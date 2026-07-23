@@ -1,19 +1,22 @@
 """
-K230 CanMV 矩形靶标识别与追踪 — 电赛E题复刻版
-==============================================
-基于 Simple_Tracking_Device 原项目，升级为 K230 + STM32F407 PID 闭环追踪。
-支持经典CV (find_rects) 和 YOLO KPU 双模式，现场可切换。
+    2025电赛E题 — K230 CanMV 适配版
+    =================================
+    基于原 MaixCam 版本，完整移植到 K230 CanMV 平台。
 
-部署: 复制此文件到 SD 卡根目录重命名为 main.py
-运行: CanMV IDE 中打开运行，或上电自动执行
+    原项目核心方法:
+      - YOLO11 神经网络检测 A4 纸黑色外框
+      - 两态状态机: IDLE(待机) / DETECTION(检测)
+      - 边缘触发串口协议: 0xA1 进入检测，检测到黑框时发送 8 字节通知帧
+      - 支持圆形检测、激光点定位等扩展功能（默认关闭）
 
-通信协议 (K230 → STM32):
-  正常: "dx,dy,0,0\n"     像素偏差
-  丢失: "404,404,0,0\n"   目标丢失
-  对准: "dx,dy,1,0\n"     flag1=1 表示已对准
+    K230 适配要点:
+      - maix API  → CanMV API (media.sensor / media.display / machine.UART)
+      - nn.YOLO11 → KPU Pipeline (YOLOv8App)
+      - 新增 CV 模式 (find_rects) 作为无模型时的备选方案
 
-@version 2.0 — K230复刻版
-@date 2025.8
+    @original  Neucrack@sipeed & lxo@sieed
+    @adapt    K230 CanMV 移植
+    @date     2025.8
 """
 
 import time, gc, math
@@ -23,7 +26,8 @@ from media.media import *
 from machine import UART
 from machine import Pin
 
-# YOLO 相关模块 — 模块顶层导入（MicroPython 不允许函数内 import *）
+# =========================== YOLO 模块导入 ============================
+# MicroPython 不允许函数内 import *，必须模块顶层导入
 try:
     from libs.PipeLine import PipeLine, ScopedTiming
     from libs.AIBase import AIBase
@@ -36,109 +40,103 @@ try:
 except Exception:
     YOLO_LIBS_AVAILABLE = False
 
-# =========================== 配置区 ============================
+# =========================== 配置区 ===================================
 
 # ★ 检测模式: "cv" / "yolo"
-#   cv:   经典CV矩形检测（无需模型, ~45fps, 推荐）
-#   yolo: KPU YOLO推理（需预训练kmodel）
+#   cv:   经典CV find_rects 矩形检测（无需模型，推荐测试用）
+#   yolo: KPU YOLO推理（需训练好的 .kmodel 模型文件）
 DETECTION_MODE = "cv"
+
 
 # 摄像头分辨率
 CAM_WIDTH  = 800
 CAM_HEIGHT = 480
-SENSOR_ID  = 2           # K230 MIPI CSI 传感器ID
+SENSOR_ID  = 2                # K230 MIPI CSI 传感器ID
 
-# 检测用低分辨率（加速用）
-DET_WIDTH  = 400
-DET_HEIGHT = 240
+# 检测用低分辨率（YOLO/CV 都在此分辨率上运行）
+DET_WIDTH  = 320
+DET_HEIGHT = 192
 
-# YOLO模型路径（仅 yolo 模式使用）
-KMODEL_PATH = "/sdcard/model/model.kmodel"
-YOLO_LABELS = ["target"]          # 必须与 data.yaml 中 names 顺序一致
-YOLO_CONF   = 0.3                 # 置信度阈值
-YOLO_NMS    = 0.4                 # NMS阈值
-YOLO_INPUT  = [320, 320]          # 模型输入尺寸
+# YOLO 模型路径（仅 yolo 模式）
+# 注意: K230 使用 .kmodel 格式，原 MaixCam 的 .mud 模型无法直接使用
+KMODEL_PATH = "/sdcard/model/best001.kmodel"
+YOLO_LABELS = ["black_frame"]   # 标签名，需与训练时一致
+YOLO_CONF   = 0.5               # 置信度阈值
+YOLO_NMS    = 0.45              # NMS 阈值
+YOLO_INPUT  = [320, 320]        # 模型输入尺寸
 
-# 矩形检测参数（cv模式）
-FIND_RECTS_THRESHOLD = 10000      # 矩形检测阈值 (5000-20000), 越低越敏感
-AREA_MIN   = 100                  # 最小面积
-ASPECT_MIN = 1.0                  # 长宽比下限
-ASPECT_MAX = 3.0                  # 长宽比上限
-ANGLE_TOL  = 25                   # 角度容差(度)
+# CV 矩形检测参数（cv 模式）
+FIND_RECTS_THRESHOLD = 15000     # 提高阈值，减少噪点候选矩形
+AREA_MIN   = 200                 # 增大最小面积，过滤小噪点
+ASPECT_MIN = 1.0
+ASPECT_MAX = 3.0
+ANGLE_TOL  = 25                  # 角度容差(度)
 
-# 画面中心（自动计算 = 分辨率/2）
-CENTER_X = CAM_WIDTH // 2         # 400
-CENTER_Y = CAM_HEIGHT // 2        # 240
+# ★ ROI 追踪窗口（检测分辨率下像素）
+#   检测到目标后，下一帧只在目标周围搜索，大幅减少 find_rects 扫描面积
+ROI_MARGIN = 80                  # 窗口半边长
+ROI_LOST_MAX = 30                # ROI 内连续丢失多少帧后恢复全图搜索
 
-# ★ 激光偏移补偿（像素）— 激光安装点与摄像头光轴不重合时填入
-LASER_OFFSET_X = 0                # 正值=激光在摄像头右侧
-LASER_OFFSET_Y = 0                # 正值=激光在摄像头下方
+# 调试开关
+DEBUG = False
+PRINT_TIME = False
+debug_draw_err_line = False
+debug_draw_err_msg  = False
+debug_draw_circle   = False
+debug_draw_rect     = True
+debug_show_hires    = False
+debug_draw_crosshair = True
+print_fps_terminal  = True
 
-# ★ 对准容差
-TOLERANCE_X = 5                   # X方向像素容差
-TOLERANCE_Y = 5                   # Y方向像素容差
-CONFIRM_FRAMES = 12               # 连续对准帧数确认
+# 裁切 & 圆检测参数（原项目保留，cv 模式下部分可用）
+crop_padding = 12
+rect_min_limit = 12
+std_from_white_rect = True
+circle_num_points = 50
+std_res = [int(29.7 / 21 * 80), 80]
 
-# 目标丢失超时 (ms)
-LOST_TIMEOUT_MS = 2000
+# =========================== 显示 & 摄像头 =============================
 
-# 串口配置
-UART_PORT = 2                     # K230 UART2
+auto_awb = True
+awb_gain = [0.134, 0.0625, 0.0625, 0.1139]
+contrast = 80
+
+# 上电自动进入检测模式（无需等待 MCU 发 0xA1）
+AUTO_START_DETECTION = True
+
+# =========================== 串口通信 ==================================
+
+enable_serial_communication = True
+UART_PORT = 2                  # K230 UART2
 UART_BAUD = 115200
 
-# 显示配置
-SHOW_OSD = True                   # 显示OSD叠加信息
-PRINT_INFO = True                 # 终端打印检测信息
+WORK_MODE_IDLE      = 0        # 待机模式
+WORK_MODE_DETECTION = 1        # 检测模式
+MODE1_TRIGGER_BYTE  = 0xA1     # 进入检测模式的单字节命令
 
-# ★ 单通道OSD模式 — 直接在检测分辨率(400×240)上绘制，4x加速
-#   开启后省掉 chn2 的 800×480 snapshot + 大图绘制
-SINGLE_CHANNEL_OSD = True
+# 检测到黑框时发送的 8 字节数据
+BLACKLINE_DETECTED_DATA = [0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88]
 
-# OSD刷新间隔（帧），仅在单通道模式下生效
-#   1=每帧刷新, 2=隔帧刷新, 3=每3帧
-OSD_DRAW_EVERY_N = 2
+# 命令帧格式（保留，用于复杂通信）
+FRAME_HEADER1 = 0xAA
+FRAME_HEADER2 = 0x55
+FRAME_TAIL    = 0xFF
+BLACK_RECT_COMMAND    = [0x11, 0x11, 0x11, 0x11]
+LASER_CENTER_COMMAND  = [0x22, 0x22, 0x22, 0x22]
+CENTER_ORIGIN_COMMAND = [0x33, 0x33, 0x33, 0x33]
 
-# ===============================================================
+# =====================================================================
 
-SCALE_X = float(CAM_WIDTH)  / float(DET_WIDTH)   # 2.0
-SCALE_Y = float(CAM_HEIGHT) / float(DET_HEIGHT)  # 2.0
+# 全局变量
+yolo_app = None
+SCALE_X = float(CAM_WIDTH)  / float(DET_WIDTH)
+SCALE_Y = float(CAM_HEIGHT) / float(DET_HEIGHT)
 
-# 检测分辨率下的中心和偏移
-DET_CENTER_X = DET_WIDTH // 2    # 200
-DET_CENTER_Y = DET_HEIGHT // 2   # 120
-DET_EFF_CX = DET_CENTER_X + int(LASER_OFFSET_X / SCALE_X)
-DET_EFF_CY = DET_CENTER_Y + int(LASER_OFFSET_Y / SCALE_Y)
-
-# cos^2(90° - ANGLE_TOL), 用于快速角度检查
+# 快速角度检查
 _angle_limit_sq = math.cos(math.radians(90 - ANGLE_TOL)) ** 2
 
-# 环形缓冲区（处理短暂丢失）
-RING_SIZE = 16
-_ring_buf = [(0, 0, None)] * RING_SIZE
-_ring_head = 0
-_ring_count = 0
 
-
-def ring_push(cx, cy, corners):
-    global _ring_head, _ring_count
-    _ring_buf[_ring_head] = (cx, cy, corners)
-    _ring_head = (_ring_head + 1) % RING_SIZE
-    if _ring_count < RING_SIZE:
-        _ring_count += 1
-
-
-def ring_latest():
-    global _ring_count
-    if _ring_count == 0:
-        return None
-    return _ring_buf[(_ring_head - 1) % RING_SIZE]
-
-
-def ring_clear():
-    global _ring_head, _ring_count
-    _ring_head = 0
-    _ring_count = 0
-
+# =========================== CV 检测函数 ==============================
 
 def poly_area(p0, p1, p2, p3):
     a  = p0[0]*p1[1] - p1[0]*p0[1]
@@ -161,7 +159,7 @@ def aspect_ok(p0, p1, p2, p3):
 
 
 def angle_ok(p0, p1, p2, p3):
-    """纯乘法角度检查 — 无 sqrt/acos，比原版快 ~10x"""
+    """纯乘法角度检查，无 sqrt/acos"""
     pts = (p0, p1, p2, p3)
     for i in range(4):
         prev = pts[(i-1)%4]; curr = pts[i]; nxt = pts[(i+1)%4]
@@ -185,15 +183,172 @@ def centroid(corners):
     return (int(sx / 4), int(sy / 4))
 
 
-def scale_corners(c, sx, sy):
-    return [(int(p[0] * sx), int(p[1] * sy)) for p in c]
+def detect_rect_cv(img):
+    """经典CV矩形检测 + ROI追踪 — 首次全图搜索，追踪期仅在目标周围搜索"""
+    global _roi_last_x, _roi_last_y, _roi_lost_count
+
+    # 如果有上次位置，先在 ROI 内搜索
+    if _roi_last_x is not None and _roi_lost_count < ROI_LOST_MAX:
+        rx = max(0, _roi_last_x - ROI_MARGIN)
+        ry = max(0, _roi_last_y - ROI_MARGIN)
+        rw = min(DET_WIDTH  - rx, ROI_MARGIN * 2)
+        rh = min(DET_HEIGHT - ry, ROI_MARGIN * 2)
+        try:
+            rects = img.find_rects(threshold=FIND_RECTS_THRESHOLD,
+                                   roi=(rx, ry, rw, rh))
+            found_in_roi = True
+        except Exception:
+            # roi 参数不支持，回退全图
+            rects = img.find_rects(threshold=FIND_RECTS_THRESHOLD)
+            found_in_roi = False
+    else:
+        rects = img.find_rects(threshold=FIND_RECTS_THRESHOLD)
+        found_in_roi = False
+
+    if not rects:
+        # ROI 内没找到，全图补搜
+        if found_in_roi:
+            rects = img.find_rects(threshold=FIND_RECTS_THRESHOLD)
+            found_in_roi = False
+        if not rects:
+            _roi_lost_count += 1
+            return None
+
+    # 筛选最优矩形
+    best = None
+    best_score = 0
+    for r in rects:
+        c = r.corners()
+        if len(c) != 4:
+            continue
+        p0, p1, p2, p3 = c[0], c[1], c[2], c[3]
+        area = poly_area(p0, p1, p2, p3)
+        if area < AREA_MIN:
+            continue
+        if not aspect_ok(p0, p1, p2, p3):
+            continue
+        if not angle_ok(p0, p1, p2, p3):
+            continue
+        cx, cy = centroid(c)
+        if cx < 0 or cx >= DET_WIDTH or cy < 0 or cy >= DET_HEIGHT:
+            continue
+        # 面积越大越好
+        if area > best_score:
+            best_score = area
+            best = (cx, cy, c)
+
+    if best is None:
+        _roi_lost_count += 1
+        return None
+
+    cx_det, cy_det, corners = best
+    _roi_last_x = cx_det
+    _roi_last_y = cy_det
+    _roi_lost_count = 0
+    return (int(cx_det * SCALE_X), int(cy_det * SCALE_Y),
+            corners, (cx_det, cy_det))
+
+
+def detect_rect_yolo(img):
+    """YOLO KPU 检测"""
+    global yolo_app
+    try:
+        res = yolo_app.run(img)
+        if res and len(res) > 0:
+            x, y, w, h = map(lambda v: int(round(v, 0)), res[0][0])
+            cx = x + w // 2
+            cy = y + h // 2
+            # 还原到全分辨率
+            return (int(cx * SCALE_X), int(cy * SCALE_Y), None, (cx, cy))
+    except Exception:
+        pass
+    return None
+
+
+def detect(img):
+    """统一检测入口，根据 DETECTION_MODE 选择方法"""
+    if DETECTION_MODE == "cv":
+        return detect_rect_cv(img)
+    else:
+        return detect_rect_yolo(img)
+
+
+# =========================== 串口通信 =================================
+
+def calculate_checksum(data):
+    return sum(data) & 0xFF
+
+
+def send_blackline_detected():
+    """发送检测到黑框的 8 字节数据帧"""
+    if not enable_serial_communication or uart is None:
+        if DEBUG:
+            print("[串口] 已禁用或未初始化")
+        return
+    try:
+        if len(BLACKLINE_DETECTED_DATA) != 8:
+            return
+        data_bytes = bytes(BLACKLINE_DETECTED_DATA)
+        uart.write(data_bytes)
+        if DEBUG:
+            print("[串口] 发送 8 字节检测帧: %s" % data_bytes)
+    except Exception as e:
+        if DEBUG:
+            print("[串口] 发送失败: %s" % e)
+
+
+def create_command_frame(command_data):
+    """创建命令帧: 帧头1+帧头2+数据(4字节)+校验位+帧尾 = 8字节"""
+    data_bytes = [FRAME_HEADER1, FRAME_HEADER2] + command_data
+    checksum = calculate_checksum(data_bytes)
+    command_frame = data_bytes + [checksum, FRAME_TAIL]
+    return bytes(command_frame)
+
+
+def check_serial_commands():
+    """检查串口命令 — 扫描 0xA1 字节"""
+    global uart
+    if not enable_serial_communication or uart is None:
+        return WORK_MODE_IDLE
+    try:
+        if uart.any() == 0:
+            return WORK_MODE_IDLE
+        data = uart.read(16)
+        if not data:
+            return WORK_MODE_IDLE
+        for byte_val in data:
+            if byte_val == MODE1_TRIGGER_BYTE:
+                uart.write(b'ACK:DETECTION_MODE')
+                print("[串口] 收到 0xA1，进入检测模式")
+                return WORK_MODE_DETECTION
+        return WORK_MODE_IDLE
+    except Exception:
+        return WORK_MODE_IDLE
+
+
+# =========================== 画图工具 =================================
+
+def draw_crosshair(img, cx, cy, size=20, color=(255, 255, 0), thickness=2):
+    img.draw_line(cx - size, cy, cx + size, cy, color, thickness)
+    img.draw_line(cx, cy - size, cx, cy + size, color, thickness)
+
+
+# =========================== 初始化 ===================================
+
+_t = time.ticks_ms()
+def debug_time(msg):
+    if PRINT_TIME:
+        global _t
+        now = time.ticks_ms()
+        print("t: %4d %s" % (time.ticks_diff(now, _t), msg))
+        _t = now
 
 
 def init_yolo():
-    """初始化 YOLO KPU 推理。需要配合 K230 KPU API。"""
+    """初始化 YOLO KPU"""
     global yolo_app
     if not YOLO_LIBS_AVAILABLE:
-        print("[YOLO] KPU库不可用，回退到CV模式")
+        print("[YOLO] KPU库不可用")
         return False
     try:
         class YOLOv8App(AIBase):
@@ -224,8 +379,8 @@ def init_yolo():
                                          np.uint8, np.uint8)
 
             def config_preprocess(self, input_image_size=None):
-                ai2d_input_size = (input_image_size if input_image_size
-                                   else self.rgb888p_size)
+                ai2d_input_size = (input_image_size
+                                   if input_image_size else self.rgb888p_size)
                 top, bottom, left, right, self.scale = letterbox_pad_param(
                     self.rgb888p_size, self.model_input_size)
                 self.ai2d.pad([0,0,0,0,top,bottom,left,right], 0, [128,128,128])
@@ -254,281 +409,188 @@ def init_yolo():
                              nms_threshold=YOLO_NMS,
                              rgb888p_size=[DET_WIDTH, DET_HEIGHT])
         yolo_app.config_preprocess()
+        print("[YOLO] 初始化成功: %s" % KMODEL_PATH)
         return True
     except Exception as e:
         print("[YOLO] 初始化失败: %s" % e)
-        print("[YOLO] 回退到CV模式")
         return False
 
 
-def detect_rect_cv(img):
-    """经典CV矩形检测 — 使用 find_rects 硬件加速"""
-    rects = img.find_rects(threshold=FIND_RECTS_THRESHOLD)
-    if not rects:
-        return None
+# =========================== 主程序 ===================================
 
-    for r in rects:
-        c = r.corners()
-        if len(c) != 4:
-            continue
-        p0, p1, p2, p3 = c[0], c[1], c[2], c[3]
-        if poly_area(p0, p1, p2, p3) < AREA_MIN:
-            continue
-        if not aspect_ok(p0, p1, p2, p3):
-            continue
-        if not angle_ok(p0, p1, p2, p3):
-            continue
-        icx, icy = centroid(c)
-        if icx < 0 or icx >= DET_WIDTH or icy < 0 or icy >= DET_HEIGHT:
-            continue
-        cx = int(icx * SCALE_X)
-        cy = int(icy * SCALE_Y)
-        return (cx, cy, c)
-    return None
-
-
-def detect_rect_yolo(img):
-    """YOLO KPU 检测 — 返回中心坐标"""
-    global yolo_app
-    try:
-        res = yolo_app.run(img)
-        if res and len(res[0]) > 0:
-            x, y, w, h = map(lambda v: int(round(v, 0)), res[0][0])
-            cx = x + w // 2
-            cy = y + h // 2
-            return (cx, cy, None)
-    except Exception as e:
-        pass
-    return None
-
+# ROI 追踪状态（检测分辨率坐标）
+_roi_last_x = None
+_roi_last_y = None
+_roi_lost_count = 0
 
 def main():
-    global _ring_count, yolo_app, DETECTION_MODE
+    global yolo_app, DETECTION_MODE, uart
+    global _roi_last_x, _roi_last_y, _roi_lost_count
+
     print("=" * 60)
-    print("K230 矩形靶标追踪 — 电赛E题复刻版 v2.0")
+    print("K230 视觉检测系统 — 原版逻辑适配")
     print("=" * 60)
-    print("检测模式: %s" % DETECTION_MODE)
-    print("分辨率:   %dx%d (检测 %dx%d)" % (CAM_WIDTH, CAM_HEIGHT,
-              DET_WIDTH, DET_HEIGHT))
-    print("画面中心: (%d, %d)" % (CENTER_X, CENTER_Y))
-    print("激光偏移: (%+d, %+d)" % (LASER_OFFSET_X, LASER_OFFSET_Y))
-    print("串口:     UART%d @ %d" % (UART_PORT, UART_BAUD))
+    print("检测模式:   %s" % DETECTION_MODE)
+    print("分辨率:     %dx%d (检测 %dx%d)" %
+          (CAM_WIDTH, CAM_HEIGHT, DET_WIDTH, DET_HEIGHT))
+    print("串口:       UART%d @ %d" % (UART_PORT, UART_BAUD))
+    print("串口通信:   %s" % ("启用" if enable_serial_communication else "禁用"))
+    print("工作模式:   待机模式 (等待上位机指令)")
+    print("触发命令:   0x%02X (单字节)" % MODE1_TRIGGER_BYTE)
+    print("检测数据:   %s (长度:%d)" %
+          ([hex(x) for x in BLACKLINE_DETECTED_DATA],
+           len(BLACKLINE_DETECTED_DATA)))
     print("=" * 60)
 
     sensor_obj = None
     yolo_app = None
+    uart = None
 
     try:
-        # ---- 摄像头初始化 ----
+        # ---- 摄像头 ----
         sensor_obj = Sensor(id=SENSOR_ID)
         sensor_obj.reset()
 
-        # chn0: 全分辨率 → 硬件DMA显示
+        # chn0: 全分辨率 → 硬件 DMA 显示
         sensor_obj.set_framesize(width=CAM_WIDTH, height=CAM_HEIGHT,
                                  chn=CAM_CHN_ID_0)
         sensor_obj.set_pixformat(Sensor.RGB565, chn=CAM_CHN_ID_0)
         bind_info = sensor_obj.bind_info(chn=CAM_CHN_ID_0)
         Display.bind_layer(**bind_info, layer=Display.LAYER_VIDEO1)
 
-        # chn1: 低分辨率 → 检测 + OSD绘制（单通道模式）
+        # chn1: 低分辨率 → 检测
         sensor_obj.set_framesize(width=DET_WIDTH, height=DET_HEIGHT,
                                  chn=CAM_CHN_ID_1)
         sensor_obj.set_pixformat(Sensor.RGB565, chn=CAM_CHN_ID_1)
 
-        if not SINGLE_CHANNEL_OSD:
-            # 传统3通道模式: chn2 全分辨率 → OSD
-            sensor_obj.set_framesize(width=CAM_WIDTH, height=CAM_HEIGHT,
-                                     chn=CAM_CHN_ID_2)
-            sensor_obj.set_pixformat(Sensor.RGB565, chn=CAM_CHN_ID_2)
-            ch_info = "三通"
-        else:
-            ch_info = "单通OSD"
+        # chn2: 全分辨率 → OSD 叠加
+        sensor_obj.set_framesize(width=CAM_WIDTH, height=CAM_HEIGHT,
+                                 chn=CAM_CHN_ID_2)
+        sensor_obj.set_pixformat(Sensor.RGB565, chn=CAM_CHN_ID_2)
 
         Display.init(Display.ST7701, width=800, height=480,
                      to_ide=True, osd_num=1)
         print("DISP OK | ST7701 800x480")
 
         sensor_obj.run()
-        print("CAM  OK | %sd" % ch_info)
+        print("CAM  OK | 三通道")
 
-        # ---- YOLO初始化（如需要） ----
+        # ---- YOLO 初始化 ----
         if DETECTION_MODE == "yolo":
             if not init_yolo():
-                print("[WARN] YOLO初始化失败，使用CV模式")
-                # 回退到CV
+                print("[WARN] YOLO 初始化失败，回退到 CV 模式")
                 DETECTION_MODE = "cv"
 
-        # ---- 串口初始化 ----
-        uart = None
+        # ---- 串口 ----
         try:
             uart = UART(UART_PORT, UART_BAUD)
             print("UART OK | UART%d @ %d" % (UART_PORT, UART_BAUD))
         except Exception as e:
             print("UART NONE | %s" % e)
-
-        # ---- 计算有效中心（含激光偏移） ----
-        eff_cx = CENTER_X + LASER_OFFSET_X
-        eff_cy = CENTER_Y + LASER_OFFSET_Y
+            uart = None
 
         # ---- 状态变量 ----
-        clock  = time.clock()
-        frame  = 0
-        lost_ms = 0
-        lost_on = False
-        last_dx = 0
-        last_dy = 0
-        last_cx = None
-        last_cy = None
-        last_crn = None
-        last_crn_raw = None
-        fb_count = 0
-        aligned_count = 0
+        center_pos = (CAM_WIDTH // 2, CAM_HEIGHT // 2)   # 画面中心（全分辨率）
+        det_center = (DET_WIDTH // 2, DET_HEIGHT // 2)   # 画面中心（检测分辨率）
 
-        # 丢弃前几帧
+        current_work_mode = WORK_MODE_DETECTION if AUTO_START_DETECTION else WORK_MODE_IDLE
+        last_black_rect_detected = False
+        last_det_info = None         # (cx, cy, corners_det)
+
+        clock = time.clock()
+        frame = 0
+        fps_counter = 0
+        fps_last_time = time.ticks_ms()
+
+        # 丢弃前 10 帧（摄像头稳定）
         for _ in range(10):
             sensor_obj.snapshot(chn=CAM_CHN_ID_1)
 
         print("LOOP...")
+
         while True:
             os.exitpoint()
             clock.tick()
             frame += 1
 
-            # ==== chn1: 低分辨率检测 ====
+            # ==== 串口命令检查 ====
+            new_mode = check_serial_commands()
+            if new_mode == WORK_MODE_DETECTION and current_work_mode != new_mode:
+                print("[系统] 当前工作模式: 检测模式")
+                # 重置 ROI，全图搜索
+                _roi_last_x = None
+                _roi_last_y = None
+                _roi_lost_count = 0
+            current_work_mode = new_mode if new_mode == WORK_MODE_DETECTION else current_work_mode
+
+            # ==== 检测图像 ====
             img_det = sensor_obj.snapshot(chn=CAM_CHN_ID_1)
 
-            cx = None; cy = None; corners_raw = None
+            det_info = None   # (cx_full, cy_full, corners, (cx_det, cy_det))
+            if current_work_mode == WORK_MODE_DETECTION:
+                det_info = detect(img_det)
 
-            if DETECTION_MODE == "cv":
-                result = detect_rect_cv(img_det)
-            else:
-                result = detect_rect_yolo(img_det)
+            black_rect_detected = det_info is not None
 
-            if result is not None:
-                cx, cy, corners_raw = result
+            # ---- 边缘触发: 首次检测到时发送串口信号 ----
+            if black_rect_detected and not last_black_rect_detected:
+                print("[检测] 检测到黑框，发送串口信号")
+                send_blackline_detected()
 
-            # ==== 追踪状态处理 ====
-            if cx is not None:
-                # 保存检测分辨率的角点（OSD用），cx/cy是全分辨率（UART用）
-                last_crn_raw = corners_raw
-                last_crn = (scale_corners(corners_raw, SCALE_X, SCALE_Y)
-                            if corners_raw and not SINGLE_CHANNEL_OSD else corners_raw)
-                last_cx, last_cy = cx, cy
-                dx = eff_cx - cx
-                dy = eff_cy - cy
-                last_dx, last_dy = dx, dy
-                lost_on = False
-                lost_ms = 0
-                fb_count = 0
-                ring_push(cx, cy, last_crn)
+            last_black_rect_detected = black_rect_detected
+            if det_info is not None:
+                last_det_info = det_info
 
-                # 对准判断
-                if abs(dx) <= TOLERANCE_X and abs(dy) <= TOLERANCE_Y:
-                    aligned_count += 1
-                else:
-                    aligned_count = 0
+            # ==== OSD 叠加 ====
+            osd_img = sensor_obj.snapshot(chn=CAM_CHN_ID_2)
 
-                aligned = 1 if aligned_count >= CONFIRM_FRAMES else 0
+            # 屏幕中心十字线
+            if debug_draw_crosshair:
+                draw_crosshair(osd_img, center_pos[0], center_pos[1])
 
-                # 串口发送
-                if uart is not None:
-                    uart.write("%d,%d,%d,0\n" % (dx, dy, aligned))
-            else:
-                # 目标丢失 — 环形缓冲区回退
-                rl = ring_latest()
-                if rl is not None and fb_count < RING_SIZE:
-                    last_cx, last_cy, last_crn = rl
-                    fb_count += 1
-                    dx = eff_cx - last_cx
-                    dy = eff_cy - last_cy
-                    last_dx, last_dy = dx, dy
-                    aligned_count = 0
-                    if uart is not None:
-                        uart.write("%d,%d,0,0\n" % (dx, dy))
-                else:
-                    ring_clear()
-                    fb_count = 0
-                    aligned_count = 0
+            if current_work_mode == WORK_MODE_DETECTION and last_det_info is not None:
+                cx_full, cy_full, corners, (cx_det, cy_det) = last_det_info
+                err_x = center_pos[0] - cx_full
+                err_y = center_pos[1] - cy_full
 
-                    if not lost_on:
-                        lost_ms = time.ticks_ms()
-                        lost_on = True
-                    elif time.ticks_diff(time.ticks_ms(), lost_ms) > LOST_TIMEOUT_MS:
-                        if uart is not None:
-                            uart.write("404,404,0,0\n")
-                    else:
-                        if uart is not None:
-                            uart.write("%d,%d,0,0\n" % (last_dx, last_dy))
+                # 矩形框
+                if debug_draw_rect and corners and len(corners) == 4:
+                    scaled = [(int(p[0] * SCALE_X), int(p[1] * SCALE_Y))
+                              for p in corners]
+                    for i in range(4):
+                        osd_img.draw_line(scaled[i][0], scaled[i][1],
+                                          scaled[(i+1)%4][0], scaled[(i+1)%4][1],
+                                          color=(255, 0, 0), thickness=2)
 
-            # ==== OSD显示 ====
-            if SHOW_OSD and frame % OSD_DRAW_EVERY_N == 0:
-                if SINGLE_CHANNEL_OSD:
-                    # 单通道: 直接在检测图(400×240)上绘制
-                    osd_img = img_det
-                    ocx = DET_EFF_CX
-                    ocy = DET_EFF_CY
-                    d_cx = int(last_cx / SCALE_X) if last_cx else None
-                    d_cy = int(last_cy / SCALE_Y) if last_cy else None
-                    d_crn = last_crn_raw  # 检测分辨率，无需缩放
-                else:
-                    # 传统: chn2 全分辨率(800×480)
-                    osd_img = sensor_obj.snapshot(chn=CAM_CHN_ID_2)
-                    ocx = eff_cx
-                    ocy = eff_cy
-                    d_cx = last_cx
-                    d_cy = last_cy
-                    d_crn = last_crn  # 已缩放至全分辨率
+                # ★ 目标中心点 + 屏幕中心连线（始终显示）
+                osd_img.draw_circle(cx_full, cy_full, 5,
+                                    color=(0, 255, 0), thickness=1, fill=True)
+                osd_img.draw_line(center_pos[0], center_pos[1],
+                                  cx_full, cy_full,
+                                  color=(0, 255, 255), thickness=2)
 
-                YLW = (255, 255, 0)
-                GRN = (0, 255, 0)
-                RED = (255, 0, 0)
-                CYN = (0, 255, 255)
+                # ★ 相对距离文字
+                osd_img.draw_string_advanced(
+                    cx_full + 8, cy_full - 8, 14,
+                    "(%+d,%+d)" % (err_x, err_y),
+                    color=(0, 255, 0))
 
-                # 十字线
-                osd_img.draw_line(ocx - 15, ocy, ocx + 15, ocy,
-                                  color=YLW, thickness=1)
-                osd_img.draw_line(ocx, ocy - 15, ocx, ocy + 15,
-                                  color=YLW, thickness=1)
+            # 模式标识
+            mode_str = "DET" if current_work_mode == WORK_MODE_DETECTION else "IDLE"
+            osd_img.draw_string_advanced(2, 2, 14,
+                                         "%s | %s" % (mode_str, DETECTION_MODE.upper()),
+                                         color=(0, 255, 255))
 
-                # 检测框 + 误差线
-                if d_cx is not None:
-                    aligned = aligned_count >= CONFIRM_FRAMES
-                    color = GRN if aligned else RED
-                    osd_img.draw_line(ocx, ocy, d_cx, d_cy,
-                                      color=color, thickness=1)
-                    if d_crn and len(d_crn) == 4:
-                        for i in range(4):
-                            x1 = int(d_crn[i][0])
-                            y1 = int(d_crn[i][1])
-                            x2 = int(d_crn[(i+1)%4][0])
-                            y2 = int(d_crn[(i+1)%4][1])
-                            osd_img.draw_line(x1, y1, x2, y2,
-                                              color=color, thickness=2)
-                    osd_img.draw_circle(d_cx, d_cy, 3, color=color,
-                                        thickness=1, fill=True)
-                    status = "OK" if aligned else "TRK"
-                    osd_img.draw_string_advanced(d_cx + 6, d_cy - 6, 14,
-                                                 status, color=color)
+            Display.show_image(osd_img, layer=Display.LAYER_OSD1)
 
-                # FPS + 模式
-                fps_str = "FPS:%d" % int(clock.fps())
-                osd_img.draw_string_advanced(2, 2, 14, fps_str, color=CYN)
-                osd_img.draw_string_advanced(2, 18, 12,
-                                             "%s" % DETECTION_MODE.upper(),
-                                             color=CYN)
-
-                Display.show_image(osd_img, layer=Display.LAYER_OSD1)
-
-            # 终端输出
-            if PRINT_INFO and frame % 30 == 0:
-                fps = int(clock.fps())
-                if last_cx is not None:
-                    aligned = "ALIGN" if aligned_count >= CONFIRM_FRAMES else ""
-                    print("OK cx=%-4d cy=%-4d dx=%+4d dy=%+4d fps=%d %s" %
-                          (last_cx, last_cy, last_dx, last_dy, fps, aligned))
-                else:
-                    print("NO DETECT fps=%d" % fps)
-                gc.collect()
+            # ==== FPS 终端输出 ====
+            if print_fps_terminal:
+                fps_counter += 1
+                now = time.ticks_ms()
+                if time.ticks_diff(now, fps_last_time) >= 1000:
+                    print("[FPS] %d" % int(clock.fps()))
+                    fps_counter = 0
+                    fps_last_time = now
 
     except KeyboardInterrupt:
         print("STOP")
@@ -544,6 +606,23 @@ def main():
         time.sleep_ms(100)
         gc.collect()
         print("END")
+
+
+# =========================== 测试函数 =================================
+
+def test_serial_communication():
+    """测试串口 — 发送 8 字节测试数据帧"""
+    global uart
+    if not enable_serial_communication or uart is None:
+        print("[串口测试] 串口通信已禁用")
+        return
+    test_data = [0xAA, 0x55, 0x00, 0x00, 0x00, 0x00, 0x09, 0xFF]
+    try:
+        print("[串口测试] 发送: %s" % [hex(x) for x in test_data])
+        uart.write(bytes(test_data))
+        print("[串口测试] 发送完成")
+    except Exception as e:
+        print("[串口测试] 失败: %s" % e)
 
 
 if __name__ == "__main__":
