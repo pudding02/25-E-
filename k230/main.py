@@ -90,10 +90,24 @@ UART_BAUD = 115200
 SHOW_OSD = True                   # 显示OSD叠加信息
 PRINT_INFO = True                 # 终端打印检测信息
 
+# ★ 单通道OSD模式 — 直接在检测分辨率(400×240)上绘制，4x加速
+#   开启后省掉 chn2 的 800×480 snapshot + 大图绘制
+SINGLE_CHANNEL_OSD = True
+
+# OSD刷新间隔（帧），仅在单通道模式下生效
+#   1=每帧刷新, 2=隔帧刷新, 3=每3帧
+OSD_DRAW_EVERY_N = 2
+
 # ===============================================================
 
 SCALE_X = float(CAM_WIDTH)  / float(DET_WIDTH)   # 2.0
 SCALE_Y = float(CAM_HEIGHT) / float(DET_HEIGHT)  # 2.0
+
+# 检测分辨率下的中心和偏移
+DET_CENTER_X = DET_WIDTH // 2    # 200
+DET_CENTER_Y = DET_HEIGHT // 2   # 120
+DET_EFF_CX = DET_CENTER_X + int(LASER_OFFSET_X / SCALE_X)
+DET_EFF_CY = DET_CENTER_Y + int(LASER_OFFSET_Y / SCALE_Y)
 
 # cos^2(90° - ANGLE_TOL), 用于快速角度检查
 _angle_limit_sq = math.cos(math.radians(90 - ANGLE_TOL)) ** 2
@@ -316,24 +330,26 @@ def main():
         bind_info = sensor_obj.bind_info(chn=CAM_CHN_ID_0)
         Display.bind_layer(**bind_info, layer=Display.LAYER_VIDEO1)
 
-        # chn1: 低分辨率 → 快速检测
+        # chn1: 低分辨率 → 检测 + OSD绘制（单通道模式）
         sensor_obj.set_framesize(width=DET_WIDTH, height=DET_HEIGHT,
                                  chn=CAM_CHN_ID_1)
         sensor_obj.set_pixformat(Sensor.RGB565, chn=CAM_CHN_ID_1)
 
-        # chn2: 全分辨率 → OSD叠加
-        sensor_obj.set_framesize(width=CAM_WIDTH, height=CAM_HEIGHT,
-                                 chn=CAM_CHN_ID_2)
-        sensor_obj.set_pixformat(Sensor.RGB565, chn=CAM_CHN_ID_2)
+        if not SINGLE_CHANNEL_OSD:
+            # 传统3通道模式: chn2 全分辨率 → OSD
+            sensor_obj.set_framesize(width=CAM_WIDTH, height=CAM_HEIGHT,
+                                     chn=CAM_CHN_ID_2)
+            sensor_obj.set_pixformat(Sensor.RGB565, chn=CAM_CHN_ID_2)
+            ch_info = "三通"
+        else:
+            ch_info = "单通OSD"
 
         Display.init(Display.ST7701, width=800, height=480,
                      to_ide=True, osd_num=1)
         print("DISP OK | ST7701 800x480")
 
         sensor_obj.run()
-        print("CAM  OK | ch0=%dx%d ch1=%dx%d ch2=%dx%d" %
-              (CAM_WIDTH, CAM_HEIGHT, DET_WIDTH, DET_HEIGHT,
-               CAM_WIDTH, CAM_HEIGHT))
+        print("CAM  OK | %sd" % ch_info)
 
         # ---- YOLO初始化（如需要） ----
         if DETECTION_MODE == "yolo":
@@ -364,6 +380,7 @@ def main():
         last_cx = None
         last_cy = None
         last_crn = None
+        last_crn_raw = None
         fb_count = 0
         aligned_count = 0
 
@@ -392,8 +409,10 @@ def main():
 
             # ==== 追踪状态处理 ====
             if cx is not None:
+                # 保存检测分辨率的角点（OSD用），cx/cy是全分辨率（UART用）
+                last_crn_raw = corners_raw
                 last_crn = (scale_corners(corners_raw, SCALE_X, SCALE_Y)
-                            if corners_raw else None)
+                            if corners_raw and not SINGLE_CHANNEL_OSD else corners_raw)
                 last_cx, last_cy = cx, cy
                 dx = eff_cx - cx
                 dy = eff_cy - cy
@@ -441,49 +460,61 @@ def main():
                         if uart is not None:
                             uart.write("%d,%d,0,0\n" % (last_dx, last_dy))
 
-            # ==== OSD显示: chn2全分辨率 ====
-            if SHOW_OSD:
-                osd_img = sensor_obj.snapshot(chn=CAM_CHN_ID_2)
+            # ==== OSD显示 ====
+            if SHOW_OSD and frame % OSD_DRAW_EVERY_N == 0:
+                if SINGLE_CHANNEL_OSD:
+                    # 单通道: 直接在检测图(400×240)上绘制
+                    osd_img = img_det
+                    ocx = DET_EFF_CX
+                    ocy = DET_EFF_CY
+                    d_cx = int(last_cx / SCALE_X) if last_cx else None
+                    d_cy = int(last_cy / SCALE_Y) if last_cy else None
+                    d_crn = last_crn_raw  # 检测分辨率，无需缩放
+                else:
+                    # 传统: chn2 全分辨率(800×480)
+                    osd_img = sensor_obj.snapshot(chn=CAM_CHN_ID_2)
+                    ocx = eff_cx
+                    ocy = eff_cy
+                    d_cx = last_cx
+                    d_cy = last_cy
+                    d_crn = last_crn  # 已缩放至全分辨率
 
                 YLW = (255, 255, 0)
                 GRN = (0, 255, 0)
                 RED = (255, 0, 0)
                 CYN = (0, 255, 255)
 
-                # 画面中心十字线（含偏移补偿点）
-                osd_img.draw_line(eff_cx - 15, eff_cy, eff_cx + 15, eff_cy,
+                # 十字线
+                osd_img.draw_line(ocx - 15, ocy, ocx + 15, ocy,
                                   color=YLW, thickness=1)
-                osd_img.draw_line(eff_cx, eff_cy - 15, eff_cx, eff_cy + 15,
+                osd_img.draw_line(ocx, ocy - 15, ocx, ocy + 15,
                                   color=YLW, thickness=1)
-                if LASER_OFFSET_X != 0 or LASER_OFFSET_Y != 0:
-                    osd_img.draw_circle(CENTER_X, CENTER_Y, 4,
-                                        color=(255, 0, 255), thickness=1)
 
-                # 检测结果
-                if last_cx is not None:
-                    color = GRN if aligned_count >= CONFIRM_FRAMES else RED
-                    osd_img.draw_line(eff_cx, eff_cy, last_cx, last_cy,
+                # 检测框 + 误差线
+                if d_cx is not None:
+                    aligned = aligned_count >= CONFIRM_FRAMES
+                    color = GRN if aligned else RED
+                    osd_img.draw_line(ocx, ocy, d_cx, d_cy,
                                       color=color, thickness=1)
-                    if last_crn and len(last_crn) == 4:
+                    if d_crn and len(d_crn) == 4:
                         for i in range(4):
-                            x1 = int(last_crn[i][0])
-                            y1 = int(last_crn[i][1])
-                            x2 = int(last_crn[(i+1)%4][0])
-                            y2 = int(last_crn[(i+1)%4][1])
+                            x1 = int(d_crn[i][0])
+                            y1 = int(d_crn[i][1])
+                            x2 = int(d_crn[(i+1)%4][0])
+                            y2 = int(d_crn[(i+1)%4][1])
                             osd_img.draw_line(x1, y1, x2, y2,
                                               color=color, thickness=2)
-                    osd_img.draw_circle(last_cx, last_cy, 3, color=color,
+                    osd_img.draw_circle(d_cx, d_cy, 3, color=color,
                                         thickness=1, fill=True)
-                    status = "ALIGN" if aligned_count >= CONFIRM_FRAMES else "TRACK"
-                    osd_img.draw_string_advanced(last_cx + 8, last_cy - 8, 20,
-                                                 "%+d,%+d %s" % (last_dx, last_dy, status),
-                                                 color=color)
+                    status = "OK" if aligned else "TRK"
+                    osd_img.draw_string_advanced(d_cx + 6, d_cy - 6, 14,
+                                                 status, color=color)
 
-                # 信息条
+                # FPS + 模式
                 fps_str = "FPS:%d" % int(clock.fps())
-                osd_img.draw_string_advanced(10, 10, 20, fps_str, color=CYN)
-                osd_img.draw_string_advanced(10, 30, 16,
-                                             "MODE:%s" % DETECTION_MODE.upper(),
+                osd_img.draw_string_advanced(2, 2, 14, fps_str, color=CYN)
+                osd_img.draw_string_advanced(2, 18, 12,
+                                             "%s" % DETECTION_MODE.upper(),
                                              color=CYN)
 
                 Display.show_image(osd_img, layer=Display.LAYER_OSD1)
