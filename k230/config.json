@@ -1,0 +1,94 @@
+{
+  "_说明": "K230 矩形靶标追踪 — 运行时配置。修改后重新运行 main.py",
+
+  "detection": {
+    "mode": "cv",
+    "_mode_选项": "cv / yolo / hybrid",
+    "detect_every": 1
+  },
+
+  "camera": {
+    "sensor_width": 640,
+    "sensor_height": 480,
+    "fps": 90
+  },
+
+  "detect_resolution": {
+    "enabled": false,
+    "_enabled": "开启后在低分辨率上检测(提速)，关闭=原版640x480",
+    "width": 320,
+    "height": 240
+  },
+
+  "center": {
+    "x": 320,
+    "y": 240,
+    "laser_offset_x": 0,
+    "laser_offset_y": 0
+  },
+
+  "rectangle": {
+    "white_low": [135, 135, 115],
+    "white_high": [255, 255, 255],
+    "black_low": [0, 0, 0],
+    "black_high": [85, 85, 85],
+    "min_area": 3500,
+    "max_area": 180000,
+    "min_aspect": 1.05,
+    "max_aspect": 2.80,
+    "target_aspect": 1.55,
+    "border_expand_x": 16,
+    "border_expand_y": 16,
+    "black_check_step": 4,
+    "min_black_hits": 3,
+    "center_white_step": 3,
+    "max_center_jump": 220,
+    "max_area_ratio": 3,
+    "min_rect_fill": 45,
+    "max_side_ratio": 3,
+    "approx_epsilon": 0.04
+  },
+
+  "yolo": {
+    "model_path": "/sdcard/model/model.kmodel",
+    "labels": ["target"],
+    "confidence": 0.3,
+    "nms_threshold": 0.4,
+    "input_size": [320, 320],
+    "max_boxes": 30
+  },
+
+  "kalman": {
+    "enabled": false,
+    "smooth_factor": 0.3,
+    "_smooth_factor": "0=完全平滑不动, 1=不过滤。推荐0.2-0.4"
+  },
+
+  "tracking": {
+    "smooth_num": 0,
+    "smooth_den": 1,
+    "lost_keep_frames": 2
+  },
+
+  "uart": {
+    "enabled": true,
+    "_format": "dx,dy,dist,status  status:0=追踪 1=对准 404=丢失",
+    "port": 2,
+    "baud": 115200,
+    "format": "csv"
+  },
+
+  "display": {
+    "lcd_width": 800,
+    "lcd_height": 480,
+    "show_osd": true,
+    "x_offset": 80,
+    "y_offset": 0,
+    "to_ide": false
+  },
+
+  "debug": {
+    "print_every": 60,
+    "gc_every": 30
+  }
+}

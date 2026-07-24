@@ -1,748 +1,688 @@
 """
-    K230 CanMV 靶标追踪 — 电赛E题复刻版
-    =====================================
-    基于原 MaixCam 项目移植，支持三种检测模式:
-      - cv:   find_rects  硬件矩形检测（精确，有角点）
-      - blob: find_blobs  硬件色块检测（更快，无需矩形特征）
-      - yolo: KPU YOLO推理（需 .kmodel 模型）
+K230 矩形靶标追踪
+================
 
-    核心优化:
-      - ROI 追踪：首次全图搜索，追踪期仅在目标周围搜索（面积缩减 75%）
-      - 三通道传感器：chn0(DMA显示) + chn1(检测) + chn2(OSD叠加)
-      - 检测分辨率 320×192，缩放比 2.5× → 全分辨率 800×480
+═══════════════════════════════════════════════════════════════
+  功能开关速查（在 config.json 中切换，无需改代码）
+═══════════════════════════════════════════════════════════════
+  [kalman.enabled]      →  卡尔曼滤波(EMA)，平滑去抖
+  [uart.enabled]        →  串口输出 dx,dy,dist,status → 云台
+  [detect_resolution.enabled] → 降采样检测(320x240)提速
+  [detection.mode]      → "cv" / "yolo" / "hybrid"
+  [camera.sensor_width/height] → 摄像头分辨率
+  [rectangle.*]         → 矩形检测阈值，现场调参入口
+═══════════════════════════════════════════════════════════════
 
-    通信协议:
-      检测到目标: "dx,dy,0,0\n"    (像素偏差)
-      目标丢失:   "404,404,0,0\n"
+═══════════════════════════════════════════════════════════════
+  性能设计原则（K230 MicroPython 优化经验）
+═══════════════════════════════════════════════════════════════
+  1. 热路径零分支 —— 可选功能用 lambda 注入，避免每帧 if
+  2. 全局变量直读 —— 模块级变量比对象属性/字典快5-10倍
+  3. 返回元组不用dict —— 避免热路径内存分配触发GC
+  4. 检测算法纯函数 —— 不封装成类，函数直接读全局参数
+═══════════════════════════════════════════════════════════════
 
-    @version 3.0 — 多模式 + ROI追踪
-    @date    2025.8
+配置文件: config.json (与main.py同目录)
 """
 
-import time, gc, math
+import time, os, gc, math
+import cv2
 from media.sensor import *
 from media.display import *
 from media.media import *
-from machine import UART
-from machine import Pin
 
-# =========================== YOLO 模块导入 ============================
-try:
-    from libs.PipeLine import PipeLine, ScopedTiming
-    from libs.AIBase import AIBase
-    from libs.AI2D import Ai2d
-    from libs.Utils import *
-    import nncase_runtime as nn
-    import ulab.numpy as np
-    import aidemo
-    YOLO_LIBS_AVAILABLE = True
-except Exception:
-    YOLO_LIBS_AVAILABLE = False
+# ============================================================================
+# 一、配置加载 — import阶段执行一次，不影响热路径速度
+# ============================================================================
 
-# =========================== 配置区 ===================================
+def _load_json(paths):
+    """从多个候选路径加载JSON配置，返回dict或{}"""
+    try:
+        import ujson as j
+    except ImportError:
+        import json as j
+    for p in paths:
+        try:
+            with open(p, "r") as f:
+                raw = j.load(f)
+            cfg = {}
+            for k, v in raw.items():
+                if not k.startswith("_"):
+                    cfg[k] = {sk: sv for sk, sv in v.items()
+                              if isinstance(v, dict) and not sk.startswith("_")}
+                    if not isinstance(v, dict):
+                        cfg[k] = v
+            print("config: %s loaded" % p)
+            return cfg
+        except Exception:
+            pass
+    print("config: using defaults")
+    return {}
 
-# ★ 检测模式: "cv" / "blob" / "cascade" / "yolo"
-#   cv:      find_rects 直接矩形检测
-#   blob:    find_blobs 色块检测 + 形状约束
-#   cascade: find_blobs 粗筛 → find_rects 精验（两级硬件级联）
-#   yolo:    KPU 神经网络推理
-DETECTION_MODE = "blob"
+def _get(cfg, key, default):
+    """安全获取配置值，cfg为空时返回默认值"""
+    return cfg.get(key, default) if cfg else default
 
-# 摄像头
-CAM_WIDTH  = 800
-CAM_HEIGHT = 480
-SENSOR_ID  = 2
+CFG = _load_json(["/sdcard/config.json", "config.json"])
 
-# 检测分辨率
-DET_WIDTH  = 320
-DET_HEIGHT = 192
+# ============================================================================
+# 二、运行参数 — 全部从config.json读取，模块级全局直接赋值
+#    修改方式: 改config.json → 重启main.py → 即刻生效
+#    不要在此处直接改值，config.json是唯一的"调参面板"
+# ============================================================================
 
-# ---- find_rects 参数（cv 模式）----
-FIND_RECTS_THRESHOLD = 15000
-RECT_AREA_MIN = 200
-ASPECT_MIN = 1.0
-ASPECT_MAX = 3.0
-ANGLE_TOL  = 25
+# ---- 摄像头 ----
+SENSOR_W  = _get(_get(CFG, "camera", {}), "sensor_width", 640)
+SENSOR_H  = _get(_get(CFG, "camera", {}), "sensor_height", 480)
+FPS       = _get(_get(CFG, "camera", {}), "fps", 90)
 
-# ---- find_blobs 参数（blob 模式）----
-# LAB 色彩空间阈值 — 找暗色/黑色区域
-#   L:   0 ~ 50   (亮度低 → 暗色)
-#   A: -30 ~ 30   (任意色相)
-#   B: -30 ~ 30   (任意色相)
-BLOB_L_THRESHOLD  = (0, 50)       # L 亮度阈值
-BLOB_A_THRESHOLD  = (-30, 30)     # A 色相
-BLOB_B_THRESHOLD  = (-30, 30)     # B 色相
-BLOB_PIXELS_MIN   = 100           # 最小像素数
-BLOB_AREA_MIN     = 200           # 最小面积
-BLOB_MERGE        = True          # 合并相邻色块
+# ---- 显示屏 ----
+DISPLAY_W = _get(_get(CFG, "display", {}), "lcd_width", 800)
+DISPLAY_H = _get(_get(CFG, "display", {}), "lcd_height", 480)
+SHOW_TO_IDE = _get(_get(CFG, "display", {}), "to_ide", False)
+DISPLAY_X = _get(_get(CFG, "display", {}), "x_offset", 80)
+DISPLAY_Y = _get(_get(CFG, "display", {}), "y_offset", 0)
+SHOW_OSD  = _get(_get(CFG, "display", {}), "show_osd", True)
 
-# ---- 背景白底约束（blob 模式防误判）----
-# 检测到的暗色块周边必须是亮色（白色背景），否则视为误判丢弃
-BG_WHITE_MIN   = 130             # 背景采样点 RGB 各通道最低值 (0~255)
-BG_SAMPLE_GAP  = 6               # 采样点距边界距离 (像素)
-BG_SAMPLE_OK   = 5               # 最少几个采样点通过才算有效（共8点）
+# ---- 检测模式 ----
+DETECT_EVERY  = _get(_get(CFG, "detection", {}), "detect_every", 1)
+# 跳帧检测: 1=每帧, 2=隔帧(帧率翻倍但响应变慢), 3=每3帧
+MODE          = _get(_get(CFG, "detection", {}), "mode", "cv")
+# 模式: "cv"=经典视觉, "yolo"=KPU推理, "hybrid"=CV优先
 
-# ---- 靶标形状约束（blob 模式）----
-# A4 黑框: 外框 297×210，长宽比 ≈ 1.4；空心框密度低（边框/外接矩形 ≈ 0.1~0.4）
-BLOB_ASPECT_MIN = 1.1            # 长宽比下限
-BLOB_ASPECT_MAX = 2.0            # 长宽比上限
-BLOB_DENSITY_MAX = 0.55          # 密度上限：低于此值才是空心框（实心块→1.0）
+# ---- 调试 ----
+PRINT_EVERY = _get(_get(CFG, "debug", {}), "print_every", 60)
+# 每N帧打印一次检测信息到串口终端，60 ≈ 每2秒(30fps)
+GC_EVERY    = _get(_get(CFG, "debug", {}), "gc_every", 30)
+# 每N帧执行一次垃圾回收，太频繁拖慢帧率、太稀疏内存堆积
 
-# ---- YOLO 参数（yolo 模式）----
-KMODEL_PATH = "/sdcard/model/best001.kmodel"
-YOLO_LABELS = ["black_frame"]
-YOLO_CONF   = 0.5
-YOLO_NMS    = 0.45
-YOLO_INPUT  = [320, 320]
+# ---- 矩形检测阈值（现场调参主要入口） ----
+r = _get(CFG, "rectangle", {})
+WHITE_LOW  = tuple(r.get("white_low",  [135, 135, 115]))
+WHITE_HIGH = tuple(r.get("white_high", [255, 255, 255]))
+# 白色掩膜RGB范围 — 检测靶标白色内部区域
+BLACK_LOW  = tuple(r.get("black_low",  [0, 0, 0]))
+BLACK_HIGH = tuple(r.get("black_high", [85, 85, 85]))
+# 黑色边框RGB范围 — 验证矩形四边是否为黑色
+MIN_AREA   = r.get("min_area", 3500)
+MAX_AREA   = r.get("max_area", 180000)
+# 矩形面积范围(像素²) — 过滤太小(噪点)和太大(全画面)
+MIN_ASPECT = r.get("min_aspect", 1.05)
+MAX_ASPECT = r.get("max_aspect", 2.80)
+TARGET_ASPECT = r.get("target_aspect", 1.55)
+# 宽高比: 正方形≈1.0, 横长方形>1.0, 竖长方形<1.0
+BORDER_EXPAND_X = r.get("border_expand_x", 16)
+BORDER_EXPAND_Y = r.get("border_expand_y", 16)
+# 检测框向外扩展像素，用于黑边/白心验证
+BLACK_CHECK_STEP = r.get("black_check_step", 4)
+MIN_BLACK_HITS   = r.get("min_black_hits", 3)
+# 黑边验证: 四边中至少3边有足够黑色像素
+CENTER_WHITE_STEP = r.get("center_white_step", 3)
+# 白心验证: 中心区域白色像素占比阈值
+MAX_CENTER_JUMP = r.get("max_center_jump", 220)
+# 帧间中心跳跃上限(像素) — 超过此值的候选框被忽略
+MAX_AREA_RATIO  = r.get("max_area_ratio", 3)
+# 帧间面积变化比例上限
+MIN_RECT_FILL   = r.get("min_rect_fill", 45)
+# 轮廓面积/外接矩形面积 最小百分比
+MAX_SIDE_RATIO  = r.get("max_side_ratio", 3)
+# 四边形对边长度比上限
+APPROX_EPSILON  = r.get("approx_epsilon", 0.04)
+# approxPolyDP精度: 0.04=轮廓周长的4%作为逼近误差
 
-# ---- ROI 追踪 ----
-ROI_MARGIN   = 80                # 窗口半边长（检测分辨率）
-ROI_LOST_MAX = 30                # 连续丢失多少帧恢复全图
+# ---- 跟踪 ----
+t = _get(CFG, "tracking", {})
+SMOOTH_NUM = t.get("smooth_num", 0)
+SMOOTH_DEN = t.get("smooth_den", 1)
+# 指数平滑: new = (old*SMOOTH_NUM + new)/SMOOTH_DEN
+# 0/1=不平滑, 1/2=一半旧一半新, 2/3=偏旧
+LOST_KEEP_FRAMES = t.get("lost_keep_frames", 2)
+# 目标丢失后保留上一帧坐标的帧数 — 遮挡短暂恢复
 
-# ---- 串口 ----
-UART_PORT = 2
-UART_BAUD = 115200
+# ---- 中心/激光偏移 ----
+CENTER_CFG = _get(CFG, "center", {})
+CENTER_X = CENTER_CFG.get("x", SENSOR_W // 2)
+CENTER_Y = CENTER_CFG.get("y", SENSOR_H // 2)
+# 画面中心像素坐标 — 分辨率改变时需同步更新
+LASER_OFFSET_X = CENTER_CFG.get("laser_offset_x", 0)
+LASER_OFFSET_Y = CENTER_CFG.get("laser_offset_y", 0)
+# 激光光斑相对摄像头光轴的像素偏移(标定值)
 
-# ---- 显示 ----
-debug_draw_rect     = True
-debug_draw_crosshair = True
-print_fps_terminal  = True
-OSD_EVERY_N = 2                  # OSD 每 N 帧刷新一次（1=每帧, 2=隔帧）
-DET_SKIP_N  = 2                  # 检测每 N 帧跑一次（1=每帧, 2=隔帧，用上次结果填充）
+# ---- 降采样检测 ----
+DRES = _get(CFG, "detect_resolution", {})
+USE_DOWNSCALE = DRES.get("enabled", False)
+# 开启后检测在低分辨率上运行: 320x240仅1/4像素量
+# 注意: cv2.resize有开销，实际帧率提升需实测。默认关闭
+DETECT_W = DRES.get("width",  320)
+DETECT_H = DRES.get("height", 240)
+SCALE_X = SENSOR_W / DETECT_W
+SCALE_Y = SENSOR_H / DETECT_H
 
-# =====================================================================
+# ---- YOLO KPU ----
+YOLO_CFG = _get(CFG, "yolo", {})
 
-SCALE_X = float(CAM_WIDTH)  / float(DET_WIDTH)   # 2.5
-SCALE_Y = float(CAM_HEIGHT) / float(DET_HEIGHT)  # 2.5
+# ---- 卡尔曼(EMA)开关 ----
+k = _get(CFG, "kalman", {})
+KALMAN_ENABLED = k.get("enabled", False)
+KALMAN_ALPHA   = k.get("smooth_factor", 0.3)
+# alpha越大→越跟手但越抖; alpha越小→越平滑但越延迟
+# 0.2=很平滑(适合静态对准), 0.6=跟手(适合快速追踪), 0.3=平衡
 
-_angle_limit_sq = math.cos(math.radians(90 - ANGLE_TOL)) ** 2
+# ---- 串口开关 ----
+u = _get(CFG, "uart", {})
+UART_ENABLED = u.get("enabled", False)
+# 开启后向云台发送 dx,dy,dist,status
 
-# 全局
-yolo_app = None
-uart = None
+# ============================================================================
+# 三、检测算法 — 纯函数，直接读全局参数（热路径优化）
+#    不改函数签名，所有阈值通过模块全局变量传递
+# ============================================================================
 
-# ROI 追踪状态（检测分辨率坐标）
-_roi_last_x = None
-_roi_last_y = None
-_roi_lost_count = 0
+def point_xy(point):
+    """统一解析OpenCV point类型 → (int(x), int(y))"""
+    try:                     return int(point[0][0]), int(point[0][1])
+    except Exception:        return int(point[0]), int(point[1])
 
+def order_points(points):
+    """四点排序: 左上→右上→右下→左下"""
+    pts = [point_xy(p) for p in points]
+    cx = sum([p[0] for p in pts]) // 4
+    cy = sum([p[1] for p in pts]) // 4
+    top, bottom = [], []
+    for p in pts:
+        if p[1] < cy: top.append(p)
+        else:         bottom.append(p)
+    if len(top) != 2 or len(bottom) != 2:
+        pts.sort(key=lambda p: p[1])
+        top, bottom = pts[:2], pts[2:]
+    top.sort(key=lambda p: p[0])
+    bottom.sort(key=lambda p: p[0])
+    return [top[0], top[1], bottom[1], bottom[0]]
 
-# =========================== CV: find_rects ===========================
+def center_of(points):
+    return (sum(point_xy(p)[0] for p in points) // 4,
+            sum(point_xy(p)[1] for p in points) // 4)
 
-def poly_area(p0, p1, p2, p3):
-    a  = p0[0]*p1[1] - p1[0]*p0[1]
-    a += p1[0]*p2[1] - p2[0]*p1[1]
-    a += p2[0]*p3[1] - p3[0]*p2[1]
-    a += p3[0]*p0[1] - p0[0]*p3[1]
-    if a < 0: a = -a
-    return a * 0.5
+def get_contours(result):
+    """兼容不同OpenCV版本的findContours返回值"""
+    return result[0] if len(result) == 2 else result[1]
 
+def has_black_border(frame_np, x, y, w, h):
+    """验证矩形四边是否有足够黑色像素（黑边框检测）"""
+    if w < 20 or h < 20: return False
+    black = cv2.inRange(frame_np, BLACK_LOW, BLACK_HIGH)
+    edge = max(2, min(w, h) // 18)
+    top    = black[y:y+edge,    x:x+w]
+    bottom = black[y+h-edge:y+h, x:x+w]
+    left   = black[y:y+h,       x:x+edge]
+    right  = black[y:y+h,       x+w-edge:x+w]
+    hits = 0
+    if cv2.countNonZero(top)    > w // BLACK_CHECK_STEP: hits += 1
+    if cv2.countNonZero(bottom) > w // BLACK_CHECK_STEP: hits += 1
+    if cv2.countNonZero(left)   > h // BLACK_CHECK_STEP: hits += 1
+    if cv2.countNonZero(right)  > h // BLACK_CHECK_STEP: hits += 1
+    return hits >= MIN_BLACK_HITS
 
-def aspect_ok(p0, p1, p2, p3):
-    xs = [p0[0], p1[0], p2[0], p3[0]]
-    ys = [p0[1], p1[1], p2[1], p3[1]]
-    w = max(xs) - min(xs)
-    h = max(ys) - min(ys)
-    if w < 1 or h < 1:
-        return False
-    r = float(w)/float(h) if w > h else float(h)/float(w)
-    return ASPECT_MIN <= r <= ASPECT_MAX
+def clamp_box(x, y, w, h):
+    """裁切检测框到画面范围内"""
+    if x < 0: x = 0
+    if y < 0: y = 0
+    if x + w > SENSOR_W: w = SENSOR_W - x
+    if y + h > SENSOR_H: h = SENSOR_H - y
+    return x, y, w, h
 
+def has_white_center(white_mask, x, y, w, h):
+    """验证矩形中心区域是否有足够白色像素（白心检测）"""
+    ix, iy = x+w//4, y+h//4
+    iw, ih = w//2, h//2
+    if iw <= 0 or ih <= 0: return False
+    roi = white_mask[iy:iy+ih, ix:ix+iw]
+    return cv2.countNonZero(roi) > (iw * ih) // CENTER_WHITE_STEP
 
-def angle_ok(p0, p1, p2, p3):
-    pts = (p0, p1, p2, p3)
-    for i in range(4):
-        prev = pts[(i-1)%4]; curr = pts[i]; nxt = pts[(i+1)%4]
-        v1x = float(prev[0]) - float(curr[0])
-        v1y = float(prev[1]) - float(curr[1])
-        v2x = float(nxt[0])  - float(curr[0])
-        v2y = float(nxt[1])  - float(curr[1])
-        m1 = v1x*v1x + v1y*v1y
-        m2 = v2x*v2x + v2y*v2y
-        if m1 < 0.001 or m2 < 0.001:
-            return False
-        dot = v1x*v2x + v1y*v2y
-        if dot * dot > _angle_limit_sq * m1 * m2:
-            return False
+def quad_bounds(box):
+    """四边形外接矩形"""
+    xs = [p[0] for p in box]; ys = [p[1] for p in box]
+    return min(xs), min(ys), max(xs)-min(xs), max(ys)-min(ys)
+
+def quad_average_center(box):
+    """四边形顶点均值中心"""
+    return (sum(p[0] for p in box)//4, sum(p[1] for p in box)//4)
+
+def quad_center(box):
+    """四边形对角线交点（精确中心）"""
+    x1,y1 = box[0]; x2,y2 = box[2]; x3,y3 = box[1]; x4,y4 = box[3]
+    den = (x1-x2)*(y3-y4) - (y1-y2)*(x3-x4)
+    if den == 0: return quad_average_center(box)
+    pre  = x1*y2 - y1*x2
+    post = x3*y4 - y3*x4
+    cx = (pre*(x3-x4) - (x1-x2)*post) // den
+    cy = (pre*(y3-y4) - (y1-y2)*post) // den
+    return int(cx), int(cy)
+
+def score_box(x, y, w, h, box_area, aspect, last_box):
+    """候选框评分: 面积大 + 接近目标宽高比 + 靠近上一帧位置 = 高分"""
+    cx, cy = x + w//2, y + h//2
+    aspect_bias = abs(aspect - TARGET_ASPECT) * 1000
+    if last_box:
+        lx, ly = quad_center(last_box)
+        return box_area - (abs(cx-lx)+abs(cy-ly))*8 - aspect_bias
+    return box_area - (abs(cx-SENSOR_W//2)+abs(cy-SENSOR_H//2))*2 - aspect_bias
+
+def side_len2(a, b):
+    dx, dy = a[0]-b[0], a[1]-b[1]
+    return dx*dx + dy*dy
+
+def is_good_quad(quad, contour_area, box_area):
+    """多维度验证四边形质量: 填充率/边长比/对边比"""
+    if contour_area * 100 < box_area * MIN_RECT_FILL: return False
+    top, right = side_len2(quad[0], quad[1]), side_len2(quad[1], quad[2])
+    bottom, left = side_len2(quad[2], quad[3]), side_len2(quad[3], quad[0])
+    sides = [top, right, bottom, left]
+    if min(sides) <= 0: return False
+    if max(sides) > min(sides) * MAX_SIDE_RATIO * MAX_SIDE_RATIO: return False
+    long_side  = max((top+bottom)//2, (left+right)//2)
+    short_side = min((top+bottom)//2, (left+right)//2)
+    if short_side <= 0: return False
+    if long_side > short_side * MAX_ASPECT * MAX_ASPECT: return False
+    if long_side * 100 < short_side * MIN_ASPECT * MIN_ASPECT * 100: return False
     return True
 
+def contour_quad(cnt, box_area):
+    """轮廓→四边形，含多边形逼近和质量验证"""
+    peri = cv2.arcLength(cnt, True)
+    approx = cv2.approxPolyDP(cnt, APPROX_EPSILON * peri, True)
+    if len(approx) != 4: return None
+    quad = order_points(approx)
+    if not is_good_quad(quad, cv2.contourArea(cnt), box_area): return None
+    return quad
 
-def centroid(corners):
-    sx = sum(c[0] for c in corners)
-    sy = sum(c[1] for c in corners)
-    return (int(sx / 4), int(sy / 4))
+def find_paper_box(frame_np, last_box):
+    """核心检测: 白色掩膜→轮廓筛选→黑边验证→白心验证→评分→最优框"""
+    mask = cv2.inRange(frame_np, WHITE_LOW, WHITE_HIGH)
+    contours = get_contours(cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE))
+    best, best_score = None, -1
+    area_count = 0
+    last_cx = last_cy = last_area = 0
+    if last_box:
+        last_cx, last_cy = quad_center(last_box)
+        lx, ly, lw, lh = quad_bounds(last_box)
+        last_area = lw * lh
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        if w <= 0 or h <= 0: continue
+        box_area = w * h
+        if box_area < MIN_AREA or box_area > MAX_AREA: continue
+        area_count += 1
+        aspect = w / h
+        if aspect < MIN_ASPECT or aspect > MAX_ASPECT: continue
+        x -= BORDER_EXPAND_X; y -= BORDER_EXPAND_Y
+        w += BORDER_EXPAND_X*2; h += BORDER_EXPAND_Y*2
+        x, y, w, h = clamp_box(x, y, w, h)
+        cx, cy = x + w//2, y + h//2
+        if last_box and abs(cx-last_cx)+abs(cy-last_cy) > MAX_CENTER_JUMP: continue
+        if last_area and (box_area > last_area*MAX_AREA_RATIO or last_area > box_area*MAX_AREA_RATIO): continue
+        if not has_white_center(mask, x, y, w, h): continue
+        if not has_black_border(frame_np, x, y, w, h): continue
+        quad = contour_quad(cnt, box_area)
+        if not quad: continue
+        score = score_box(x, y, w, h, box_area, aspect, last_box)
+        if score > best_score: best_score = score; best = quad
+    return best, len(contours), area_count
 
+def smooth_box(last_box, box):
+    """四边形顶点指数平滑: 减少帧间抖动"""
+    if not last_box: return box
+    return [((last_box[i][0]*SMOOTH_NUM + box[i][0]) // SMOOTH_DEN,
+             (last_box[i][1]*SMOOTH_NUM + box[i][1]) // SMOOTH_DEN)
+            for i in range(4)]
 
-def detect_cv(img):
-    """find_rects 矩形检测 + ROI追踪"""
-    global _roi_last_x, _roi_last_y, _roi_lost_count
+def draw_box(frame_np, box, source):
+    """绘制检测框+十字线+中心点, 返回 (cx, cy, dx, dy)"""
+    for i in range(4):
+        cv2.line(frame_np, box[i], box[(i+1)%4], (0, 255, 0), 2)
+    cx, cy = quad_center(box)
+    dx, dy = cx - CENTER_X, cy - CENTER_Y
+    cv2.line(frame_np, (cx-14, cy), (cx+14, cy), (255, 255, 0), 2)
+    cv2.line(frame_np, (cx, cy-14), (cx, cy+14), (255, 255, 0), 2)
+    cv2.circle(frame_np, (cx, cy), 4, (0, 0, 255), 1)
+    return cx, cy, dx, dy
 
-    # ROI 搜索
-    if _roi_last_x is not None and _roi_lost_count < ROI_LOST_MAX:
-        rx = max(0, _roi_last_x - ROI_MARGIN)
-        ry = max(0, _roi_last_y - ROI_MARGIN)
-        rw = min(DET_WIDTH  - rx, ROI_MARGIN * 2)
-        rh = min(DET_HEIGHT - ry, ROI_MARGIN * 2)
-        try:
-            rects = img.find_rects(threshold=FIND_RECTS_THRESHOLD,
-                                   roi=(rx, ry, rw, rh))
-            found_in_roi = True
-        except Exception:
-            rects = img.find_rects(threshold=FIND_RECTS_THRESHOLD)
-            found_in_roi = False
-    else:
-        rects = img.find_rects(threshold=FIND_RECTS_THRESHOLD)
-        found_in_roi = False
+# ============================================================================
+# 四、可选功能注入 — lambda模式, 热路径零分支
+#    开启: 创建真实函数对象并绑定
+#    关闭: 绑定为lambda identity / no-op
+#    主循环中无感调用, 无 if 判断开销
+# ============================================================================
 
-    if not rects:
-        if found_in_roi:
-            rects = img.find_rects(threshold=FIND_RECTS_THRESHOLD)
-        if not rects:
-            _roi_lost_count += 1
-            return None
-
-    best = None
-    best_score = 0
-    for r in rects:
-        c = r.corners()
-        if len(c) != 4:
-            continue
-        p0, p1, p2, p3 = c[0], c[1], c[2], c[3]
-        area = poly_area(p0, p1, p2, p3)
-        if area < RECT_AREA_MIN:
-            continue
-        if not aspect_ok(p0, p1, p2, p3):
-            continue
-        if not angle_ok(p0, p1, p2, p3):
-            continue
-        cx, cy = centroid(c)
-        if cx < 0 or cx >= DET_WIDTH or cy < 0 or cy >= DET_HEIGHT:
-            continue
-        if area > best_score:
-            best_score = area
-            best = (cx, cy, c)
-
-    if best is None:
-        _roi_lost_count += 1
-        return None
-
-    cx_det, cy_det, corners = best
-    _roi_last_x = cx_det
-    _roi_last_y = cy_det
-    _roi_lost_count = 0
-    return (int(cx_det * SCALE_X), int(cy_det * SCALE_Y),
-            corners, (cx_det, cy_det))
-
-
-# =========================== Blob: find_blobs ===========================
-
-def bg_white_check(img, blob):
-    """
-    检查色块周边是否为白色背景。
-    在色块边界框外围采样 8 个点，如果大多数是亮色则通过。
-    """
-    x = blob.x()
-    y = blob.y()
-    w = blob.w()
-    h = blob.h()
-    gap = BG_SAMPLE_GAP
-
-    # 8 个采样点：四边中点 + 四角
-    samples = [
-        (x + w // 2, y - gap),           # 上边中点
-        (x + w // 2, y + h + gap),       # 下边中点
-        (x - gap,      y + h // 2),       # 左边中点
-        (x + w + gap,  y + h // 2),       # 右边中点
-        (x - gap,      y - gap),          # 左上角
-        (x + w + gap,  y - gap),          # 右上角
-        (x - gap,      y + h + gap),      # 左下角
-        (x + w + gap,  y + h + gap),      # 右下角
-    ]
-
-    ok = 0
-    for sx, sy in samples:
-        if sx < 2 or sy < 2 or sx >= DET_WIDTH - 2 or sy >= DET_HEIGHT - 2:
-            ok += 1  # 出界也算通过（可能是画面边缘的靶标）
-            continue
-        try:
-            r, g, b = img.get_pixel(sx, sy)
-            if r >= BG_WHITE_MIN and g >= BG_WHITE_MIN and b >= BG_WHITE_MIN:
-                ok += 1
-        except Exception:
-            ok += 1  # 读不到也算通过，不断在边界情况
-
-    return ok >= BG_SAMPLE_OK
-
-
-
-def detect_blob(img):
-    """
-    硬件色块检测 + ROI追踪 + 几何约束。
-    收紧 LAB 阈值 + 长宽比 + 密度 + 白底约束，过滤误判。
-    """
-    global _roi_last_x, _roi_last_y, _roi_lost_count
-
-    thresholds = [BLOB_L_THRESHOLD, BLOB_A_THRESHOLD, BLOB_B_THRESHOLD]
-
-    # ROI 搜索
-    if _roi_last_x is not None and _roi_lost_count < ROI_LOST_MAX:
-        rx = max(0, _roi_last_x - ROI_MARGIN)
-        ry = max(0, _roi_last_y - ROI_MARGIN)
-        rw = min(DET_WIDTH  - rx, ROI_MARGIN * 2)
-        rh = min(DET_HEIGHT - ry, ROI_MARGIN * 2)
-        try:
-            blobs = img.find_blobs(thresholds, roi=(rx, ry, rw, rh),
-                                   pixels_threshold=BLOB_PIXELS_MIN,
-                                   area_threshold=BLOB_AREA_MIN,
-                                   merge=BLOB_MERGE)
-            found_in_roi = True
-        except Exception:
-            blobs = img.find_blobs(thresholds,
-                                   pixels_threshold=BLOB_PIXELS_MIN,
-                                   area_threshold=BLOB_AREA_MIN,
-                                   merge=BLOB_MERGE)
-            found_in_roi = False
-    else:
-        blobs = img.find_blobs(thresholds,
-                               pixels_threshold=BLOB_PIXELS_MIN,
-                               area_threshold=BLOB_AREA_MIN,
-                               merge=BLOB_MERGE)
-        found_in_roi = False
-
-    if not blobs:
-        if found_in_roi:
-            blobs = img.find_blobs(thresholds,
-                                   pixels_threshold=BLOB_PIXELS_MIN,
-                                   area_threshold=BLOB_AREA_MIN,
-                                   merge=BLOB_MERGE)
-        if not blobs:
-            _roi_lost_count += 1
-            return None
-
-    # 选面积最大且通过全部约束的色块
-    best = None
-    best_area = 0
-    for b in blobs:
-        if b.area() <= best_area:
-            continue
-        # ① 长宽比：必须接近矩形靶标
-        bw, bh = b.w(), b.h()
-        if bw < 8 or bh < 8:
-            continue
-        aspect = float(bw) / float(bh) if bw > bh else float(bh) / float(bw)
-        if aspect < BLOB_ASPECT_MIN or aspect > BLOB_ASPECT_MAX:
-            continue
-        # ② 密度：空心框密度低，实心噪点→1.0
-        try:
-            density = b.density()
-        except Exception:
-            density = 1.0
-        if density > BLOB_DENSITY_MAX:
-            continue
-
-        # ③ 背景白底检查
-        if not bg_white_check(img, b):
-            continue
-
-        best_area = b.area()
-        best = b
-
-    if best is None:
-        _roi_lost_count += 1
-        return None
-
-    cx_det = best.cx()
-    cy_det = best.cy()
-    _roi_last_x = cx_det
-    _roi_last_y = cy_det
-    _roi_lost_count = 0
-
-    # blob 的角点（最小外接矩形）
-    corners = None
-    try:
-        corners = best.corners()
-        if len(corners) != 4:
-            corners = None
-    except Exception:
-        pass
-
-    return (int(cx_det * SCALE_X), int(cy_det * SCALE_Y),
-            corners, (cx_det, cy_det))
-
-
-# =========================== YOLO: KPU ================================
-
-def detect_yolo(img):
-    global yolo_app
-    try:
-        res = yolo_app.run(img)
-        if res and len(res) > 0:
-            x, y, w, h = map(lambda v: int(round(v, 0)), res[0][0])
-            cx = x + w // 2
-            cy = y + h // 2
-            return (int(cx * SCALE_X), int(cy * SCALE_Y), None, (cx, cy))
-    except Exception:
-        pass
-    return None
-
-
-# ===================== Cascade: blob粗筛 → rect精验 ======================
-
-CASCADE_BLOB_PIXELS = 60         # blob 粗筛：宽松，多收候选
-CASCADE_BLOB_AREA   = 60
-CASCADE_RECT_THRESH = 10000      # rect 精验阈值
-CASCADE_ROI_PAD     = 20         # blob 边界框外扩
-CASCADE_RECT_AREA_MIN = 150
-
-def detect_cascade(img):
-    """
-    两级硬件级联：S1: find_blobs 全图快扫 → S2: find_rects 候选区内精验。
-    blob 负责速度（不漏），rect 负责精度（不误判）。
-    """
-    global _roi_last_x, _roi_last_y, _roi_lost_count
-
-    thresholds = [BLOB_L_THRESHOLD, BLOB_A_THRESHOLD, BLOB_B_THRESHOLD]
-
-    # S1: blob 粗筛
-    if _roi_last_x is not None and _roi_lost_count < ROI_LOST_MAX:
-        rx = max(0, _roi_last_x - ROI_MARGIN)
-        ry = max(0, _roi_last_y - ROI_MARGIN)
-        rw = min(DET_WIDTH  - rx, ROI_MARGIN * 2)
-        rh = min(DET_HEIGHT - ry, ROI_MARGIN * 2)
-        try:
-            blobs = img.find_blobs(thresholds, roi=(rx, ry, rw, rh),
-                                   pixels_threshold=CASCADE_BLOB_PIXELS,
-                                   area_threshold=CASCADE_BLOB_AREA, merge=True)
-        except Exception:
-            blobs = img.find_blobs(thresholds,
-                                   pixels_threshold=CASCADE_BLOB_PIXELS,
-                                   area_threshold=CASCADE_BLOB_AREA, merge=True)
-    else:
-        blobs = img.find_blobs(thresholds,
-                               pixels_threshold=CASCADE_BLOB_PIXELS,
-                               area_threshold=CASCADE_BLOB_AREA, merge=True)
-
-    if not blobs:
-        _roi_lost_count += 1
-        return None
-
-    # 按面积降序 — 优先验证最大候选
-    blobs.sort(key=lambda b: b.area(), reverse=True)
-
-    # S2: rect 精验 — 在候选 ROI 内找矩形
-    for b in blobs:
-        bx, by, bw, bh = b.x(), b.y(), b.w(), b.h()
-        pad = CASCADE_ROI_PAD
-        rx = max(0, bx - pad)
-        ry = max(0, by - pad)
-        rw = min(DET_WIDTH  - rx, bw + pad * 2)
-        rh = min(DET_HEIGHT - ry, bh + pad * 2)
-
-        try:
-            rects = img.find_rects(threshold=CASCADE_RECT_THRESH,
-                                   roi=(rx, ry, rw, rh))
-        except Exception:
-            continue
-
-        if not rects:
-            continue
-
-        best_r = None
-        best_area = 0
-        for r in rects:
-            c = r.corners()
-            if len(c) != 4:
-                continue
-            area = poly_area(c[0], c[1], c[2], c[3])
-            if area < CASCADE_RECT_AREA_MIN:
-                continue
-            if area > best_area:
-                best_area = area
-                best_r = (c, area)
-
-        if best_r is not None:
-            corners, _ = best_r
-            cx_det, cy_det = centroid(corners)
-            _roi_last_x = cx_det
-            _roi_last_y = cy_det
-            _roi_lost_count = 0
-            return (int(cx_det * SCALE_X), int(cy_det * SCALE_Y),
-                    corners, (cx_det, cy_det))
-
-    _roi_lost_count += 1
-    return None
-
-
-# =========================== 统一入口 =================================
-
-def detect(img):
-    if DETECTION_MODE == "cv":
-        return detect_cv(img)
-    elif DETECTION_MODE == "blob":
-        return detect_blob(img)
-    elif DETECTION_MODE == "cascade":
-        return detect_cascade(img)
-    else:
-        return detect_yolo(img)
-
-
-# =========================== 串口通信 =================================
-
-def send_tracking_data(dx, dy, lost=False):
-    if uart is None:
-        return
-    try:
-        if lost:
-            uart.write("404,404,0,0\n")
+# ---- 卡尔曼滤波器(EMA) ----
+# 功能: 对dx,dy做一阶指数平滑, 减少检测抖动
+# 配置: kalman.enabled / kalman.smooth_factor
+# 关闭时: kf_update = 透传(float转换), kf_reset = no-op
+class _Kalman:
+    def __init__(self, a): self.a, self.x, self.y = a, None, None
+    def update(self, mx, my):
+        if self.x is None: self.x, self.y = float(mx), float(my)
         else:
-            uart.write("%d,%d,0,0\n" % (dx, dy))
-    except Exception:
-        pass
+            a = self.a
+            self.x = a*float(mx) + (1-a)*self.x
+            self.y = a*float(my) + (1-a)*self.y
+        return self.x, self.y
+    def reset(self): self.x = self.y = None
 
+if KALMAN_ENABLED:
+    _kf = _Kalman(KALMAN_ALPHA)
+    kf_update = _kf.update      # 真实EMA
+    kf_reset  = _kf.reset
+else:
+    kf_update = lambda mx, my: (float(mx), float(my))  # 透传
+    kf_reset  = lambda: None                            # 空操作
 
-# =========================== 画图工具 =================================
-
-def draw_crosshair(img, cx, cy, size=20, color=(255, 255, 0), thickness=2):
-    img.draw_line(cx - size, cy, cx + size, cy, color, thickness)
-    img.draw_line(cx, cy - size, cx, cy + size, color, thickness)
-
-
-# =========================== 初始化 ===================================
-
-def init_yolo():
-    global yolo_app
-    if not YOLO_LIBS_AVAILABLE:
-        print("[YOLO] KPU库不可用")
-        return False
+# ---- 串口输出 ----
+# 功能: 通过UART向云台STM32发送 dx,dy,dist,status
+# 协议: "dx,dy,dist,status\n"  status: 0=追踪 1=对准 404=丢失
+# 配置: uart.enabled / uart.port / uart.baud
+# 关闭时: uart_send = no-op
+if UART_ENABLED:
     try:
-        class YOLOv8App(AIBase):
-            def __init__(self, kmodel_path, labels, model_input_size,
-                         max_boxes_num=30, confidence_threshold=0.3,
-                         nms_threshold=0.4, rgb888p_size=None,
-                         display_size=None, debug_mode=0):
-                if rgb888p_size is None:
-                    rgb888p_size = model_input_size
-                if display_size is None:
-                    display_size = [1920, 1080]
-                super().__init__(kmodel_path, model_input_size,
-                                 rgb888p_size, debug_mode)
-                self.labels = labels
-                self.model_input_size = model_input_size
-                self.confidence_threshold = confidence_threshold
-                self.nms_threshold = nms_threshold
-                self.max_boxes_num = max_boxes_num
-                self.rgb888p_size = [ALIGN_UP(rgb888p_size[0], 16),
-                                     rgb888p_size[1]]
-                self.display_size = [ALIGN_UP(display_size[0], 16),
-                                     display_size[1]]
-                self.debug_mode = debug_mode
-                self.color_four = get_colors(len(self.labels))
-                self.ai2d = Ai2d(debug_mode)
-                self.ai2d.set_ai2d_dtype(nn.ai2d_format.NCHW_FMT,
-                                         nn.ai2d_format.NCHW_FMT,
-                                         np.uint8, np.uint8)
-
-            def config_preprocess(self, input_image_size=None):
-                ai2d_input_size = (input_image_size
-                                   if input_image_size else self.rgb888p_size)
-                top, bottom, left, right, self.scale = letterbox_pad_param(
-                    self.rgb888p_size, self.model_input_size)
-                self.ai2d.pad([0,0,0,0,top,bottom,left,right], 0, [128,128,128])
-                self.ai2d.resize(nn.interp_method.tf_bilinear,
-                                 nn.interp_mode.half_pixel)
-                self.ai2d.build(
-                    [1,3,ai2d_input_size[1],ai2d_input_size[0]],
-                    [1,3,self.model_input_size[1],self.model_input_size[0]])
-
-            def preprocess(self, input_np):
-                return [nn.from_numpy(input_np)]
-
-            def postprocess(self, results):
-                new_result = results[0][0].transpose()
-                det_res = aidemo.yolov8_det_postprocess(
-                    new_result.copy(),
-                    [self.rgb888p_size[1], self.rgb888p_size[0]],
-                    [self.model_input_size[1], self.model_input_size[0]],
-                    [self.display_size[1], self.display_size[0]],
-                    len(self.labels), self.confidence_threshold,
-                    self.nms_threshold, self.max_boxes_num)
-                return det_res
-
-        yolo_app = YOLOv8App(KMODEL_PATH, YOLO_LABELS, YOLO_INPUT,
-                             confidence_threshold=YOLO_CONF,
-                             nms_threshold=YOLO_NMS,
-                             rgb888p_size=[DET_WIDTH, DET_HEIGHT])
-        yolo_app.config_preprocess()
-        print("[YOLO] 初始化成功: %s" % KMODEL_PATH)
-        return True
+        from machine import UART
+        _uart_port = u.get("port", 2)
+        _uart_baud = u.get("baud", 115200)
+        _uart = UART(_uart_port, baudrate=_uart_baud)
+        print("uart: port=%d baud=%d" % (_uart_port, _uart_baud))
+        def uart_send(dx, dy, dist, status):
+            """发送偏差到云台 — 协议: dx,dy,dist,status\\n"""
+            try:
+                if status == "lost":
+                    _uart.write("404,404,0,0\n")
+                elif status == "aligned":
+                    _uart.write("%d,%d,%.0f,1\n" % (dx, dy, dist))
+                else:
+                    _uart.write("%d,%d,%.0f,0\n" % (dx, dy, dist))
+            except Exception:
+                pass
     except Exception as e:
-        print("[YOLO] 初始化失败: %s" % e)
-        return False
+        print("uart init failed:", e)
+        uart_send = lambda dx, dy, d, s: None
+else:
+    uart_send = lambda dx, dy, d, s: None
 
+# ============================================================================
+# 五、CV模式主循环
+#    热路径结构与初版main.py一致 → 保证帧率
+#    新增: kf_update/uart_send已在上方注入, 此处直接调用
+# ============================================================================
 
-# =========================== 主程序 ===================================
+def run_cv():
+    global SENSOR_W, SENSOR_H  # 降采样时会临时改写
 
-def main():
-    global yolo_app, uart, DETECTION_MODE
-    global _roi_last_x, _roi_last_y, _roi_lost_count
-
-    print("=" * 60)
-    print("K230 靶标追踪 v3.0 — %s 模式" % DETECTION_MODE.upper())
-    print("=" * 60)
-    print("分辨率:  %dx%d (检测 %dx%d)" %
-          (CAM_WIDTH, CAM_HEIGHT, DET_WIDTH, DET_HEIGHT))
-    print("ROI窗口: %dpx | 丢失阈值: %d帧" % (ROI_MARGIN, ROI_LOST_MAX))
-    if DETECTION_MODE == "blob":
-        print("色块阈值: L%s A%s B%s" %
-              (BLOB_L_THRESHOLD, BLOB_A_THRESHOLD, BLOB_B_THRESHOLD))
-    print("=" * 60)
-
-    sensor_obj = None
-    yolo_app = None
-    uart = None
+    sensor = None
+    frame_id = lost_count = 0
+    last_box = None
+    fps = fps_count = 0
+    fps_tick = time.ticks_ms()
+    sw_orig, sh_orig = SENSOR_W, SENSOR_H
 
     try:
-        # ---- 摄像头 ----
-        sensor_obj = Sensor(id=SENSOR_ID)
-        sensor_obj.reset()
-
-        sensor_obj.set_framesize(width=CAM_WIDTH, height=CAM_HEIGHT,
-                                 chn=CAM_CHN_ID_0)
-        sensor_obj.set_pixformat(Sensor.RGB565, chn=CAM_CHN_ID_0)
-        bind_info = sensor_obj.bind_info(chn=CAM_CHN_ID_0)
-        Display.bind_layer(**bind_info, layer=Display.LAYER_VIDEO1)
-
-        sensor_obj.set_framesize(width=DET_WIDTH, height=DET_HEIGHT,
-                                 chn=CAM_CHN_ID_1)
-        sensor_obj.set_pixformat(Sensor.RGB565, chn=CAM_CHN_ID_1)
-
-        # chn2: 全分辨率 → OSD 叠加
-        sensor_obj.set_framesize(width=CAM_WIDTH, height=CAM_HEIGHT,
-                                 chn=CAM_CHN_ID_2)
-        sensor_obj.set_pixformat(Sensor.RGB565, chn=CAM_CHN_ID_2)
-
-        Display.init(Display.ST7701, width=800, height=480,
-                     to_ide=True, osd_num=1)
-        sensor_obj.run()
-        print("HW   OK | CAM+Display")
-
-        # ---- YOLO ----
-        if DETECTION_MODE == "yolo":
-            if not init_yolo():
-                print("[WARN] YOLO失败，回退blob")
-                DETECTION_MODE = "blob"
-
-        # ---- 串口 ----
-        try:
-            uart = UART(UART_PORT, UART_BAUD)
-            print("UART OK | UART%d @ %d" % (UART_PORT, UART_BAUD))
-        except Exception as e:
-            print("UART -- | %s" % e)
-
-        # ---- 状态 ----
-        center_pos = (CAM_WIDTH // 2, CAM_HEIGHT // 2)
-        last_det_info = None
-        last_dx, last_dy = 0, 0
-
-        clock = time.clock()
-        frame = 0
-        lost_ms = 0
-        lost_on = False
-
-        # 丢弃前 10 帧
-        for _ in range(10):
-            sensor_obj.snapshot(chn=CAM_CHN_ID_1)
-
-        print("LOOP...")
+        # ---- 初始化 ----
+        print("boot")
+        os.exitpoint(os.EXITPOINT_ENABLE)
+        sensor = Sensor(width=1280, height=960, fps=FPS)
+        sensor.reset()
+        sensor.set_framesize(width=SENSOR_W, height=SENSOR_H, chn=CAM_CHN_ID_0)
+        sensor.set_pixformat(Sensor.RGB888, chn=CAM_CHN_ID_0)
+        print("sensor ok")
+        Display.init(Display.ST7701, width=DISPLAY_W, height=DISPLAY_H, to_ide=SHOW_TO_IDE)
+        MediaManager.init()
+        sensor.run()
+        print("run ok")
 
         while True:
             os.exitpoint()
-            clock.tick()
-            frame += 1
+            frame_id += 1
+            frame = sensor.snapshot(chn=CAM_CHN_ID_0)
+            frame_np = frame.to_numpy_ref()
 
-            # ==== 检测 ====
-            img_det = sensor_obj.snapshot(chn=CAM_CHN_ID_1)
-
-            if frame % DET_SKIP_N == 0:
-                det_info = detect(img_det)
-                if det_info is not None:
-                    cx_full, cy_full, corners, (cx_det, cy_det) = det_info
-                    dx = center_pos[0] - cx_full
-                    dy = center_pos[1] - cy_full
-                    last_det_info = det_info
-                    last_dx, last_dy = dx, dy
-                    lost_on = False
-                    lost_ms = 0
+            # ================================================================
+            # 检测阶段
+            #   detect_every: 跳帧检测 — 非检测帧直接复用last_box
+            #   downscale:    降采样 — 在320x240上检测, 坐标映射回640x480
+            # ================================================================
+            if frame_id % DETECT_EVERY == 0 or not last_box:
+                if USE_DOWNSCALE:
+                    # --- 降采样路径 ---
+                    detect_frame = cv2.resize(frame_np, (DETECT_W, DETECT_H))
+                    SENSOR_W, SENSOR_H = DETECT_W, DETECT_H          # 临时切换尺寸
+                    box, contour_count, area_count = find_paper_box(detect_frame, last_box)
+                    SENSOR_W, SENSOR_H = sw_orig, sh_orig             # 恢复
+                    if box:
+                        box = [[int(p[0]*SCALE_X), int(p[1]*SCALE_Y)] for p in box]
                 else:
-                    if not lost_on:
-                        lost_ms = time.ticks_ms()
-                        lost_on = True
+                    # --- 原版路径(默认) ---
+                    box, contour_count, area_count = find_paper_box(frame_np, last_box)
+            else:
+                box, contour_count, area_count = last_box, 0, 0
 
-            # UART 每帧都发（用最新偏差值）
-            if last_det_info is not None and not lost_on:
-                if uart is not None:
-                    uart.write("%d,%d,0,0\n" % (last_dx, last_dy))
-            elif lost_on and time.ticks_diff(time.ticks_ms(), lost_ms) > 2000:
-                if uart is not None:
-                    uart.write("404,404,0,0\n")
+            # ================================================================
+            # 结果处理阶段
+            #   OK:    检测到 → 平滑 → 绘图 → 卡尔曼 → 距离 → 串口
+            #   HOLD:  短暂丢失 → 复用上一帧坐标
+            #   LOST:  完全丢失 → 重置卡尔曼 → 通知云台
+            # ================================================================
+            if box:
+                # ---- 检测成功 ----
+                box = smooth_box(last_box, box)
+                last_box = box
+                lost_count = 0
+                cx, cy, dx, dy = draw_box(frame_np, box, "OK")
 
-            # ==== OSD ====
-            if OSD_EVERY_N > 0 and frame % OSD_EVERY_N == 0:
-                osd_img = sensor_obj.snapshot(chn=CAM_CHN_ID_2)
+                # 卡尔曼滤波(或透传)
+                fdx, fdy = kf_update(dx, dy)
 
-                if debug_draw_crosshair:
-                    draw_crosshair(osd_img, center_pos[0], center_pos[1])
+                # 欧氏距离: sqrt(dx² + dy²) — 目标到画面中心的像素距离
+                dist = math.sqrt(fdx*fdx + fdy*fdy)
 
-                if last_det_info is not None:
-                    cx_full, cy_full, corners, _ = last_det_info
+                # 串口输出: dx,dy,dist,status
+                uart_send(int(fdx), int(fdy), dist, "track")
 
-                    # 矩形框
-                    if debug_draw_rect and corners and len(corners) == 4:
-                        scaled = [(int(p[0] * SCALE_X), int(p[1] * SCALE_Y))
-                                  for p in corners]
-                        for i in range(4):
-                            osd_img.draw_line(scaled[i][0], scaled[i][1],
-                                              scaled[(i+1)%4][0], scaled[(i+1)%4][1],
-                                              color=(255, 0, 0), thickness=2)
+                if frame_id % PRINT_EVERY == 0:
+                    print("OK  xy=(%d,%d)  d=(%d,%d)  dist=%.0f  c=%d a=%d" %
+                          (cx, cy, int(fdx), int(fdy), dist, contour_count, area_count))
 
-                    # 中心点 + 连线 + 偏差值
-                    osd_img.draw_circle(cx_full, cy_full, 5,
-                                        color=(0, 255, 0), thickness=1, fill=True)
-                    osd_img.draw_line(center_pos[0], center_pos[1],
-                                      cx_full, cy_full,
-                                      color=(0, 255, 255), thickness=2)
-                    osd_img.draw_string_advanced(
-                        cx_full + 8, cy_full - 8, 14,
-                        "(%+d,%+d)" % (last_dx, last_dy),
-                        color=(0, 255, 0))
+            else:
+                # ---- 检测失败 ----
+                lost_count += 1
+                if last_box and lost_count <= LOST_KEEP_FRAMES:
+                    # 短暂丢失 → 保持上一帧位置
+                    cx, cy, dx, dy = draw_box(frame_np, last_box, "HOLD")
+                    fdx, fdy = kf_update(dx, dy)
+                    dist = math.sqrt(fdx*fdx + fdy*fdy)
+                    uart_send(int(fdx), int(fdy), dist, "track")
+                    if frame_id % PRINT_EVERY == 0:
+                        print("HOLD xy=(%d,%d)  d=(%d,%d)  dist=%.0f  c=%d a=%d" %
+                              (cx, cy, int(fdx), int(fdy), dist, contour_count, area_count))
+                else:
+                    # 完全丢失 → 重置状态
+                    last_box = None
+                    kf_reset()
+                    uart_send(0, 0, 0, "lost")
+                    if frame_id % PRINT_EVERY == 0:
+                        print("LOST c=%d a=%d" % (contour_count, area_count))
 
-                # 状态标识
-                osd_img.draw_string_advanced(
-                    2, 2, 14, "%s | %dFPS" % (DETECTION_MODE.upper(), int(clock.fps())),
-                    color=(0, 255, 255))
+            # ================================================================
+            # OSD叠加 — 左上角显示实时偏差和距离
+            # ================================================================
+            if SHOW_OSD and box:
+                cv2.putText(frame_np, "dx:%+d dy:%+d dist:%.0f" % (int(fdx), int(fdy), dist),
+                            (4, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
-                Display.show_image(osd_img, layer=Display.LAYER_OSD1)
+            # ================================================================
+            # FPS统计
+            # ================================================================
+            fps_count += 1
+            now = time.ticks_ms()
+            elapsed = time.ticks_diff(now, fps_tick)
+            if elapsed >= 1000:
+                fps = fps_count * 1000 // elapsed
+                fps_count = 0; fps_tick = now
+            cv2.putText(frame_np, "FPS:%d" % fps, (4, SENSOR_H - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
-            # FPS 终端
-            if print_fps_terminal and frame % 30 == 0:
-                print("[FPS] %d" % int(clock.fps()))
+            Display.show_image(frame, x=DISPLAY_X, y=DISPLAY_Y)
+
+            # ================================================================
+            # 垃圾回收 — 定时清理, 防止内存堆积导致周期性卡顿
+            # ================================================================
+            if frame_id % GC_EVERY == 0:
                 gc.collect()
 
     except KeyboardInterrupt:
-        print("STOP")
-    except Exception as e:
-        print("ERR: " + str(e))
-        import sys
-        sys.print_exception(e)
+        print("user stop")
+    except BaseException as e:
+        print("error:", e)
     finally:
-        if sensor_obj is not None:
-            sensor_obj.stop()
-        Display.deinit()
-        os.exitpoint(os.EXITPOINT_ENABLE_SLEEP)
+        if sensor:
+            try: sensor.stop()
+            except Exception: pass
+        try: Display.deinit()
+        except Exception: pass
+        try: os.exitpoint(os.EXITPOINT_ENABLE_SLEEP)
+        except Exception: pass
         time.sleep_ms(100)
-        gc.collect()
-        print("END")
+        try: MediaManager.deinit()
+        except Exception: pass
+        print("exit")
 
+# ============================================================================
+# 六、YOLO KPU模式
+#    使用K230 PipeLine框架进行KPU推理
+#    功能: 目标检测 → 中心偏差 → 距离 → 串口
+#    前提: SD卡上有model.kmodel, KPU库可用
+# ============================================================================
 
-if __name__ == "__main__":
-    main()
+def _yolo_ok():
+    """检测KPU库是否可用 — 不可用时自动回退CV模式"""
+    try:
+        import nncase_runtime, aidemo
+        from libs.PipeLine import PipeLine
+        from libs.AIBase import AIBase
+        from libs.Ai2d import Ai2d
+        return True
+    except ImportError:
+        return False
+
+def run_yolo():
+    from libs.PipeLine import PipeLine, ScopedTiming
+    from libs.AIBase import AIBase
+    from libs.Ai2d import Ai2d
+    from libs.Utils import ALIGN_UP, letterbox_pad_param, get_colors
+    import nncase_runtime as nn
+    import ulab.numpy as np
+    import aidemo
+
+    MP = YOLO_CFG.get("model_path", "/sdcard/model/model.kmodel")
+    LABELS = YOLO_CFG.get("labels", ["target"])
+    ISIZE  = YOLO_CFG.get("input_size", [320, 320])
+    CONF   = YOLO_CFG.get("confidence", 0.3)
+    NMS    = YOLO_CFG.get("nms_threshold", 0.4)
+    MB     = YOLO_CFG.get("max_boxes", 30)
+
+    class YOLOv8App(AIBase):
+        def __init__(self, kmodel_path, labels, model_input_size, max_boxes_num,
+                     confidence_threshold, nms_threshold, rgb888p_size, display_size, debug_mode=0):
+            super().__init__(kmodel_path, model_input_size, rgb888p_size, debug_mode)
+            self.labels = labels
+            self.model_input_size = model_input_size
+            self.confidence_threshold = confidence_threshold
+            self.nms_threshold = nms_threshold
+            self.max_boxes_num = max_boxes_num
+            self.rgb888p_size = [ALIGN_UP(rgb888p_size[0], 16), rgb888p_size[1]]
+            self.display_size = [ALIGN_UP(display_size[0], 16), display_size[1]]
+            self.debug_mode = debug_mode
+            self.color_four = get_colors(len(labels))
+            self.ai2d = Ai2d(debug_mode)
+            self.ai2d.set_ai2d_dtype(nn.ai2d_format.NCHW_FMT, nn.ai2d_format.NCHW_FMT, np.uint8, np.uint8)
+
+        def config_preprocess(self, input_image_size=None):
+            with ScopedTiming("set preprocess config", self.debug_mode > 0):
+                ai2d_input_size = input_image_size or self.rgb888p_size
+                top, bottom, left, right, self.scale = letterbox_pad_param(self.rgb888p_size, self.model_input_size)
+                self.ai2d.pad([0,0,0,0, top,bottom,left,right], 0, [128,128,128])
+                self.ai2d.resize(nn.interp_method.tf_bilinear, nn.interp_mode.half_pixel)
+                self.ai2d.build([1,3,ai2d_input_size[1],ai2d_input_size[0]],
+                                [1,3,self.model_input_size[1],self.model_input_size[0]])
+
+        def preprocess(self, input_np):
+            with ScopedTiming("preprocess", self.debug_mode > 0):
+                return [nn.from_numpy(input_np)]
+
+        def postprocess(self, results):
+            with ScopedTiming("postprocess", self.debug_mode > 0):
+                nr = results[0][0].transpose()
+                return aidemo.yolov8_det_postprocess(nr.copy(),
+                    [self.rgb888p_size[1],self.rgb888p_size[0]],
+                    [self.model_input_size[1],self.model_input_size[0]],
+                    [self.display_size[1],self.display_size[0]],
+                    len(self.labels), self.confidence_threshold,
+                    self.nms_threshold, self.max_boxes_num)
+
+        def draw_result(self, pl, dets):
+            with ScopedTiming("display_draw", self.debug_mode > 0):
+                if dets:
+                    pl.osd_img.clear()
+                    for i in range(len(dets[0])):
+                        x,y,w,h = map(lambda v: int(round(v,0)), dets[0][i])
+                        pl.osd_img.draw_rectangle(x,y,w,h, color=self.color_four[dets[1][i]], thickness=4)
+                        pl.osd_img.draw_string_advanced(x,y-50,32,
+                            " %s %.2f " % (self.labels[dets[1][i]], dets[2][i]),
+                            color=self.color_four[dets[1][i]])
+                else:
+                    pl.osd_img.clear()
+
+    print("=" * 60)
+    print("YOLOv8 KPU mode")
+    print("model: %s  labels: %s" % (MP, LABELS))
+    print("=" * 60)
+
+    pl = PipeLine(rgb888p_size=ISIZE, display_mode="lcd", display_size=None)
+    pl.create()
+    ds = pl.get_display_size()
+    det = YOLOv8App(MP, labels=LABELS, model_input_size=ISIZE,
+                     max_boxes_num=MB, confidence_threshold=CONF,
+                     nms_threshold=NMS, rgb888p_size=ISIZE,
+                     display_size=ds, debug_mode=0)
+    det.config_preprocess()
+    print("running...")
+    try:
+        while True:
+            with ScopedTiming("total", 1):
+                img = pl.get_frame()
+                res = det.run(img)
+                det.draw_result(pl, res)
+                pl.show_image()
+                if res and len(res[0]) > 0:
+                    x,y,w,h = [int(round(v,0)) for v in res[0][0]]
+                    cx, cy = x+w//2, y+h//2
+                    fdx, fdy = kf_update(cx-CENTER_X, cy-CENTER_Y)
+                    dist = math.sqrt(fdx*fdx + fdy*fdy)
+                    uart_send(int(fdx), int(fdy), dist, "track")
+                else:
+                    uart_send(0, 0, 0, "lost")
+                gc.collect()
+    except KeyboardInterrupt:
+        print("\nstopped")
+    finally:
+        det.deinit(); pl.destroy()
+
+# ============================================================================
+# 七、入口 — 根据 config.json 中 detection.mode 选择运行模式
+# ============================================================================
+
+if MODE == "yolo":
+    if _yolo_ok():
+        run_yolo()
+    else:
+        print("YOLO libs missing, fallback to CV")
+        run_cv()
+else:
+    # MODE == "cv" 或 "hybrid" → 都走CV路径
+    run_cv()

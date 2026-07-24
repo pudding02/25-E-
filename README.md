@@ -7,13 +7,13 @@ STM32F407 云台端从开环控制升级为 PID 闭环追踪。
 
 ```
 ┌─────────────────────┐     UART(115200)      ┌──────────────────────┐
-│    K230-CanMV        │  "dx,dy,0,0\n"       │    STM32F407         │
-│   (视觉处理)          │ ──────────────────→  │   (云台PID控制)       │
-│                      │ ←────────────────── │                      │
-│  MIPI CSI OV5640     │   控制命令(可选)      │   UART3 → X轴步进电机  │
-│  LCD ST7701 800×480  │                      │   UART6 → Y轴步进电机  │
-│  激光GPIO(可选)       │                      │   按键/OLED(可选)     │
-└─────────────────────┘                      └──────────────────────┘
+│    K230-CanMV       │  "dx,dy,0,0\n"        │    STM32F407         │
+│   (视觉处理)         │ ──────────────────→  │   (云台PID控制)       │
+│                     │ ←──────────────────   │                      │
+│  MIPI CSI OV5640    │    控制命令(可选)      │  UART3 → X轴步进电机  │
+│  LCD ST7701 800×480 │                       │  UART6 → Y轴步进电机  │
+│  激光GPIO(可选)      │                      │   按键/OLED(可选)     │
+└─────────────────────┘                       └──────────────────────┘
 ```
 
 **与原项目的关键区别：**
@@ -21,32 +21,44 @@ STM32F407 云台端从开环控制升级为 PID 闭环追踪。
 | 维度 | 原项目 (MaixCam) | 复刻版 (K230) |
 |------|:-----------:|:------:|
 | 视觉芯片 | K210 (MaixCam) | K230 (庐山派) |
-| 检测方式 | YOLO11 NN 模型 | 经典CV find_rects + 可选YOLO KPU |
+| 检测方式 | YOLO11 NN 模型 | 经典CV + YOLO KPU 双模式 |
 | 控制方式 | 开环(检测到→转固定角度) | **PID闭环**(根据像素偏差连续调节) |
 | 串口协议 | `0x88*8` 固定字节 | `"dx,dy,0,0\n"` CSV文本 |
-| 分辨率 | 448×448 | 800×480 (检测用400×240) |
+| 分辨率 | 448×448 | 640×480 (检测可选降采样至320×240) |
 | 帧率 | ~25fps | ~45fps (CV模式) |
+| 配置方式 | 硬编码 | config.json 配置文件 |
+
+## 新增功能 (v2.0)
+
+| 功能 | 说明 |
+|------|------|
+| **配置文件化** | 所有参数从 `config.json` 读取，无需修改代码即可调参 |
+| **检测降采样** | 可选低分辨率检测(320×240)，检测在1/4像素上运行，帧率提升显著 |
+| **UART偏差输出** | 实时向STM32发送 `dx,dy` 像素偏差，支持 track/lost/aligned 状态 |
+| **YOLO KPU模式** | 支持加载kmodel进行YOLOv8 KPU推理，与CV模式可切换 |
+| **卡尔曼滤波** | 2D恒定速度模型平滑检测结果，减少抖动，提高对准稳定性 |
 
 ## 目录结构
 
 ```
 复刻/
 ├── README.md                   # 本文档
-├── config.yaml                 # 配置文件（K230 Linux模式用）
 ├── k230/
-│   └── main.py                 # K230 CanMV 主程序（经典CV + YOLO双模式）
+│   ├── config.json             # 运行时配置文件 ★
+│   └── main.py                 # K230 CanMV 主程序（CV + YOLO双模式）
 ├── stm32/
 │   ├── README.md               # STM32端编译说明
 │   └── User/
 │       ├── main.c              # 主程序（PID追踪 + 状态机）
-│       ├── pid.h / pid.c       # 双轴PID控制器 (新增)
+│       ├── pid.h / pid.c       # 双轴PID控制器
 │       ├── DATOU.h / DATOU.c   # 步进电机云台控制
 │       ├── frame.h / frame.c   # 数据帧处理
-│       ├── frame_parser.h/c    # 帧解析器
-│       ├── Key.h / Key.c       # 按键处理
-│       ├── usart.h / usart.c   # 串口通信
-│       ├── dma.h / dma.c       # DMA传输
-│       └── gpio.h / gpio.c     # GPIO控制
+│       └── Key.h / Key.c       # 按键处理
+├── skill/                      # 方法论文档
+│   ├── K230-DRONE-AI-SKILL.md  # K230 AI 全流程 Skill
+│   ├── config_template.yaml    # 配置参考模板
+│   ├── 01_方法论文档_视觉识别与云台控制全解析.md
+│   └── 02_训练配置指南.md
 └── tools/
     └── calibrate_laser.py      # 激光/光轴偏移标定工具
 ```
@@ -65,10 +77,11 @@ STM32F407 云台端从开环控制升级为 PID 闭环追踪。
 ### 1.2 部署步骤
 
 ```bash
-# 1. 将 k230/main.py 复制到 SD 卡根目录
+# 1. 将 k230/main.py 和 k230/config.json 复制到 SD 卡根目录
 cp k230/main.py /sdcard/main.py
+cp k230/config.json /sdcard/config.json
 
-# 2. （可选）如果使用 YOLO 模式，复制 kmodel
+# 2. （YOLO模式）复制 kmodel 到 SD 卡
 mkdir -p /sdcard/model
 cp model.kmodel /sdcard/model/
 
@@ -89,60 +102,75 @@ GPIO          →    激光驱动模块
 
 ---
 
-## 二、STM32F407 云台端
+## 二、配置文件说明 (config.json)
 
-### 2.1 与原项目的兼容性
+所有运行参数集中在 `k230/config.json`，修改后重新运行即生效。关键配置项：
 
-STM32 端保留原项目的**全部硬件驱动代码**，仅修改 `main.c` 和新增 `pid.c/h`：
+### 2.1 检测模式
 
-- **DATOU.c/h** — 保留，步进电机控制协议不变
-- **frame.c/h** — 保留，数据帧编解码
-- **usart.c/h, dma.c/h, gpio.c/h** — 保留
-- **main.c** — 重写：从按键触发的开环控制 → UART中断接收 dx,dy + PID闭环
-- **pid.c/h** — 新增：双轴PID控制器
+```json
+"detection": {
+  "mode": "cv",           // "cv" / "yolo" / "hybrid"
+  "detect_every": 1       // 跳帧检测: 1=每帧, 2=隔帧(帧率翻倍)
+}
+```
 
-即：CubeMX 生成的 HAL 配置文件无需修改，仅替换 `Core/Src/main.c` 并添加 `pid.c/h` 即可编译。
+### 2.2 降采样加速
 
-### 2.2 编译
+```json
+"detect_resolution": {
+  "enabled": true,        // true=降采样检测
+  "width": 320,           // 检测分辨率宽
+  "height": 240           // 检测分辨率高
+}
+```
 
-```bash
-# 1. 用 STM32CubeIDE 打开原项目的 .ioc 文件
-# 2. 将 stm32/User/ 下的所有 .c/.h 替换 Core/Src/ 和 Core/Inc/
-# 3. 添加 pid.c 到编译列表
-# 4. 编译 → 下载到 F407
+启用后检测在 320×240 上运行（仅1/4像素量），坐标自动映射回 640×480。帧率可提升 2-4 倍。
+
+### 2.3 卡尔曼滤波
+
+```json
+"kalman": {
+  "enabled": true,
+  "dt": 0.033,                // 1/帧率
+  "measurement_noise": 5.0,   // 越大越平滑但响应慢
+  "process_noise": 0.1        // 越大越信任原始测量
+}
+```
+
+### 2.4 UART 输出
+
+```json
+"uart": {
+  "enabled": true,
+  "port": 2,
+  "baud": 115200,
+  "format": "csv"             // csv=文本协议, binary=二进制帧
+}
 ```
 
 ---
 
-## 三、两种检测模式
+## 三、三种检测模式
 
-### 3.1 经典CV模式（默认，推荐）
+### 3.1 CV模式（默认，推荐）
 
-无需模型，使用 K230 CanMV 的 `find_rects()` 硬件加速查找矩形：
+经典计算机视觉矩形检测，使用 OpenCV 白色掩膜 + 轮廓筛选 + 黑边/白心验证。
 
-- 优点：帧率高（~45fps）、不依赖模型、光照可调参
+- 优点：帧率高（~45fps）、无需训练模型、参数可现场调优
 - 缺点：背景杂乱时可能误检
 
-`k230/main.py` 中设置：
-```python
-DETECTION_MODE = "cv"       # 经典CV矩形检测
-```
+### 3.2 YOLO KPU模式
 
-### 3.2 YOLO KPU模式（备选）
+使用 K230 KPU 进行 YOLOv8 神经网络推理。
 
-需要预先训练并转换 kmodel：
+- 前提：需预先训练并转换 kmodel（参考 `skill/K230-DRONE-AI-SKILL.md`）
+- 优点：对复杂背景、形变、遮挡鲁棒
+- 缺点：帧率较低（~25fps）、需提前训练模型
 
-```python
-DETECTION_MODE = "yolo"     # YOLO KPU推理
-```
+### 3.3 Hybrid模式
 
-YOLO 训练→转换全流程参考 `D:\temp\电赛E题输出\02_训练配置指南.md` 和 `K230-DRONE-AI-SKILL.md`。
-
-### 3.3 模式切换
-
-现场可通过以下方式切换：
-1. 修改 `main.py` 顶部 `DETECTION_MODE` 变量
-2. （高级）通过 STM32 发送串口命令动态切换
+以CV为主检测器，CV连续失败时回退到历史位置保持。适合CV为主、偶尔需要容错的场景。
 
 ---
 
@@ -168,7 +196,26 @@ YOLO 训练→转换全流程参考 `D:\temp\电赛E题输出\02_训练配置指
 
 ---
 
-## 五、PID参数调优
+## 五、OpenCV 提速策略总结
+
+`k230/main.py` 的CV模式采用了多层提速设计：
+
+| 层级 | 策略 | 原理 |
+|------|------|------|
+| 输入级 | **降采样检测** | 320×240 vs 640×480，像素量仅1/4 |
+| 输入级 | **跳帧检测** | detect_every=N，每隔N帧才完整检测 |
+| 预处理级 | **inRange颜色掩膜** | 直接生成二值图，比灰度+Canny更快 |
+| 筛选级 | **面积/宽高比边界** | boundingRect O(1)，在approxPolyDP前淘汰 |
+| 筛选级 | **时空连续性** | 利用上一帧位置/面积排除远距离候选 |
+| 筛选级 | **ROI局部验证** | has_black_border/has_white_center只检查边框和中心 |
+| 轮廓级 | **RETR_EXTERNAL** | 只取最外层轮廓，跳过嵌套层级 |
+| 轮廓级 | **松逼近精度** | approxPolyDP epsilon=0.04，4%周长容差 |
+| 时序级 | **丢失帧保持** | 短暂丢失时复用上一帧，避免全图搜索 |
+| 时序级 | **GC/打印限流** | GC每30帧、串口打印每60帧才执行一次 |
+
+---
+
+## 六、PID参数调优
 
 STM32端默认PID参数（可在 `main.c` 中修改）：
 
@@ -184,39 +231,40 @@ STM32端默认PID参数（可在 `main.c` 中修改）：
 #define KD_FINE     0.05f
 
 // 切换阈值（像素偏差）
-#define FINE_THRESHOLD  15      // 偏差<15px时切换到精调参数
+#define FINE_THRESHOLD  15
 ```
 
-调优方向：
 | 现象 | 调整 |
 |------|------|
 | 云台振荡/过冲 | 降低 Kp，增加 Kd |
 | 对准慢 | 提高 Kp |
 | 有静态误差无法对准 | 增加 Ki |
 | 对准后抖动 | 增加 Kd，提高 FINE_THRESHOLD |
+| 跟踪不平滑 | 在K230端开启卡尔曼滤波 |
 
 ---
 
-## 六、激光标定
-
-如果激光器与摄像头光轴不重合，运行标定工具：
+## 七、激光标定
 
 ```bash
 python tools/calibrate_laser.py
 ```
 
-在 `k230/main.py` 中配置偏移补偿：
-```python
-LASER_OFFSET_X = 0      # 激光在摄像头右侧为正
-LASER_OFFSET_Y = 0      # 激光在摄像头下方为正
+将测量结果填入 `config.json`:
+```json
+"center": {
+  "laser_offset_x": 5,    // 激光在摄像头右侧为正
+  "laser_offset_y": -3    // 激光在摄像头下方为正
+}
 ```
 
 ---
 
-## 七、现场部署检查清单
+## 八、现场部署检查清单
 
 - [ ] K230 与 STM32 共地
 - [ ] UART 波特率一致 (115200)
+- [ ] `config.json` 中 mode、分辨率、UART端口正确
 - [ ] K230 摄像头画面正常
 - [ ] STM32 步进电机方向正确（发正dx→电机向减小偏差方向转）
 - [ ] 靶标在画面中可见且矩形清晰
@@ -225,13 +273,16 @@ LASER_OFFSET_Y = 0      # 激光在摄像头下方为正
 
 ---
 
-## 八、故障排查
+## 九、故障排查
 
 | 问题 | 排查 |
 |------|------|
-| 检测不到矩形 | 降低 `FIND_RECTS_THRESHOLD`（10000→5000），增加 `AREA_MIN`（100→50） |
-| 误检太多 | 提高 `FIND_RECTS_THRESHOLD`，提高 `AREA_MIN` |
-| 云台不转 | 检查 STM32 串口接收、电机使能引脚 |
-| 云台乱转 | 交换电机方向、降低 Kp |
-| K230 画面卡 | 降低 `CAM_WIDTH/CAM_HEIGHT`，关闭 OSD 显示 |
-| 串口无数据 | 检查接线 TX/RX、共地、波特率 |
+| 检测不到矩形 | 降低 `rectangle.min_area`（3500→1000），降低 `rectangle.white_low` |
+| 误检太多 | 提高 `rectangle.min_area`，收窄 `rectangle.min_aspect/max_aspect` |
+| 帧率低 | 启用 `detect_resolution.enabled: true`，降低分辨率到 320×240 |
+| 云台不转 | 检查 `uart.enabled: true`、STM32串口接收、电机使能引脚 |
+| 云台乱转/抖动 | 在K230端开启 `kalman.enabled: true`，或降低STM32端Kp |
+| 跟踪不平滑 | 增大 `kalman.measurement_noise`（5→10），或调大 `tracking.smooth_num` |
+| 串口无数据 | 检查 TX/RX 接线、共地、`uart.port` 和 `uart.baud` |
+| K230 画面卡 | 降低 `detect_resolution`，增大 `debug.gc_every` |
+| YOLO模式报错 | 确认 kmodel 路径正确、KPU库已安装 |
