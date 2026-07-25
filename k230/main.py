@@ -384,11 +384,16 @@ else:
 # 关闭时: uart_send = no-op
 if UART_ENABLED:
     try:
-        from machine import UART
+        from machine import UART, FPIOA
         _uart_port = u.get("port", 2)
         _uart_baud = u.get("baud", 115200)
+        _tx_pin = u.get("tx_pin", 5)
+        _rx_pin = u.get("rx_pin", 6)
+        _fpioa = FPIOA()
+        _fpioa.set_function(_tx_pin, FPIOA.UART2_TXD)
+        _fpioa.set_function(_rx_pin, FPIOA.UART2_RXD)
         _uart = UART(_uart_port, baudrate=_uart_baud)
-        print("uart: port=%d baud=%d" % (_uart_port, _uart_baud))
+        print("uart: port=%d baud=%d tx=%d rx=%d" % (_uart_port, _uart_baud, _tx_pin, _rx_pin))
         def uart_send(dx, dy, dist, status):
             """发送偏差到云台 — 协议: dx,dy,dist,status\\n"""
             try:
@@ -560,122 +565,163 @@ def run_cv():
 # ============================================================================
 
 def _yolo_ok():
-    """检测KPU库是否可用 — 不可用时自动回退CV模式"""
+    """检测KPU库是否可用 — 不可用时打印原因并回退CV模式"""
     try:
-        import nncase_runtime, aidemo
-        from libs.PipeLine import PipeLine
-        from libs.AIBase import AIBase
-        from libs.Ai2d import Ai2d
-        return True
-    except ImportError:
+        import nncase_runtime as _t
+    except ImportError as e:
+        print("YOLO fallback: nncase_runtime missing — %s" % e)
         return False
+    try:
+        from libs.PipeLine import PipeLine as _t
+    except ImportError as e:
+        print("YOLO fallback: libs.PipeLine missing — %s" % e)
+        return False
+    try:
+        from libs.YOLO import YOLOv8 as _t
+    except ImportError as e:
+        print("YOLO fallback: libs.YOLO missing — %s" % e)
+        return False
+    return True
 
 def run_yolo():
     from libs.PipeLine import PipeLine, ScopedTiming
-    from libs.AIBase import AIBase
-    from libs.Ai2d import Ai2d
-    from libs.Utils import ALIGN_UP, letterbox_pad_param, get_colors
-    import nncase_runtime as nn
-    import ulab.numpy as np
-    import aidemo
+    from libs.YOLO import YOLOv8
 
-    MP = YOLO_CFG.get("model_path", "/sdcard/model/model.kmodel")
+    MP     = YOLO_CFG.get("model_path", "/sdcard/model/model.kmodel")
     LABELS = YOLO_CFG.get("labels", ["target"])
     ISIZE  = YOLO_CFG.get("input_size", [320, 320])
-    CONF   = YOLO_CFG.get("confidence", 0.3)
-    NMS    = YOLO_CFG.get("nms_threshold", 0.4)
-    MB     = YOLO_CFG.get("max_boxes", 30)
+    CONF   = YOLO_CFG.get("confidence", 0.5)
+    NMS    = YOLO_CFG.get("nms_threshold", 0.45)
+    MB     = YOLO_CFG.get("max_boxes", 50)
+    SELECT = YOLO_CFG.get("select", "max_conf")
+    TASK   = YOLO_CFG.get("task", "detect")
+    MASK_THRESH = YOLO_CFG.get("mask_threshold", 0.5)
 
-    class YOLOv8App(AIBase):
-        def __init__(self, kmodel_path, labels, model_input_size, max_boxes_num,
-                     confidence_threshold, nms_threshold, rgb888p_size, display_size, debug_mode=0):
-            super().__init__(kmodel_path, model_input_size, rgb888p_size, debug_mode)
-            self.labels = labels
-            self.model_input_size = model_input_size
-            self.confidence_threshold = confidence_threshold
-            self.nms_threshold = nms_threshold
-            self.max_boxes_num = max_boxes_num
-            self.rgb888p_size = [ALIGN_UP(rgb888p_size[0], 16), rgb888p_size[1]]
-            self.display_size = [ALIGN_UP(display_size[0], 16), display_size[1]]
-            self.debug_mode = debug_mode
-            self.color_four = get_colors(len(labels))
-            self.ai2d = Ai2d(debug_mode)
-            self.ai2d.set_ai2d_dtype(nn.ai2d_format.NCHW_FMT, nn.ai2d_format.NCHW_FMT, np.uint8, np.uint8)
-
-        def config_preprocess(self, input_image_size=None):
-            with ScopedTiming("set preprocess config", self.debug_mode > 0):
-                ai2d_input_size = input_image_size or self.rgb888p_size
-                top, bottom, left, right, self.scale = letterbox_pad_param(self.rgb888p_size, self.model_input_size)
-                self.ai2d.pad([0,0,0,0, top,bottom,left,right], 0, [128,128,128])
-                self.ai2d.resize(nn.interp_method.tf_bilinear, nn.interp_mode.half_pixel)
-                self.ai2d.build([1,3,ai2d_input_size[1],ai2d_input_size[0]],
-                                [1,3,self.model_input_size[1],self.model_input_size[0]])
-
-        def preprocess(self, input_np):
-            with ScopedTiming("preprocess", self.debug_mode > 0):
-                return [nn.from_numpy(input_np)]
-
-        def postprocess(self, results):
-            with ScopedTiming("postprocess", self.debug_mode > 0):
-                nr = results[0][0].transpose()
-                return aidemo.yolov8_det_postprocess(nr.copy(),
-                    [self.rgb888p_size[1],self.rgb888p_size[0]],
-                    [self.model_input_size[1],self.model_input_size[0]],
-                    [self.display_size[1],self.display_size[0]],
-                    len(self.labels), self.confidence_threshold,
-                    self.nms_threshold, self.max_boxes_num)
-
-        def draw_result(self, pl, dets):
-            with ScopedTiming("display_draw", self.debug_mode > 0):
-                if dets:
-                    pl.osd_img.clear()
-                    for i in range(len(dets[0])):
-                        x,y,w,h = map(lambda v: int(round(v,0)), dets[0][i])
-                        pl.osd_img.draw_rectangle(x,y,w,h, color=self.color_four[dets[1][i]], thickness=4)
-                        pl.osd_img.draw_string_advanced(x,y-50,32,
-                            " %s %.2f " % (self.labels[dets[1][i]], dets[2][i]),
-                            color=self.color_four[dets[1][i]])
-                else:
-                    pl.osd_img.clear()
+    # segment 用 [320,320], detect 用 [640,360]
+    if TASK == "segment":
+        RGB888P_SIZE = [320, 320]
+    else:
+        RGB888P_SIZE = [640, 360]
 
     print("=" * 60)
-    print("YOLOv8 KPU mode")
-    print("model: %s  labels: %s" % (MP, LABELS))
+    print("YOLOv8 KPU mode  task: %s" % TASK)
+    print("model : %s" % MP)
+    print("labels: %s" % LABELS)
+    print("input : %s  rgb888p: %s" % (ISIZE, RGB888P_SIZE))
+    print("conf  : %.2f  nms: %.2f  select: %s" % (CONF, NMS, SELECT))
     print("=" * 60)
 
-    pl = PipeLine(rgb888p_size=ISIZE, display_mode="lcd", display_size=None)
+    pl = PipeLine(rgb888p_size=RGB888P_SIZE, display_mode="lcd")
     pl.create()
     ds = pl.get_display_size()
-    det = YOLOv8App(MP, labels=LABELS, model_input_size=ISIZE,
-                     max_boxes_num=MB, confidence_threshold=CONF,
-                     nms_threshold=NMS, rgb888p_size=ISIZE,
-                     display_size=ds, debug_mode=0)
-    det.config_preprocess()
+    disp_w = ds[0] if ds else DISPLAY_W
+    disp_h = ds[1] if ds else DISPLAY_H
+    print("display: %dx%d" % (disp_w, disp_h))
+
+    if TASK == "segment":
+        yolo = YOLOv8(task_type="segment", mode="video",
+                      kmodel_path=MP, labels=LABELS,
+                      rgb888p_size=RGB888P_SIZE, model_input_size=ISIZE,
+                      display_size=ds,
+                      conf_thresh=CONF, nms_thresh=NMS,
+                      mask_thresh=MASK_THRESH,
+                      max_boxes_num=MB, debug_mode=0)
+    else:
+        yolo = YOLOv8(task_type="detect", mode="video",
+                      kmodel_path=MP, labels=LABELS,
+                      rgb888p_size=RGB888P_SIZE, model_input_size=ISIZE,
+                      display_size=ds,
+                      conf_thresh=CONF, nms_thresh=NMS,
+                      max_boxes_num=MB, debug_mode=0)
+    yolo.config_preprocess()
     print("running...")
+
+    lost_count = 0
+    fps_count = 0
+    fps = 0
+    fps_tick = time.ticks_ms()
+
     try:
         while True:
+            os.exitpoint()
             with ScopedTiming("total", 1):
                 img = pl.get_frame()
-                res = det.run(img)
-                det.draw_result(pl, res)
-                pl.show_image()
-                if res and len(res[0]) > 0:
-                    x,y,w,h = [int(round(v,0)) for v in res[0][0]]
-                    cx, cy = x+w//2, y+h//2
-                    fdx, fdy = kf_update(cx-CENTER_X, cy-CENTER_Y)
-                    dist = math.sqrt(fdx*fdx + fdy*fdy)
-                    uart_send(int(fdx), int(fdy), dist, "track")
-                else:
+                res = yolo.run(img)
+                yolo.draw_result(res, pl.osd_img)
+
+            # ---- FPS ----
+            fps_count += 1
+            now = time.ticks_ms()
+            if time.ticks_diff(now, fps_tick) >= 1000:
+                fps = fps_count * 1000 // time.ticks_diff(now, fps_tick)
+                fps_count = 0; fps_tick = now
+
+            # ---- 选取最佳目标 ----
+            if res and len(res[0]) > 0:
+                boxes   = res[0]
+                cls_ids = res[1]
+                confs   = res[2]
+
+                best_idx = 0
+                best_score = -1
+                for i in range(len(boxes)):
+                    x, y, w, h = [int(round(v, 0)) for v in boxes[i]]
+                    if SELECT == "max_area":
+                        score = w * h
+                    elif SELECT == "nearest":
+                        bcx, bcy = x + w//2, y + h//2
+                        score = -((bcx - disp_w//2)**2 + (bcy - disp_h//2)**2)
+                    else:
+                        score = confs[i]
+                    if score > best_score:
+                        best_score = score
+                        best_idx = i
+
+                x, y, w, h = [int(round(v, 0)) for v in boxes[best_idx]]
+                cx, cy = x + w//2, y + h//2
+                best_label = LABELS[cls_ids[best_idx]] if cls_ids[best_idx] < len(LABELS) else "?"
+                best_conf  = confs[best_idx]
+
+                fdx, fdy = kf_update(cx - disp_w//2, cy - disp_h//2)
+                dist = math.sqrt(fdx*fdx + fdy*fdy)
+                uart_send(int(fdx), int(fdy), dist, "track")
+                lost_count = 0
+
+                pl.osd_img.draw_string_advanced(4, 4, 24,
+                    "%s %.2f | dx:%+d dy:%+d dist:%.0f" % (best_label, best_conf, int(fdx), int(fdy), dist),
+                    color=(0, 255, 0))
+            else:
+                lost_count += 1
+                if lost_count > LOST_KEEP_FRAMES:
+                    kf_reset()
                     uart_send(0, 0, 0, "lost")
-                gc.collect()
+                pl.osd_img.draw_string_advanced(4, 4, 24, "LOST", color=(255, 0, 0))
+
+            pl.osd_img.draw_string_advanced(4, disp_h - 28, 24, "FPS:%d" % fps, color=(0, 255, 0))
+            pl.show_image()
+            gc.collect()
+
     except KeyboardInterrupt:
         print("\nstopped")
+    except BaseException as e:
+        print("error:", e)
     finally:
-        det.deinit(); pl.destroy()
+        yolo.deinit()
+        pl.destroy()
 
 # ============================================================================
 # 七、入口 — 根据 config.json 中 detection.mode 选择运行模式
 # ============================================================================
+
+print("=" * 50)
+print("mode: %s" % MODE.upper())
+if MODE == "cv":
+    print("detect: %dx%d  downscale: %s  kalman: %s  uart: %s" %
+          (SENSOR_W, SENSOR_H, USE_DOWNSCALE, KALMAN_ENABLED, UART_ENABLED))
+elif MODE == "yolo":
+    print("model: %s  input: %s  conf: %.2f" %
+          (YOLO_CFG.get("model_path", ""), YOLO_CFG.get("input_size", []), YOLO_CFG.get("confidence", 0.3)))
+print("=" * 50)
 
 if MODE == "yolo":
     if _yolo_ok():
@@ -684,5 +730,4 @@ if MODE == "yolo":
         print("YOLO libs missing, fallback to CV")
         run_cv()
 else:
-    # MODE == "cv" 或 "hybrid" → 都走CV路径
     run_cv()

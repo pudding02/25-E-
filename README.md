@@ -7,10 +7,10 @@ STM32F407 云台端从开环控制升级为 PID 闭环追踪。
 
 ```
 ┌─────────────────────┐     UART(115200)      ┌──────────────────────┐
-│    K230-CanMV       │  "dx,dy,0,0\n"        │    STM32F407         │
+│    K230-CanMV       │  "dx,dy,dist,status\n"  │    STM32F407         │
 │   (视觉处理)         │ ──────────────────→  │   (云台PID控制)       │
 │                     │ ←──────────────────   │                      │
-│  MIPI CSI OV5640    │    控制命令(可选)      │  UART3 → X轴步进电机  │
+│  MIPI CSI GC2093    │    控制命令(可选)      │  UART3 → X轴步进电机  │
 │  LCD ST7701 800×480 │                       │  UART6 → Y轴步进电机  │
 │  激光GPIO(可选)      │                      │   按键/OLED(可选)     │
 └─────────────────────┘                       └──────────────────────┘
@@ -35,8 +35,9 @@ STM32F407 云台端从开环控制升级为 PID 闭环追踪。
 | **配置文件化** | 所有参数从 `config.json` 读取，无需修改代码即可调参 |
 | **检测降采样** | 可选低分辨率检测(320×240)，检测在1/4像素上运行，帧率提升显著 |
 | **UART偏差输出** | 实时向STM32发送 `dx,dy` 像素偏差，支持 track/lost/aligned 状态 |
-| **YOLO KPU模式** | 支持加载kmodel进行YOLOv8 KPU推理，与CV模式可切换 |
-| **卡尔曼滤波** | 2D恒定速度模型平滑检测结果，减少抖动，提高对准稳定性 |
+| **YOLO KPU模式** | 支持 detect（检测框）和 segment（填充蒙版）两种推理，与CV模式可切换 |
+| **卡尔曼滤波(EMA)** | 一阶指数平滑，减少检测抖动，提高对准稳定性 |
+| **UART串口输出** | 实时发送 `dx,dy,dist,status` 到云台STM32，支持 FPIOA 引脚映射 |
 
 ## 目录结构
 
@@ -70,7 +71,7 @@ STM32F407 云台端从开环控制升级为 PID 闭环追踪。
 ### 1.1 硬件
 
 - 庐山派 K230-CanMV 开发板
-- OV5640 MIPI CSI 摄像头（板载）
+- GC2093 MIPI CSI 摄像头（板载，原生1920×1080@30fps，16:9）
 - ST7701 LCD（板载，800×480）
 - 可选：5V激光模块（GPIO控制）
 
@@ -145,28 +146,72 @@ GPIO          →    激光驱动模块
   "enabled": true,
   "port": 2,
   "baud": 115200,
-  "format": "csv"             // csv=文本协议, binary=二进制帧
+  "tx_pin": 5,             // K230 GPIO引脚号, 庐山派UART2默认 GPIO5(TX) + GPIO6(RX)
+  "rx_pin": 6,             // 接线不同时修改此处
+  "format": "csv"          // csv=文本协议, binary=二进制帧
 }
 ```
+
+> K230 的 UART 需通过 FPIOA 映射 GPIO 引脚。如报 `tx not configured` 错误，检查 `tx_pin`/`rx_pin` 是否正确。
 
 ---
 
 ## 三、三种检测模式
 
-### 3.1 CV模式（默认，推荐）
+### 3.1 CV模式（默认，推荐矩形靶标）
 
 经典计算机视觉矩形检测，使用 OpenCV 白色掩膜 + 轮廓筛选 + 黑边/白心验证。
 
 - 优点：帧率高（~45fps）、无需训练模型、参数可现场调优
 - 缺点：背景杂乱时可能误检
+- **适用场景：黑背景上的白色矩形靶标（白底黑边）**
 
 ### 3.2 YOLO KPU模式
 
-使用 K230 KPU 进行 YOLOv8 神经网络推理。
+使用 K230 KPU 进行 YOLOv8 神经网络推理，支持 detect（检测框）和 segment（检测框+填充蒙版）两种任务类型。
 
 - 前提：需预先训练并转换 kmodel（参考 `skill/K230-DRONE-AI-SKILL.md`）
-- 优点：对复杂背景、形变、遮挡鲁棒
-- 缺点：帧率较低（~25fps）、需提前训练模型
+- 优点：可检测任意训练过的目标（无人机、水果、手势…），对复杂背景鲁棒
+- 缺点：帧率较低（~15-25fps）、需提前训练模型
+
+#### ⚠️ 关键配置规则（违反则不出框或误判满天飞）
+
+| 规则 | 说明 |
+|------|------|
+| **input_size 必须等于训练 imgsz** | 模型名含 `320` → 填 `[320,320]`；含 `224` → 填 `[224,224]`。不匹配会导致坐标错乱/不出框 |
+| **model_path 和 task 必须配对** | `_seg_` 模型 → `"task": "segment"`；`_det_` 模型 → `"task": "detect"`。交叉使用产生随机误检 |
+| **labels 必须与训练时完全一致** | 顺序、数量、名称都不能错。果实模型 → `["apple","banana","orange"]` |
+| **rgb888p_size 随 task 变化** | segment → `[320, 320]`；detect → `[640, 360]` |
+| **GC2093 是 16:9 传感器** | 不能设 4:3 分辨率（如 640×480），否则传感器初始化失败 |
+
+YOLO 配置示例：
+
+```json
+// 检测模式（仅检测框）
+"yolo": {
+  "task": "detect",
+  "model_path": "/sdcard/examples/kmodel/fruit_det_yolov8n_320.kmodel",
+  "labels": ["apple","banana","orange"],
+  "input_size": [320, 320],
+  "confidence": 0.5,
+  "nms_threshold": 0.45,
+  "max_boxes": 50,
+  "select": "max_conf"
+}
+
+// 分割模式（检测框 + 填充蒙版）
+"yolo": {
+  "task": "segment",
+  "model_path": "/sdcard/examples/kmodel/fruit_seg_yolov8n_320.kmodel",
+  "labels": ["apple","banana","orange"],
+  "input_size": [320, 320],
+  "confidence": 0.5,
+  "mask_threshold": 0.5,
+  ...
+}
+```
+
+`select` 多目标选取策略：`max_conf`=最高置信度 / `max_area`=最大面积 / `nearest`=最靠近画面中心。
 
 ### 3.3 Hybrid模式
 
@@ -179,11 +224,11 @@ GPIO          →    激光驱动模块
 ### 4.1 K230 → STM32（视觉偏差数据）
 
 ```
-格式: "deltaX,deltaY,flag1,flag2\n"
+格式: "dx,dy,dist,status\n"
 
-正常追踪:  "-25,18,0,0\n"       # X偏差-25px, Y偏差+18px
-目标丢失:  "404,404,0,0\n"      # 目标丢失通知
-对准完成:  "-2,1,1,0\n"         # flag1=1表示已对准
+正常追踪:  "-25,18,150,0\n"         # dx=-25, dy=18, dist=150px, status=0(追踪中)
+对准完成:  "-2,1,5,1\n"             # status=1(已对准)
+目标丢失:  "404,404,0,0\n"          # status=404(目标丢失)
 ```
 
 ### 4.2 STM32 → K230（控制命令，可选）
@@ -264,8 +309,10 @@ python tools/calibrate_laser.py
 
 - [ ] K230 与 STM32 共地
 - [ ] UART 波特率一致 (115200)
-- [ ] `config.json` 中 mode、分辨率、UART端口正确
-- [ ] K230 摄像头画面正常
+- [ ] `config.json` 中 mode、input_size、labels、task 与模型匹配（YOLO模式）
+- [ ] YOLO模式下 `input_size` 严格等于模型训练 `imgsz`
+- [ ] YOLO模式下 `task`(detect/segment) 与模型类型（_det_/_seg_）一致
+- [ ] 摄像头画面正常（GC2093，16:9）
 - [ ] STM32 步进电机方向正确（发正dx→电机向减小偏差方向转）
 - [ ] 靶标在画面中可见且矩形清晰
 - [ ] 激光偏移量已标定（如使用激光）
@@ -277,7 +324,7 @@ python tools/calibrate_laser.py
 
 | 问题 | 排查 |
 |------|------|
-| 检测不到矩形 | 降低 `rectangle.min_area`（3500→1000），降低 `rectangle.white_low` |
+| 检测不到矩形 | 降低 `rectangle.min_area`（3500→1000），降低 `rectangle.white_low`。注意CV模式仅支持黑底白矩形 |
 | 误检太多 | 提高 `rectangle.min_area`，收窄 `rectangle.min_aspect/max_aspect` |
 | 帧率低 | 启用 `detect_resolution.enabled: true`，降低分辨率到 320×240 |
 | 云台不转 | 检查 `uart.enabled: true`、STM32串口接收、电机使能引脚 |
@@ -286,3 +333,6 @@ python tools/calibrate_laser.py
 | 串口无数据 | 检查 TX/RX 接线、共地、`uart.port` 和 `uart.baud` |
 | K230 画面卡 | 降低 `detect_resolution`，增大 `debug.gc_every` |
 | YOLO模式报错 | 确认 kmodel 路径正确、KPU库已安装 |
+| YOLO不出框 | ① `input_size` 是否等于模型训练 `imgsz` ② `labels` 顺序/名称是否与训练一致 ③ `task`(detect/segment)是否与模型类型匹配 ④ 摄像头是否拍到模型训练过的物体 |
+| YOLO误判满天飞 | `input_size` 与模型不匹配，或 segment 模型配了 `task: detect`（反之亦然） |
+| UART报 tx not configured | 在 `config.json` 添加 `"tx_pin": 5, "rx_pin": 6`，K230 需 FPIOA 映射 |

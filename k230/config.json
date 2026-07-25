@@ -50,12 +50,18 @@
   },
 
   "yolo": {
-    "model_path": "/sdcard/model/model.kmodel",
-    "labels": ["target"],
-    "confidence": 0.3,
-    "nms_threshold": 0.4,
+    "task": "detect",
+    "_task": "detect=检测框 / segment=检测框+填充蒙版",
+    "model_path": "/sdcard/kmodel/model_v4.kmodel",
+    "_input_size_hint": "必须与模型训练时的imgsz严格一致！",
+    "labels": ["bird","drone","plane"],
+    "confidence": 0.5,
+    "nms_threshold": 0.45,
+    "mask_threshold": 0.5,
     "input_size": [320, 320],
-    "max_boxes": 30
+    "max_boxes": 50,
+    "select": "max_conf",
+    "_select": "max_conf=最高置信度 / max_area=最大面积 / nearest=最靠近中心"
   },
 
   "kalman": {
@@ -75,6 +81,9 @@
     "_format": "dx,dy,dist,status  status:0=追踪 1=对准 404=丢失",
     "port": 2,
     "baud": 115200,
+    "tx_pin": 5,
+    "rx_pin": 6,
+    "_pins": "tx_pin/rx_pin为K230 GPIO引脚号, 庐山派UART2默认GPIO5/6",
     "format": "csv"
   },
 
