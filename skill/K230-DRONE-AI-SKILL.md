@@ -24,7 +24,44 @@ description: "K230无人机AI视觉部署全流程：YOLOv8训练→ONNX→KMode
 | 接口 | USB-C、MIPI CSI、HDMI、UART |
 | NPU对齐要求 | **16字节对齐**（输入宽高必须整除16） |
 
-### 1.2 软件栈
+### 1.2 K230 庐山派 40-Pin 引脚定义
+
+> 数据来源：庐山派K230开发板排针引脚表（2026-09-04 校验）
+
+| 物理 Pin | 板上功能 | GPIO 号 | 物理 Pin | 板上功能 | GPIO 号 |
+|----------|----------|---------|----------|----------|---------|
+| 1 | 5V0（5V 电源输出） | — | 2 | 5V0（5V 电源输出） | — |
+| 3 | I2C0_SDA | 49 | 4 | GND | GND |
+| 5 | I2C0_SCL | 48 | 6 | GND | GND |
+| 7 | GPIO50 | 50 | 8 | UART1_TX | 3 |
+| 9 | GND | GND | 10 | UART1_RX | 4 |
+| 11 | **UART2_TX** | **5** | 12 | I2C4_SDA | 47 |
+| 13 | **UART2_RX** | **6** | 14 | GND | GND |
+| 15 | PWM5 | 26 | 16 | QSPI0_D2 | 18 |
+| 17 | 3V3（3.3V 电源输出） | — | 18 | QSPI0_D3 | 19 |
+| 19 | QSPI0_DO | 16 | 20 | GND | GND |
+| 21 | QSPI0_D1 | 17 | 22 | PDM_IN0 | 27 |
+| 23 | QSPI0_CLK | 15 | 24 | QSPI0_CS0 | 14 |
+| 25 | GND | GND | 26 | I2C1_SCL | 40 |
+| 27 | I2C1_SDA | 41 | 28 | GND | GND |
+| 29 | I2C3_SCL | 36 | 30 | GND | GND |
+| 31 | I2C3_SDA | 37 | 32 | PWM2 | 46 |
+| 33 | PWM4 | 52 | 34 | GND | GND |
+| 35 | PWM0 | 42 | 36 | ADC0-1.8V | 54 |
+| 37 | UART3_TX | 32 | 38 | ADC1-1.8V | 55 |
+| 39 | GND | GND | 40 | UART3_RX | 33 |
+
+**UART 引脚速查：**
+
+| UART | TX (物理Pin / GPIO) | RX (物理Pin / GPIO) | 默认用途 |
+|------|---------------------|---------------------|----------|
+| UART1 | Pin 8 / GPIO 3 | Pin 10 / GPIO 4 | 调试/备用 |
+| **UART2** | **Pin 11 / GPIO 5** | **Pin 13 / GPIO 6** | **视觉数据输出（本项目）** |
+| UART3 | Pin 37 / GPIO 32 | Pin 40 / GPIO 33 | 扩展/备用 |
+
+> **本项目使用 UART2**：K230 通过 GPIO5(TX)/GPIO6(RX) 发送矩形中心偏差数据 `"dx,dy,dist,status\n"` 至 STM32 或 USB-TTL 模块。
+
+### 1.3 软件栈
 
 | 组件 | 版本/说明 |
 |------|-----------|
@@ -1070,14 +1107,68 @@ dist = math.sqrt(dx*dx + dy*dy)
   "uart": {
     "enabled": true,
     "port": 2,
-    "baud": 115200
+    "baud": 115200,
+    "tx_pin": 5,
+    "rx_pin": 6,
+    "format": "csv"
   }
 }
 ```
 
 - `enabled`: 接云台时改为 `true`，否则保持 `false`（防止TX阻塞）
-- `port`: K230 UART端口号，对应物理引脚
-- `baud`: 必须与STM32端一致
+- `port`: K230 UART端口号（本项目用 UART2）
+- `baud`: 必须与STM32端一致（默认 115200，8N1）
+- `tx_pin` / `rx_pin`: K230 GPIO 引脚号，经 FPIOA 映射为 UART 功能
+- `format`: 输出格式，`csv` = 文本 `"dx,dy,dist,status\n"`（UTF-8 编码）
+
+### 16.6 物理引脚映射
+
+> 引脚定义详见 §1.2 庐山派 40-Pin 引脚表
+
+| config.json 字段 | GPIO 号 | 物理 Pin | 板上功能 | 方向 |
+|------------------|---------|----------|----------|------|
+| `tx_pin` | 5 | **Pin 11** | UART2_TX | 输出（K230→外部） |
+| `rx_pin` | 6 | **Pin 13** | UART2_RX | 输入（外部→K230） |
+
+### 16.7 接线图
+
+**方案A：K230 → USB-TTL → 电脑（测试用）**
+
+```
+   K230 庐山派                    USB-TTL 模块 (CH340/CP2102)
+   ┌──────────────┐               ┌──────────────┐
+   │  Pin11 GPIO5 │── UART2_TX ──→│ RXD          │
+   │  (UART2_TX)  │               │              │
+   │  Pin13 GPIO6 │── UART2_RX ←──│ TXD (可不接) │
+   │  (UART2_RX)  │               │              │
+   │  Pin9  GND   │── GND ────────│ GND          │
+   └──────────────┘               └──────┬───────┘
+                                         │ USB
+                                   ┌─────┴─────┐
+                                   │   电脑    │
+                                   └───────────┘
+
+   ★ 只需3根线: TX→RX, GND↔GND (单向测试)
+   ★ 电平: 3.3V TTL, 直连无需电平转换
+   ★ 串口参数: 115200, 8N1, UTF-8 文本
+```
+
+**方案B：K230 → STM32F407（部署用）**
+
+```
+   K230 庐山派                    STM32F407
+   ┌──────────────┐               ┌──────────────┐
+   │  Pin11 GPIO5 │── UART2_TX ──→│ PC11 UART4_RX│
+   │  (UART2_TX)  │               │              │
+   │  Pin13 GPIO6 │── UART2_RX ←──│ PC10 UART4_TX│
+   │  (UART2_RX)  │               │              │
+   │  Pin9  GND   │── GND ────────│ GND          │
+   └──────────────┘               └──────────────┘
+
+   ★ TX↔RX 交叉连接, 共地
+   ★ 双方均为 3.3V TTL, 直连
+   ★ 波特率必须一致 (115200)
+```
 
 ---
 

@@ -395,14 +395,14 @@ if UART_ENABLED:
         _uart = UART(_uart_port, baudrate=_uart_baud)
         print("uart: port=%d baud=%d tx=%d rx=%d" % (_uart_port, _uart_baud, _tx_pin, _rx_pin))
         def uart_send(dx, dy, dist, status):
-            """发送偏差到云台 — 协议: dx,dy,dist,status\\n"""
+            """发送偏差到云台 — 协议: dx,dy,dist,status\\r\\n (每帧以CRLF结尾)"""
             try:
                 if status == "lost":
-                    _uart.write("404,404,0,0\n")
+                    _uart.write("404,404,0,0\r\n")
                 elif status == "aligned":
-                    _uart.write("%d,%d,%.0f,1\n" % (dx, dy, dist))
+                    _uart.write("%d,%d,%.0f,1\r\n" % (dx, dy, dist))
                 else:
-                    _uart.write("%d,%d,%.0f,0\n" % (dx, dy, dist))
+                    _uart.write("%d,%d,%.0f,0\r\n" % (dx, dy, dist))
             except Exception:
                 pass
     except Exception as e:

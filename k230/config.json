@@ -83,7 +83,7 @@
     "baud": 115200,
     "tx_pin": 5,
     "rx_pin": 6,
-    "_pins": "tx_pin/rx_pin为K230 GPIO引脚号, 庐山派UART2默认GPIO5/6",
+    "_pins": "tx_pin/rx_pin为K230 GPIO引脚号。UART2: TX=GPIO5(物理Pin11), RX=GPIO6(物理Pin13)",
     "format": "csv"
   },
 
