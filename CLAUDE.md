@@ -23,6 +23,7 @@ K230-CanMV (visual processing)  ──UART "dx,dy,dist,status\n"──>  STM32F4
 复刻/
 ├── k230/
 │   ├── main.py          # K230 runtime — CV + YOLO dual mode, ~690 lines
+│   ├── fs_servo.py      # FashionStar bus servo driver (FSUS protocol over UART, servo.enabled)
 │   └── config.json      # Runtime config — the sole tuning surface, no code edits needed
 ├── stm32/
 │   ├── README.md        # Build instructions (HAL files to copy, GPIO config)

@@ -46,7 +46,8 @@ STM32F407 云台端从开环控制升级为 PID 闭环追踪。
 ├── README.md                   # 本文档
 ├── k230/
 │   ├── config.json             # 运行时配置文件 ★
-│   └── main.py                 # K230 CanMV 主程序（CV + YOLO双模式）
+│   ├── main.py                 # K230 CanMV 主程序（CV + YOLO双模式）
+│   └── fs_servo.py             # FashionStar总线舵机直控驱动（servo.enabled，K230不经STM32直驱舵机云台）
 ├── stm32/
 │   ├── README.md               # STM32端编译说明
 │   └── User/

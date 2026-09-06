@@ -1,10 +1,11 @@
 {
-  "_说明": "K230 矩形靶标追踪 — 运行时配置。修改后重新运行 main.py",
+  "_说明": "K230 物体追踪双轴舵机云台 — 运行时配置。修改后重启 main.py 生效",
 
   "detection": {
     "mode": "cv",
-    "_mode_选项": "cv / yolo / hybrid",
-    "detect_every": 1
+    "_mode_选项": "cv=矩形靶标检测 / yolo=KPU目标检测",
+    "detect_every": 1,
+    "_detect_every": "跳帧检测: 1=每帧, 2=隔帧(帧率翻倍但响应变慢)"
   },
 
   "camera": {
@@ -13,48 +14,62 @@
     "fps": 90
   },
 
-  "detect_resolution": {
-    "enabled": false,
-    "_enabled": "开启后在低分辨率上检测(提速)，关闭=原版640x480",
-    "width": 320,
-    "height": 240
+  "display": {
+    "lcd_width": 800,
+    "lcd_height": 480,
+    "show_osd": true,
+    "_show_osd": "左上角显示dx/dy偏差和FPS",
+    "x_offset": 80,
+    "y_offset": 0,
+    "to_ide": false
   },
 
   "center": {
     "x": 320,
     "y": 240,
-    "laser_offset_x": 0,
-    "laser_offset_y": 0
+    "_说明": "屏幕中心像素坐标, 追踪目标点。分辨率改变时需同步更新"
   },
 
   "rectangle": {
+    "_说明": "CV模式矩形检测阈值, 现场调参入口",
     "white_low": [135, 135, 115],
     "white_high": [255, 255, 255],
+    "_white": "白色掩膜RGB范围(靶标白色内部)",
     "black_low": [0, 0, 0],
     "black_high": [85, 85, 85],
+    "_black": "黑色边框RGB范围(验证矩形四边)",
     "min_area": 3500,
     "max_area": 180000,
+    "_area": "矩形面积范围(像素²), 过滤太小(噪点)和太大(全画面)",
     "min_aspect": 1.05,
     "max_aspect": 2.80,
-    "target_aspect": 1.55,
+    "_aspect": "宽高比范围, 正方形≈1.0, 横长方形>1.0",
     "border_expand_x": 16,
     "border_expand_y": 16,
+    "_border_expand": "检测框向外扩展像素, 用于黑边/白心验证",
     "black_check_step": 4,
     "min_black_hits": 3,
+    "_black_check": "黑边验证: 四边中至少min_black_hits边有足够黑色像素",
     "center_white_step": 3,
+    "_center_white": "白心验证: 中心区域白色像素占比阈值(1/step)",
     "max_center_jump": 220,
+    "_max_center_jump": "帧间中心跳跃上限(像素), 超过此值的候选框被忽略",
     "max_area_ratio": 3,
+    "_max_area_ratio": "帧间面积变化比例上限",
     "min_rect_fill": 45,
+    "_min_rect_fill": "轮廓面积/外接矩形面积 最小百分比(%)",
     "max_side_ratio": 3,
-    "approx_epsilon": 0.04
+    "_max_side_ratio": "四边形对边长度比上限",
+    "approx_epsilon": 0.04,
+    "_approx_epsilon": "多边形逼近精度=轮廓周长×此值"
   },
 
   "yolo": {
     "task": "detect",
     "_task": "detect=检测框 / segment=检测框+填充蒙版",
     "model_path": "/sdcard/kmodel/model_v4.kmodel",
-    "_input_size_hint": "必须与模型训练时的imgsz严格一致！",
-    "labels": ["bird","drone","plane"],
+    "_input_size_hint": "必须与模型训练时的imgsz严格一致",
+    "labels": ["bird", "drone", "plane"],
     "confidence": 0.5,
     "nms_threshold": 0.45,
     "mask_threshold": 0.5,
@@ -64,40 +79,55 @@
     "_select": "max_conf=最高置信度 / max_area=最大面积 / nearest=最靠近中心"
   },
 
-  "kalman": {
-    "enabled": false,
-    "smooth_factor": 0.3,
-    "_smooth_factor": "0=完全平滑不动, 1=不过滤。推荐0.2-0.4"
-  },
-
-  "tracking": {
-    "smooth_num": 0,
-    "smooth_den": 1,
-    "lost_keep_frames": 2
-  },
-
-  "uart": {
+  "servo": {
+    "_说明": "K230直控FashionStar总线舵机云台。接线: UART2 TX(GPIO5/Pin11)串1kΩ接信号线, RX(GPIO6/Pin13)直连, 共地, 舵机独立供电",
     "enabled": true,
-    "_format": "dx,dy,dist,status  status:0=追踪 1=对准 404=丢失",
+    "mode": "track",
+    "_mode": "track=视觉追踪(物体中心→舵机增量控制) / spin=持续正反转 / ping=持续ping",
     "port": 2,
     "baud": 115200,
     "tx_pin": 5,
     "rx_pin": 6,
-    "_pins": "tx_pin/rx_pin为K230 GPIO引脚号。UART2: TX=GPIO5(物理Pin11), RX=GPIO6(物理Pin13)",
-    "format": "csv"
-  },
+    "_pins": "UART2默认: TX=GPIO5(Pin11), RX=GPIO6(Pin13)",
 
-  "display": {
-    "lcd_width": 800,
-    "lcd_height": 480,
-    "show_osd": true,
-    "x_offset": 80,
-    "y_offset": 0,
-    "to_ide": false
+    "yaw_id": 1,
+    "pitch_id": 0,
+    "_ids": "yaw=左右轴舵机ID, pitch=上下轴舵机ID",
+
+    "yaw_vel_scale": 0.01,
+    "_yaw_vel_scale": "左右轴每帧角度增量系数: 每帧角度 += yaw_vel_scale × dx(左右偏移)。越大转越快, 典型0.01~0.1",
+    "pitch_k": 0.02,
+    "_pitch_k": "上下轴每帧角度增量系数: 每帧角度 += pitch_k × dy(上下偏移)。典型0.01~0.05",
+
+    "yaw_reverse": false,
+    "pitch_reverse": true,
+    "_reverse": "舵机转向与偏差方向相反时翻转对应轴(true/false)",
+
+    "yaw_min": -360,
+    "yaw_max": 360,
+    "pitch_min": -30,
+    "pitch_max": 30,
+    "_range": "角度限位(度)。yaw支持±360°多圈, pitch通常±30°",
+
+    "interval_ms": 40,
+    "_interval_ms": "舵机行程周期(ms), ≈视觉帧周期",
+    "power": 0,
+    "_power": "功率上限(mW), 0=不限制",
+
+    "deadband_px": 5,
+    "_deadband_px": "死区(像素), 偏差小于此值不动作, 防止抖动",
+
+    "lost_hold": true,
+    "_lost_hold": "丢靶处理: true=保持最后位置, false=进入阻尼(安全卸力)",
+
+    "center_on_boot": true,
+    "_center_on_boot": "上电后2s缓慢回中0°(要求上电时云台机械位置大致居中)"
   },
 
   "debug": {
     "print_every": 60,
-    "gc_every": 30
+    "_print_every": "每N帧打印一次检测信息",
+    "gc_every": 30,
+    "_gc_every": "每N帧执行一次垃圾回收"
   }
 }

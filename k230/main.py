@@ -1,28 +1,37 @@
 """
-K230 矩形靶标追踪
-================
+K230 物体追踪 — 双轴舵机云台
+============================
 
 ═══════════════════════════════════════════════════════════════
-  功能开关速查（在 config.json 中切换，无需改代码）
+  功能说明
 ═══════════════════════════════════════════════════════════════
-  [kalman.enabled]      →  卡尔曼滤波(EMA)，平滑去抖
-  [uart.enabled]        →  串口输出 dx,dy,dist,status → 云台
-  [detect_resolution.enabled] → 降采样检测(320x240)提速
-  [detection.mode]      → "cv" / "yolo" / "hybrid"
-  [camera.sensor_width/height] → 摄像头分辨率
-  [rectangle.*]         → 矩形检测阈值，现场调参入口
-═══════════════════════════════════════════════════════════════
+  摄像头采集 → 物体检测 → 计算物体中心与屏幕中心偏移 → 控制舵机
+  - CV 模式:  矩形检测, 偏移 = 矩形中心 - 屏幕中心
+  - YOLO 模式: 目标检测, 偏移 = 识别框中心 - 屏幕中心
 
 ═══════════════════════════════════════════════════════════════
-  性能设计原则（K230 MicroPython 优化经验）
+  配置速查 (config.json, 修改后重启生效)
 ═══════════════════════════════════════════════════════════════
-  1. 热路径零分支 —— 可选功能用 lambda 注入，避免每帧 if
-  2. 全局变量直读 —— 模块级变量比对象属性/字典快5-10倍
-  3. 返回元组不用dict —— 避免热路径内存分配触发GC
-  4. 检测算法纯函数 —— 不封装成类，函数直接读全局参数
+  [detection.mode]        →  "cv"(矩形) / "yolo"(KPU目标检测)
+  [camera.sensor_width]   →  摄像头宽度
+  [camera.sensor_height]  →  摄像头高度
+  [center.x / center.y]   →  屏幕中心像素坐标(追踪目标点)
+  [rectangle.*]           →  CV矩形检测阈值
+  [yolo.*]                →  YOLO模型/置信度等
+  [servo.enabled]         →  true=K230直控FashionStar总线舵机
+  [servo.yaw_id]          →  左右轴舵机ID
+  [servo.pitch_id]        →  上下轴舵机ID
+  [servo.yaw_vel_scale]   →  每帧角度增量系数(越大转越快)
+  [servo.pitch_k]         →  上下轴每帧增量系数
+  [servo.yaw_reverse]     →  左右方向翻转(true/false)
+  [servo.pitch_reverse]   →  上下方向翻转(true/false)
+  [servo.yaw_min/max]     →  左右轴角度限位
+  [servo.pitch_min/max]   →  上下轴角度限位
+  [servo.deadband_px]     →  死区(像素偏差小于此值不动作)
+  [servo.center_on_boot]  →  上电回中0°
 ═══════════════════════════════════════════════════════════════
 
-配置文件: config.json (与main.py同目录)
+接线: K230 UART2 TX(GPIO5/Pin11)串1kΩ接舵机信号线, RX(GPIO6/Pin13)直连, 共地, 舵机独立供电
 """
 
 import time, os, gc, math
@@ -31,12 +40,18 @@ from media.sensor import *
 from media.display import *
 from media.media import *
 
+# CanMV 工作目录切换到 /sdcard
+try:
+    os.chdir("/sdcard")
+except Exception:
+    pass
+
 # ============================================================================
-# 一、配置加载 — import阶段执行一次，不影响热路径速度
+# 一、配置加载
 # ============================================================================
 
 def _load_json(paths):
-    """从多个候选路径加载JSON配置，返回dict或{}"""
+    """从候选路径加载JSON, 跳过_开头的注释键"""
     try:
         import ujson as j
     except ImportError:
@@ -47,11 +62,12 @@ def _load_json(paths):
                 raw = j.load(f)
             cfg = {}
             for k, v in raw.items():
-                if not k.startswith("_"):
-                    cfg[k] = {sk: sv for sk, sv in v.items()
-                              if isinstance(v, dict) and not sk.startswith("_")}
-                    if not isinstance(v, dict):
-                        cfg[k] = v
+                if k.startswith("_"):
+                    continue
+                if isinstance(v, dict):
+                    cfg[k] = {sk: sv for sk, sv in v.items() if not sk.startswith("_")}
+                else:
+                    cfg[k] = v
             print("config: %s loaded" % p)
             return cfg
         except Exception:
@@ -60,15 +76,12 @@ def _load_json(paths):
     return {}
 
 def _get(cfg, key, default):
-    """安全获取配置值，cfg为空时返回默认值"""
     return cfg.get(key, default) if cfg else default
 
 CFG = _load_json(["/sdcard/config.json", "config.json"])
 
 # ============================================================================
-# 二、运行参数 — 全部从config.json读取，模块级全局直接赋值
-#    修改方式: 改config.json → 重启main.py → 即刻生效
-#    不要在此处直接改值，config.json是唯一的"调参面板"
+# 二、运行参数 (全部来自 config.json)
 # ============================================================================
 
 # ---- 摄像头 ----
@@ -85,219 +98,405 @@ DISPLAY_Y = _get(_get(CFG, "display", {}), "y_offset", 0)
 SHOW_OSD  = _get(_get(CFG, "display", {}), "show_osd", True)
 
 # ---- 检测模式 ----
-DETECT_EVERY  = _get(_get(CFG, "detection", {}), "detect_every", 1)
-# 跳帧检测: 1=每帧, 2=隔帧(帧率翻倍但响应变慢), 3=每3帧
-MODE          = _get(_get(CFG, "detection", {}), "mode", "cv")
-# 模式: "cv"=经典视觉, "yolo"=KPU推理, "hybrid"=CV优先
+MODE = _get(_get(CFG, "detection", {}), "mode", "cv")   # "cv" / "yolo"
+DETECT_EVERY = _get(_get(CFG, "detection", {}), "detect_every", 1)
 
-# ---- 调试 ----
-PRINT_EVERY = _get(_get(CFG, "debug", {}), "print_every", 60)
-# 每N帧打印一次检测信息到串口终端，60 ≈ 每2秒(30fps)
-GC_EVERY    = _get(_get(CFG, "debug", {}), "gc_every", 30)
-# 每N帧执行一次垃圾回收，太频繁拖慢帧率、太稀疏内存堆积
-
-# ---- 矩形检测阈值（现场调参主要入口） ----
-r = _get(CFG, "rectangle", {})
-WHITE_LOW  = tuple(r.get("white_low",  [135, 135, 115]))
-WHITE_HIGH = tuple(r.get("white_high", [255, 255, 255]))
-# 白色掩膜RGB范围 — 检测靶标白色内部区域
-BLACK_LOW  = tuple(r.get("black_low",  [0, 0, 0]))
-BLACK_HIGH = tuple(r.get("black_high", [85, 85, 85]))
-# 黑色边框RGB范围 — 验证矩形四边是否为黑色
-MIN_AREA   = r.get("min_area", 3500)
-MAX_AREA   = r.get("max_area", 180000)
-# 矩形面积范围(像素²) — 过滤太小(噪点)和太大(全画面)
-MIN_ASPECT = r.get("min_aspect", 1.05)
-MAX_ASPECT = r.get("max_aspect", 2.80)
-TARGET_ASPECT = r.get("target_aspect", 1.55)
-# 宽高比: 正方形≈1.0, 横长方形>1.0, 竖长方形<1.0
-BORDER_EXPAND_X = r.get("border_expand_x", 16)
-BORDER_EXPAND_Y = r.get("border_expand_y", 16)
-# 检测框向外扩展像素，用于黑边/白心验证
-BLACK_CHECK_STEP = r.get("black_check_step", 4)
-MIN_BLACK_HITS   = r.get("min_black_hits", 3)
-# 黑边验证: 四边中至少3边有足够黑色像素
-CENTER_WHITE_STEP = r.get("center_white_step", 3)
-# 白心验证: 中心区域白色像素占比阈值
-MAX_CENTER_JUMP = r.get("max_center_jump", 220)
-# 帧间中心跳跃上限(像素) — 超过此值的候选框被忽略
-MAX_AREA_RATIO  = r.get("max_area_ratio", 3)
-# 帧间面积变化比例上限
-MIN_RECT_FILL   = r.get("min_rect_fill", 45)
-# 轮廓面积/外接矩形面积 最小百分比
-MAX_SIDE_RATIO  = r.get("max_side_ratio", 3)
-# 四边形对边长度比上限
-APPROX_EPSILON  = r.get("approx_epsilon", 0.04)
-# approxPolyDP精度: 0.04=轮廓周长的4%作为逼近误差
-
-# ---- 跟踪 ----
-t = _get(CFG, "tracking", {})
-SMOOTH_NUM = t.get("smooth_num", 0)
-SMOOTH_DEN = t.get("smooth_den", 1)
-# 指数平滑: new = (old*SMOOTH_NUM + new)/SMOOTH_DEN
-# 0/1=不平滑, 1/2=一半旧一半新, 2/3=偏旧
-LOST_KEEP_FRAMES = t.get("lost_keep_frames", 2)
-# 目标丢失后保留上一帧坐标的帧数 — 遮挡短暂恢复
-
-# ---- 中心/激光偏移 ----
+# ---- 屏幕中心 (追踪目标点) ----
 CENTER_CFG = _get(CFG, "center", {})
 CENTER_X = CENTER_CFG.get("x", SENSOR_W // 2)
 CENTER_Y = CENTER_CFG.get("y", SENSOR_H // 2)
-# 画面中心像素坐标 — 分辨率改变时需同步更新
-LASER_OFFSET_X = CENTER_CFG.get("laser_offset_x", 0)
-LASER_OFFSET_Y = CENTER_CFG.get("laser_offset_y", 0)
-# 激光光斑相对摄像头光轴的像素偏移(标定值)
 
-# ---- 降采样检测 ----
-DRES = _get(CFG, "detect_resolution", {})
-USE_DOWNSCALE = DRES.get("enabled", False)
-# 开启后检测在低分辨率上运行: 320x240仅1/4像素量
-# 注意: cv2.resize有开销，实际帧率提升需实测。默认关闭
-DETECT_W = DRES.get("width",  320)
-DETECT_H = DRES.get("height", 240)
-SCALE_X = SENSOR_W / DETECT_W
-SCALE_Y = SENSOR_H / DETECT_H
+# ---- CV 矩形检测阈值 ----
+r = _get(CFG, "rectangle", {})
+WHITE_LOW  = tuple(r.get("white_low",  [135, 135, 115]))
+WHITE_HIGH = tuple(r.get("white_high", [255, 255, 255]))
+BLACK_LOW  = tuple(r.get("black_low",  [0, 0, 0]))
+BLACK_HIGH = tuple(r.get("black_high", [85, 85, 85]))
+MIN_AREA   = r.get("min_area", 3500)
+MAX_AREA   = r.get("max_area", 180000)
+MIN_ASPECT = r.get("min_aspect", 1.05)
+MAX_ASPECT = r.get("max_aspect", 2.80)
+BORDER_EXPAND_X = r.get("border_expand_x", 16)
+BORDER_EXPAND_Y = r.get("border_expand_y", 16)
+BLACK_CHECK_STEP = r.get("black_check_step", 4)
+MIN_BLACK_HITS   = r.get("min_black_hits", 3)
+CENTER_WHITE_STEP = r.get("center_white_step", 3)
+MAX_CENTER_JUMP = r.get("max_center_jump", 220)
+MAX_AREA_RATIO  = r.get("max_area_ratio", 3)
+MIN_RECT_FILL   = r.get("min_rect_fill", 45)
+MAX_SIDE_RATIO  = r.get("max_side_ratio", 3)
+APPROX_EPSILON  = r.get("approx_epsilon", 0.04)
 
-# ---- YOLO KPU ----
+# ---- YOLO 配置 ----
 YOLO_CFG = _get(CFG, "yolo", {})
 
-# ---- 卡尔曼(EMA)开关 ----
-k = _get(CFG, "kalman", {})
-KALMAN_ENABLED = k.get("enabled", False)
-KALMAN_ALPHA   = k.get("smooth_factor", 0.3)
-# alpha越大→越跟手但越抖; alpha越小→越平滑但越延迟
-# 0.2=很平滑(适合静态对准), 0.6=跟手(适合快速追踪), 0.3=平衡
-
-# ---- 串口开关 ----
-u = _get(CFG, "uart", {})
-UART_ENABLED = u.get("enabled", False)
-# 开启后向云台发送 dx,dy,dist,status
+# ---- 舵机配置 ----
+sv = _get(CFG, "servo", {})
+SERVO_ENABLED = sv.get("enabled", False)
 
 # ============================================================================
-# 三、检测算法 — 纯函数，直接读全局参数（热路径优化）
-#    不改函数签名，所有阈值通过模块全局变量传递
+# 三、FSUS 协议驱动 (整合自 fs_servo.py)
+#    协议: Fashion Star Uart Servo, 小端字节序, 角度单位 0.1°
+# ============================================================================
+
+# ---- FSUS 指令 ID ----
+CMD_PING = 1
+CMD_READ = 3
+CMD_WRITE = 4
+CMD_SET_ANGLE = 8
+CMD_DAMPING = 9
+CMD_QUERY_ANGLE = 10
+CMD_SET_BY_INTERVAL = 11
+CMD_SET_BY_VELOCITY = 12
+CMD_SET_MTURN = 13
+CMD_QUERY_MTURN = 16
+CMD_RESET_MTURN = 17
+CMD_MONITOR = 22
+CMD_ORIGIN = 23
+CMD_STOP = 24
+CMD_SYNC = 25
+
+# ---- 参数地址 ----
+ADDR_SERVO_ID = 34
+ADDR_BAUDRATE = 36
+ADDR_ANGLE_LIMIT_SW = 48
+ADDR_ANGLE_LIMIT_HIGH = 51
+ADDR_ANGLE_LIMIT_LOW = 52
+
+
+class FSServoBus:
+    """一条舵机总线 = 一个 UART, 总线上可挂多个舵机(靠ID区分)"""
+
+    def __init__(self, uart_id=2, baud=115200, tx_pin=5, rx_pin=6, timeout_ms=200):
+        from machine import UART, FPIOA
+        fp = FPIOA()
+        fn_tx = getattr(FPIOA, "UART%d_TXD" % uart_id, FPIOA.UART2_TXD)
+        fn_rx = getattr(FPIOA, "UART%d_RXD" % uart_id, FPIOA.UART2_RXD)
+        fp.set_function(tx_pin, fn_tx)
+        fp.set_function(rx_pin, fn_rx)
+        self.uart = UART(uart_id, baudrate=baud)
+        self.tmo = timeout_ms
+
+    def _pack(self, cmd, content):
+        """请求帧: [0x12,0x4C, cmd, size, content..., checksum]"""
+        n = len(content)
+        f = bytearray(4 + n + 1)
+        f[0] = 0x12
+        f[1] = 0x4C
+        f[2] = cmd
+        f[3] = n
+        f[4:4 + n] = content
+        chk = 0x12 + 0x4C + cmd + n
+        for b in content:
+            chk += b
+        f[4 + n] = chk & 0xFF
+        return f
+
+    def _read_n(self, n):
+        """读满 n 字节, 超时返回 None"""
+        buf = bytearray()
+        t0 = time.ticks_ms()
+        while len(buf) < n:
+            if time.ticks_diff(time.ticks_ms(), t0) > self.tmo:
+                return None
+            m = self.uart.any()
+            if m:
+                buf += self.uart.read(min(m, n - len(buf)))
+        return buf
+
+    def txrx(self, cmd, content, wait_resp=True, retry=1):
+        """发一帧; wait_resp=False 纯写。成功返回(cmdId, content), 失败 None"""
+        for _ in range(retry + 1):
+            try:
+                self.uart.read()
+                self.uart.write(self._pack(cmd, content))
+                if not wait_resp:
+                    return None
+                time.sleep_ms(5)  # 等舵机开始回应
+                hdr = self._read_n(4)
+                if hdr is None or hdr[0] != 0x05 or hdr[1] != 0x1C:
+                    continue
+                size = hdr[3]
+                body = self._read_n(size + 1)
+                if body is None:
+                    continue
+                cont = body[:size]
+                chk = (0x05 + 0x1C + hdr[2] + size + sum(cont)) & 0xFF
+                if chk == body[size]:
+                    return hdr[2], cont
+            except Exception:
+                continue
+        return None
+
+
+class FSServo:
+    """单个总线舵机"""
+
+    def __init__(self, bus, sid):
+        self.bus = bus
+        self.id = sid
+
+    def ping(self):
+        """通信检测, 成功返回 True"""
+        r = self.bus.txrx(CMD_PING, bytes([self.id]), retry=2)
+        return r is not None and len(r[1]) > 0 and r[1][0] == self.id
+
+    def set_angle(self, angle_deg, interval_ms=0, power=0):
+        """单圈设角度 ±180°; interval_ms=行程时间(ms)"""
+        a = int(max(-180.0, min(180.0, angle_deg)) * 10)
+        self.bus.txrx(CMD_SET_ANGLE, bytes([
+            self.id,
+            a & 0xFF, (a >> 8) & 0xFF,
+            interval_ms & 0xFF, (interval_ms >> 8) & 0xFF,
+            power & 0xFF, (power >> 8) & 0xFF]), wait_resp=False)
+
+    def set_angle_mturn(self, angle_deg, interval_ms=0, power=0):
+        """多圈设角度; angle_deg 支持 ±360° 及更大范围"""
+        a = int(angle_deg * 10)
+        self.bus.txrx(CMD_SET_MTURN, bytes([
+            self.id,
+            a & 0xFF, (a >> 8) & 0xFF, (a >> 16) & 0xFF, (a >> 24) & 0xFF,
+            interval_ms & 0xFF, (interval_ms >> 8) & 0xFF,
+            (interval_ms >> 16) & 0xFF, (interval_ms >> 24) & 0xFF,
+            power & 0xFF, (power >> 8) & 0xFF]), wait_resp=False)
+
+    def stop(self, mode=2, power=500):
+        """停止: 0=卸力 1=锁力 2=阻尼(默认最安全)"""
+        self.bus.txrx(CMD_STOP, bytes([
+            self.id, (mode | 0x10) & 0xFF,
+            power & 0xFF, (power >> 8) & 0xFF]), wait_resp=False)
+
+    def read_param(self, addr):
+        """读参数, 返回 int(小端解码); 失败 None"""
+        r = self.bus.txrx(CMD_READ, bytes([self.id, addr]), retry=2)
+        if r is None or len(r[1]) < 4:
+            return None
+        c = r[1]
+        val = c[2] | (c[3] << 8)
+        return val
+
+    def write_param(self, addr, data):
+        """写参数, data 为 list/bytes"""
+        self.bus.txrx(CMD_WRITE,
+                      bytes([self.id, addr, len(data)]) + bytes(data),
+                      wait_resp=False)
+
+
+def sync_set_angles(bus, targets, interval_ms=0, power=0):
+    """同步指令: 一帧驱动多舵机同时动作。targets=[(id, angle), ...]"""
+    n = len(targets)
+    c = bytearray([8, 7, n])  # 子cmd=8, 每舵机7B
+    for sid, ang in targets:
+        a = int(max(-180.0, min(180.0, ang)) * 10)
+        c += bytes([
+            sid & 0xFF,
+            a & 0xFF, (a >> 8) & 0xFF,
+            interval_ms & 0xFF, (interval_ms >> 8) & 0xFF,
+            power & 0xFF, (power >> 8) & 0xFF])
+    bus.txrx(CMD_SYNC, c, wait_resp=False)
+
+
+# ============================================================================
+# 四、舵机控制 — 初始化 + servo_send
+# ============================================================================
+
+if SERVO_ENABLED:
+    _servo_inited = False
+    try:
+        _sport = sv.get("port", 2)
+        _sbus = FSServoBus(uart_id=_sport, baud=sv.get("baud", 115200),
+                           tx_pin=sv.get("tx_pin", 5), rx_pin=sv.get("rx_pin", 6))
+        _yaw = FSServo(_sbus, sv.get("yaw_id", 1))      # 左右轴
+        _pitch = FSServo(_sbus, sv.get("pitch_id", 0))  # 上下轴
+        _servo_inited = True
+
+        # ---- 控制参数 ----
+        YAW_VEL_SCALE = sv.get("yaw_vel_scale", 0.08)   # 左右: 每帧角度 += scale × dx
+        PITCH_K = sv.get("pitch_k", 0.02)               # 上下: 每帧角度 += k × dy
+        YAW_REV = -1.0 if sv.get("yaw_reverse", False) else 1.0
+        PITCH_REV = -1.0 if sv.get("pitch_reverse", False) else 1.0
+        YAW_MIN = sv.get("yaw_min", -360)
+        YAW_MAX = sv.get("yaw_max", 360)
+        PITCH_MIN = sv.get("pitch_min", -30)
+        PITCH_MAX = sv.get("pitch_max", 30)
+        S_INTERVAL = sv.get("interval_ms", 40)          # 舵机行程周期(ms)
+        S_POWER = sv.get("power", 0)                     # 功率上限mW, 0=不限
+        S_DEADBAND = sv.get("deadband_px", 5)            # 死区像素
+        S_LOST_HOLD = sv.get("lost_hold", True)          # 丢靶保持 or 阻尼
+
+        # 角度积分状态 (上电时云台应居中=0°)
+        _yaw_ang = 0.0
+        _pitch_ang = 0.0
+
+        def _s_clamp(v, lo, hi):
+            return lo if v < lo else (hi if v > hi else v)
+
+        def servo_send(dx, dy, dist, status):
+            """视觉追踪控制 — 增量式
+               dx=左右偏移(像素), dy=上下偏移(像素)
+               yaw(左右轴) 用 dx 控制, pitch(上下轴) 用 dy 控制
+               偏差越大, 每帧增量越大 → 转越快"""
+            global _yaw_ang, _pitch_ang
+            try:
+                if status == "lost":
+                    if not S_LOST_HOLD:
+                        _yaw.stop(2)   # 丢靶→阻尼
+                        _pitch.stop(2)
+                    return
+
+                # ---- yaw 左右轴: 用 dx 增量控制 ----
+                if abs(dx) > S_DEADBAND:
+                    incr = YAW_VEL_SCALE * dx
+                    if abs(dx) > 50:
+                        incr *= 1 + (abs(dx) - 50) / 80  # 大偏差加速
+                    _yaw_ang = _s_clamp(_yaw_ang + YAW_REV * incr, YAW_MIN, YAW_MAX)
+                    _yaw.set_angle_mturn(_yaw_ang, S_INTERVAL, S_POWER)
+                else:
+                    _yaw.stop(1)   # 死区内锁力保持
+
+                # ---- pitch 上下轴: 用 dy 增量控制 ----
+                if abs(dy) > S_DEADBAND:
+                    _pitch_ang = _s_clamp(_pitch_ang + PITCH_REV * PITCH_K * dy, PITCH_MIN, PITCH_MAX)
+                    _pitch.set_angle(_pitch_ang, S_INTERVAL, S_POWER)
+
+            except Exception:
+                pass
+
+        # 上电回中
+        if sv.get("center_on_boot", False):
+            sync_set_angles(_sbus, [(_yaw.id, 0.0), (_pitch.id, 0.0)], 2000, S_POWER)
+
+        # 读取并解除角度限制
+        try:
+            lim_sw = _yaw.read_param(48)
+            lim_hi = _yaw.read_param(51)
+            lim_lo = _yaw.read_param(52)
+            if lim_sw is None:
+                print("  yaw limit: 读取失败")
+            else:
+                hi = (lim_hi - 65536 if lim_hi >= 32768 else lim_hi) / 10.0
+                lo = (lim_lo - 65536 if lim_lo >= 32768 else lim_lo) / 10.0
+                print("  yaw limit: sw=%s hi=%.1f° lo=%.1f°" % ("ON" if lim_sw else "OFF", hi, lo))
+                if lim_sw:
+                    _yaw.write_param(48, [0])
+                    _yaw.write_param(51, [0x10, 0x0E])   # +360° = 3600 = 0x0E10
+                    _yaw.write_param(52, [0xF0, 0xF1])   # -360° = -3600 = 0xF1F0
+                    print("  -> 已解除角度限制, 设为±360°(断电重启生效)")
+        except Exception as _e:
+            print("  读取限制参数失败:", _e)
+
+        print("servo: yaw_id=%d pitch_id=%d scale=%.3f k=%.3f rev=%s/%s range=%d~%d port=%d%s" %
+              (_yaw.id, _pitch.id, YAW_VEL_SCALE, PITCH_K,
+               "Y" if YAW_REV < 0 else "N", "Y" if PITCH_REV < 0 else "N",
+               YAW_MIN, YAW_MAX, _sport,
+               " online" if _yaw.ping() else " (ping no resp)"))
+    except Exception as e:
+        print("\n!!! servo init failed: %s" % str(e))
+        servo_send = lambda dx, dy, d, s: None
+else:
+    servo_send = lambda dx, dy, d, s: None
+
+
+# ============================================================================
+# 五、CV 矩形检测
 # ============================================================================
 
 def point_xy(point):
-    """统一解析OpenCV point类型 → (int(x), int(y))"""
-    try:                     return int(point[0][0]), int(point[0][1])
-    except Exception:        return int(point[0]), int(point[1])
+    try:
+        return int(point[0][0]), int(point[0][1])
+    except Exception:
+        return int(point[0]), int(point[1])
 
 def order_points(points):
-    """四点排序: 左上→右上→右下→左下"""
     pts = [point_xy(p) for p in points]
-    cx = sum([p[0] for p in pts]) // 4
-    cy = sum([p[1] for p in pts]) // 4
-    top, bottom = [], []
-    for p in pts:
-        if p[1] < cy: top.append(p)
-        else:         bottom.append(p)
-    if len(top) != 2 or len(bottom) != 2:
+    cx = sum(p[0] for p in pts) // 4
+    cy = sum(p[1] for p in pts) // 4
+    top = [p for p in pts if p[1] < cy]
+    bottom = [p for p in pts if p[1] >= cy]
+    if len(top) != 2:
         pts.sort(key=lambda p: p[1])
         top, bottom = pts[:2], pts[2:]
     top.sort(key=lambda p: p[0])
     bottom.sort(key=lambda p: p[0])
     return [top[0], top[1], bottom[1], bottom[0]]
 
-def center_of(points):
-    return (sum(point_xy(p)[0] for p in points) // 4,
-            sum(point_xy(p)[1] for p in points) // 4)
-
 def get_contours(result):
-    """兼容不同OpenCV版本的findContours返回值"""
     return result[0] if len(result) == 2 else result[1]
 
+def quad_center(box):
+    """四边形对角线交点(精确中心)"""
+    x1, y1 = box[0]; x2, y2 = box[2]; x3, y3 = box[1]; x4, y4 = box[3]
+    den = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+    if den == 0:
+        return (sum(p[0] for p in box) // 4, sum(p[1] for p in box) // 4)
+    pre = x1 * y2 - y1 * x2
+    post = x3 * y4 - y3 * x4
+    cx = (pre * (x3 - x4) - (x1 - x2) * post) // den
+    cy = (pre * (y3 - y4) - (y1 - y2) * post) // den
+    return int(cx), int(cy)
+
+def side_len2(a, b):
+    dx, dy = a[0] - b[0], a[1] - b[1]
+    return dx * dx + dy * dy
+
+def is_good_quad(quad, contour_area, box_area):
+    if contour_area * 100 < box_area * MIN_RECT_FILL:
+        return False
+    sides = [side_len2(quad[i], quad[(i + 1) % 4]) for i in range(4)]
+    if min(sides) <= 0 or max(sides) > min(sides) * MAX_SIDE_RATIO * MAX_SIDE_RATIO:
+        return False
+    h_avg = (sides[0] + sides[2]) // 2
+    v_avg = (sides[1] + sides[3]) // 2
+    if min(h_avg, v_avg) <= 0:
+        return False
+    ratio = max(h_avg, v_avg) / min(h_avg, v_avg)
+    if ratio > MAX_ASPECT * MAX_ASPECT or ratio < MIN_ASPECT * MIN_ASPECT:
+        return False
+    return True
+
+def contour_quad(cnt, box_area):
+    peri = cv2.arcLength(cnt, True)
+    approx = cv2.approxPolyDP(cnt, APPROX_EPSILON * peri, True)
+    if len(approx) != 4:
+        return None
+    quad = order_points(approx)
+    if not is_good_quad(quad, cv2.contourArea(cnt), box_area):
+        return None
+    return quad
+
 def has_black_border(frame_np, x, y, w, h):
-    """验证矩形四边是否有足够黑色像素（黑边框检测）"""
-    if w < 20 or h < 20: return False
+    if w < 20 or h < 20:
+        return False
     black = cv2.inRange(frame_np, BLACK_LOW, BLACK_HIGH)
     edge = max(2, min(w, h) // 18)
-    top    = black[y:y+edge,    x:x+w]
-    bottom = black[y+h-edge:y+h, x:x+w]
-    left   = black[y:y+h,       x:x+edge]
-    right  = black[y:y+h,       x+w-edge:x+w]
+    top = black[y:y + edge, x:x + w]
+    bottom = black[y + h - edge:y + h, x:x + w]
+    left = black[y:y + h, x:x + edge]
+    right = black[y:y + h, x + w - edge:x + w]
     hits = 0
-    if cv2.countNonZero(top)    > w // BLACK_CHECK_STEP: hits += 1
+    if cv2.countNonZero(top) > w // BLACK_CHECK_STEP: hits += 1
     if cv2.countNonZero(bottom) > w // BLACK_CHECK_STEP: hits += 1
-    if cv2.countNonZero(left)   > h // BLACK_CHECK_STEP: hits += 1
-    if cv2.countNonZero(right)  > h // BLACK_CHECK_STEP: hits += 1
+    if cv2.countNonZero(left) > h // BLACK_CHECK_STEP: hits += 1
+    if cv2.countNonZero(right) > h // BLACK_CHECK_STEP: hits += 1
     return hits >= MIN_BLACK_HITS
 
+def has_white_center(white_mask, x, y, w, h):
+    ix, iy = x + w // 4, y + h // 4
+    iw, ih = w // 2, h // 2
+    if iw <= 0 or ih <= 0:
+        return False
+    roi = white_mask[iy:iy + ih, ix:ix + iw]
+    return cv2.countNonZero(roi) > (iw * ih) // CENTER_WHITE_STEP
+
 def clamp_box(x, y, w, h):
-    """裁切检测框到画面范围内"""
     if x < 0: x = 0
     if y < 0: y = 0
     if x + w > SENSOR_W: w = SENSOR_W - x
     if y + h > SENSOR_H: h = SENSOR_H - y
     return x, y, w, h
 
-def has_white_center(white_mask, x, y, w, h):
-    """验证矩形中心区域是否有足够白色像素（白心检测）"""
-    ix, iy = x+w//4, y+h//4
-    iw, ih = w//2, h//2
-    if iw <= 0 or ih <= 0: return False
-    roi = white_mask[iy:iy+ih, ix:ix+iw]
-    return cv2.countNonZero(roi) > (iw * ih) // CENTER_WHITE_STEP
-
-def quad_bounds(box):
-    """四边形外接矩形"""
-    xs = [p[0] for p in box]; ys = [p[1] for p in box]
-    return min(xs), min(ys), max(xs)-min(xs), max(ys)-min(ys)
-
-def quad_average_center(box):
-    """四边形顶点均值中心"""
-    return (sum(p[0] for p in box)//4, sum(p[1] for p in box)//4)
-
-def quad_center(box):
-    """四边形对角线交点（精确中心）"""
-    x1,y1 = box[0]; x2,y2 = box[2]; x3,y3 = box[1]; x4,y4 = box[3]
-    den = (x1-x2)*(y3-y4) - (y1-y2)*(x3-x4)
-    if den == 0: return quad_average_center(box)
-    pre  = x1*y2 - y1*x2
-    post = x3*y4 - y3*x4
-    cx = (pre*(x3-x4) - (x1-x2)*post) // den
-    cy = (pre*(y3-y4) - (y1-y2)*post) // den
-    return int(cx), int(cy)
-
-def score_box(x, y, w, h, box_area, aspect, last_box):
-    """候选框评分: 面积大 + 接近目标宽高比 + 靠近上一帧位置 = 高分"""
-    cx, cy = x + w//2, y + h//2
-    aspect_bias = abs(aspect - TARGET_ASPECT) * 1000
-    if last_box:
-        lx, ly = quad_center(last_box)
-        return box_area - (abs(cx-lx)+abs(cy-ly))*8 - aspect_bias
-    return box_area - (abs(cx-SENSOR_W//2)+abs(cy-SENSOR_H//2))*2 - aspect_bias
-
-def side_len2(a, b):
-    dx, dy = a[0]-b[0], a[1]-b[1]
-    return dx*dx + dy*dy
-
-def is_good_quad(quad, contour_area, box_area):
-    """多维度验证四边形质量: 填充率/边长比/对边比"""
-    if contour_area * 100 < box_area * MIN_RECT_FILL: return False
-    top, right = side_len2(quad[0], quad[1]), side_len2(quad[1], quad[2])
-    bottom, left = side_len2(quad[2], quad[3]), side_len2(quad[3], quad[0])
-    sides = [top, right, bottom, left]
-    if min(sides) <= 0: return False
-    if max(sides) > min(sides) * MAX_SIDE_RATIO * MAX_SIDE_RATIO: return False
-    long_side  = max((top+bottom)//2, (left+right)//2)
-    short_side = min((top+bottom)//2, (left+right)//2)
-    if short_side <= 0: return False
-    if long_side > short_side * MAX_ASPECT * MAX_ASPECT: return False
-    if long_side * 100 < short_side * MIN_ASPECT * MIN_ASPECT * 100: return False
-    return True
-
-def contour_quad(cnt, box_area):
-    """轮廓→四边形，含多边形逼近和质量验证"""
-    peri = cv2.arcLength(cnt, True)
-    approx = cv2.approxPolyDP(cnt, APPROX_EPSILON * peri, True)
-    if len(approx) != 4: return None
-    quad = order_points(approx)
-    if not is_good_quad(quad, cv2.contourArea(cnt), box_area): return None
-    return quad
-
 def find_paper_box(frame_np, last_box):
-    """核心检测: 白色掩膜→轮廓筛选→黑边验证→白心验证→评分→最优框"""
+    """检测矩形靶标, 返回 (box4点, 轮廓数, 面积候选数)"""
     mask = cv2.inRange(frame_np, WHITE_LOW, WHITE_HIGH)
     contours = get_contours(cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE))
     best, best_score = None, -1
@@ -305,130 +504,84 @@ def find_paper_box(frame_np, last_box):
     last_cx = last_cy = last_area = 0
     if last_box:
         last_cx, last_cy = quad_center(last_box)
-        lx, ly, lw, lh = quad_bounds(last_box)
-        last_area = lw * lh
+        xs = [p[0] for p in last_box]; ys = [p[1] for p in last_box]
+        last_area = (max(xs) - min(xs)) * (max(ys) - min(ys))
     for cnt in contours:
         x, y, w, h = cv2.boundingRect(cnt)
-        if w <= 0 or h <= 0: continue
+        if w <= 0 or h <= 0:
+            continue
         box_area = w * h
-        if box_area < MIN_AREA or box_area > MAX_AREA: continue
+        if box_area < MIN_AREA or box_area > MAX_AREA:
+            continue
         area_count += 1
         aspect = w / h
-        if aspect < MIN_ASPECT or aspect > MAX_ASPECT: continue
+        if aspect < MIN_ASPECT or aspect > MAX_ASPECT:
+            continue
         x -= BORDER_EXPAND_X; y -= BORDER_EXPAND_Y
-        w += BORDER_EXPAND_X*2; h += BORDER_EXPAND_Y*2
+        w += BORDER_EXPAND_X * 2; h += BORDER_EXPAND_Y * 2
         x, y, w, h = clamp_box(x, y, w, h)
-        cx, cy = x + w//2, y + h//2
-        if last_box and abs(cx-last_cx)+abs(cy-last_cy) > MAX_CENTER_JUMP: continue
-        if last_area and (box_area > last_area*MAX_AREA_RATIO or last_area > box_area*MAX_AREA_RATIO): continue
-        if not has_white_center(mask, x, y, w, h): continue
-        if not has_black_border(frame_np, x, y, w, h): continue
+        cx, cy = x + w // 2, y + h // 2
+        if last_box and abs(cx - last_cx) + abs(cy - last_cy) > MAX_CENTER_JUMP:
+            continue
+        if last_area and (box_area > last_area * MAX_AREA_RATIO or last_area > box_area * MAX_AREA_RATIO):
+            continue
+        if not has_white_center(mask, x, y, w, h):
+            continue
+        if not has_black_border(frame_np, x, y, w, h):
+            continue
         quad = contour_quad(cnt, box_area)
-        if not quad: continue
-        score = score_box(x, y, w, h, box_area, aspect, last_box)
-        if score > best_score: best_score = score; best = quad
+        if not quad:
+            continue
+        score = box_area - (abs(cx - last_cx) + abs(cy - last_cy)) * 8 if last_box else box_area
+        if score > best_score:
+            best_score = score
+            best = quad
     return best, len(contours), area_count
 
-def smooth_box(last_box, box):
-    """四边形顶点指数平滑: 减少帧间抖动"""
-    if not last_box: return box
-    return [((last_box[i][0]*SMOOTH_NUM + box[i][0]) // SMOOTH_DEN,
-             (last_box[i][1]*SMOOTH_NUM + box[i][1]) // SMOOTH_DEN)
-            for i in range(4)]
-
-def draw_box(frame_np, box, source):
-    """绘制检测框+十字线+中心点, 返回 (cx, cy, dx, dy)"""
+def draw_box(frame_np, box):
+    """绘制矩形框+中心十字, 返回 (cx, cy, dx, dy)"""
     for i in range(4):
-        cv2.line(frame_np, box[i], box[(i+1)%4], (0, 255, 0), 2)
+        cv2.line(frame_np, box[i], box[(i + 1) % 4], (0, 255, 0), 2)
     cx, cy = quad_center(box)
     dx, dy = cx - CENTER_X, cy - CENTER_Y
-    cv2.line(frame_np, (cx-14, cy), (cx+14, cy), (255, 255, 0), 2)
-    cv2.line(frame_np, (cx, cy-14), (cx, cy+14), (255, 255, 0), 2)
+    cv2.line(frame_np, (cx - 14, cy), (cx + 14, cy), (255, 255, 0), 2)
+    cv2.line(frame_np, (cx, cy - 14), (cx, cy + 14), (255, 255, 0), 2)
     cv2.circle(frame_np, (cx, cy), 4, (0, 0, 255), 1)
     return cx, cy, dx, dy
 
+
 # ============================================================================
-# 四、可选功能注入 — lambda模式, 热路径零分支
-#    开启: 创建真实函数对象并绑定
-#    关闭: 绑定为lambda identity / no-op
-#    主循环中无感调用, 无 if 判断开销
+# 六、YOLO 检测支持
 # ============================================================================
 
-# ---- 卡尔曼滤波器(EMA) ----
-# 功能: 对dx,dy做一阶指数平滑, 减少检测抖动
-# 配置: kalman.enabled / kalman.smooth_factor
-# 关闭时: kf_update = 透传(float转换), kf_reset = no-op
-class _Kalman:
-    def __init__(self, a): self.a, self.x, self.y = a, None, None
-    def update(self, mx, my):
-        if self.x is None: self.x, self.y = float(mx), float(my)
-        else:
-            a = self.a
-            self.x = a*float(mx) + (1-a)*self.x
-            self.y = a*float(my) + (1-a)*self.y
-        return self.x, self.y
-    def reset(self): self.x = self.y = None
-
-if KALMAN_ENABLED:
-    _kf = _Kalman(KALMAN_ALPHA)
-    kf_update = _kf.update      # 真实EMA
-    kf_reset  = _kf.reset
-else:
-    kf_update = lambda mx, my: (float(mx), float(my))  # 透传
-    kf_reset  = lambda: None                            # 空操作
-
-# ---- 串口输出 ----
-# 功能: 通过UART向云台STM32发送 dx,dy,dist,status
-# 协议: "dx,dy,dist,status\n"  status: 0=追踪 1=对准 404=丢失
-# 配置: uart.enabled / uart.port / uart.baud
-# 关闭时: uart_send = no-op
-if UART_ENABLED:
+def _yolo_ok():
     try:
-        from machine import UART, FPIOA
-        _uart_port = u.get("port", 2)
-        _uart_baud = u.get("baud", 115200)
-        _tx_pin = u.get("tx_pin", 5)
-        _rx_pin = u.get("rx_pin", 6)
-        _fpioa = FPIOA()
-        _fpioa.set_function(_tx_pin, FPIOA.UART2_TXD)
-        _fpioa.set_function(_rx_pin, FPIOA.UART2_RXD)
-        _uart = UART(_uart_port, baudrate=_uart_baud)
-        print("uart: port=%d baud=%d tx=%d rx=%d" % (_uart_port, _uart_baud, _tx_pin, _rx_pin))
-        def uart_send(dx, dy, dist, status):
-            """发送偏差到云台 — 协议: dx,dy,dist,status\\r\\n (每帧以CRLF结尾)"""
-            try:
-                if status == "lost":
-                    _uart.write("404,404,0,0\r\n")
-                elif status == "aligned":
-                    _uart.write("%d,%d,%.0f,1\r\n" % (dx, dy, dist))
-                else:
-                    _uart.write("%d,%d,%.0f,0\r\n" % (dx, dy, dist))
-            except Exception:
-                pass
-    except Exception as e:
-        print("uart init failed:", e)
-        uart_send = lambda dx, dy, d, s: None
-else:
-    uart_send = lambda dx, dy, d, s: None
+        import nncase_runtime
+    except ImportError:
+        return False
+    try:
+        from libs.PipeLine import PipeLine
+    except ImportError:
+        return False
+    try:
+        from libs.YOLO import YOLOv8
+    except ImportError:
+        return False
+    return True
+
 
 # ============================================================================
-# 五、CV模式主循环
-#    热路径结构与初版main.py一致 → 保证帧率
-#    新增: kf_update/uart_send已在上方注入, 此处直接调用
+# 七、CV 模式主循环
 # ============================================================================
 
 def run_cv():
-    global SENSOR_W, SENSOR_H  # 降采样时会临时改写
-
     sensor = None
     frame_id = lost_count = 0
     last_box = None
     fps = fps_count = 0
     fps_tick = time.ticks_ms()
-    sw_orig, sh_orig = SENSOR_W, SENSOR_H
 
     try:
-        # ---- 初始化 ----
         print("boot")
         os.exitpoint(os.EXITPOINT_ENABLE)
         sensor = Sensor(width=1280, height=960, fps=FPS)
@@ -447,97 +600,45 @@ def run_cv():
             frame = sensor.snapshot(chn=CAM_CHN_ID_0)
             frame_np = frame.to_numpy_ref()
 
-            # ================================================================
-            # 检测阶段
-            #   detect_every: 跳帧检测 — 非检测帧直接复用last_box
-            #   downscale:    降采样 — 在320x240上检测, 坐标映射回640x480
-            # ================================================================
+            # 检测
             if frame_id % DETECT_EVERY == 0 or not last_box:
-                if USE_DOWNSCALE:
-                    # --- 降采样路径 ---
-                    detect_frame = cv2.resize(frame_np, (DETECT_W, DETECT_H))
-                    SENSOR_W, SENSOR_H = DETECT_W, DETECT_H          # 临时切换尺寸
-                    box, contour_count, area_count = find_paper_box(detect_frame, last_box)
-                    SENSOR_W, SENSOR_H = sw_orig, sh_orig             # 恢复
-                    if box:
-                        box = [[int(p[0]*SCALE_X), int(p[1]*SCALE_Y)] for p in box]
-                else:
-                    # --- 原版路径(默认) ---
-                    box, contour_count, area_count = find_paper_box(frame_np, last_box)
+                box, contour_count, area_count = find_paper_box(frame_np, last_box)
             else:
                 box, contour_count, area_count = last_box, 0, 0
 
-            # ================================================================
-            # 结果处理阶段
-            #   OK:    检测到 → 平滑 → 绘图 → 卡尔曼 → 距离 → 串口
-            #   HOLD:  短暂丢失 → 复用上一帧坐标
-            #   LOST:  完全丢失 → 重置卡尔曼 → 通知云台
-            # ================================================================
             if box:
-                # ---- 检测成功 ----
-                box = smooth_box(last_box, box)
                 last_box = box
                 lost_count = 0
-                cx, cy, dx, dy = draw_box(frame_np, box, "OK")
-
-                # 卡尔曼滤波(或透传)
-                fdx, fdy = kf_update(dx, dy)
-
-                # 欧氏距离: sqrt(dx² + dy²) — 目标到画面中心的像素距离
-                dist = math.sqrt(fdx*fdx + fdy*fdy)
-
-                # 串口输出: dx,dy,dist,status
-                uart_send(int(fdx), int(fdy), dist, "track")
-
-                if frame_id % PRINT_EVERY == 0:
-                    print("OK  xy=(%d,%d)  d=(%d,%d)  dist=%.0f  c=%d a=%d" %
-                          (cx, cy, int(fdx), int(fdy), dist, contour_count, area_count))
-
+                cx, cy, dx, dy = draw_box(frame_np, box)
+                dist = math.sqrt(dx * dx + dy * dy)
+                servo_send(int(dx), int(dy), dist, "track")
+                if frame_id % 60 == 0:
+                    print("OK  center=(%d,%d)  d=(%d,%d)  dist=%.0f" % (cx, cy, dx, dy, dist))
             else:
-                # ---- 检测失败 ----
                 lost_count += 1
-                if last_box and lost_count <= LOST_KEEP_FRAMES:
-                    # 短暂丢失 → 保持上一帧位置
-                    cx, cy, dx, dy = draw_box(frame_np, last_box, "HOLD")
-                    fdx, fdy = kf_update(dx, dy)
-                    dist = math.sqrt(fdx*fdx + fdy*fdy)
-                    uart_send(int(fdx), int(fdy), dist, "track")
-                    if frame_id % PRINT_EVERY == 0:
-                        print("HOLD xy=(%d,%d)  d=(%d,%d)  dist=%.0f  c=%d a=%d" %
-                              (cx, cy, int(fdx), int(fdy), dist, contour_count, area_count))
-                else:
-                    # 完全丢失 → 重置状态
+                if lost_count > 2:
                     last_box = None
-                    kf_reset()
-                    uart_send(0, 0, 0, "lost")
-                    if frame_id % PRINT_EVERY == 0:
-                        print("LOST c=%d a=%d" % (contour_count, area_count))
+                    servo_send(0, 0, 0, "lost")
+                    if frame_id % 60 == 0:
+                        print("LOST")
 
-            # ================================================================
-            # OSD叠加 — 左上角显示实时偏差和距离
-            # ================================================================
+            # OSD
             if SHOW_OSD and box:
-                cv2.putText(frame_np, "dx:%+d dy:%+d dist:%.0f" % (int(fdx), int(fdy), dist),
+                cv2.putText(frame_np, "dx:%+d dy:%+d" % (dx, dy),
                             (4, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
-            # ================================================================
-            # FPS统计
-            # ================================================================
+            # FPS
             fps_count += 1
             now = time.ticks_ms()
-            elapsed = time.ticks_diff(now, fps_tick)
-            if elapsed >= 1000:
-                fps = fps_count * 1000 // elapsed
-                fps_count = 0; fps_tick = now
+            if time.ticks_diff(now, fps_tick) >= 1000:
+                fps = fps_count * 1000 // time.ticks_diff(now, fps_tick)
+                fps_count = 0
+                fps_tick = now
             cv2.putText(frame_np, "FPS:%d" % fps, (4, SENSOR_H - 8),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
             Display.show_image(frame, x=DISPLAY_X, y=DISPLAY_Y)
-
-            # ================================================================
-            # 垃圾回收 — 定时清理, 防止内存堆积导致周期性卡顿
-            # ================================================================
-            if frame_id % GC_EVERY == 0:
+            if frame_id % 30 == 0:
                 gc.collect()
 
     except KeyboardInterrupt:
@@ -546,99 +647,61 @@ def run_cv():
         print("error:", e)
     finally:
         if sensor:
-            try: sensor.stop()
-            except Exception: pass
-        try: Display.deinit()
-        except Exception: pass
-        try: os.exitpoint(os.EXITPOINT_ENABLE_SLEEP)
-        except Exception: pass
+            try:
+                sensor.stop()
+            except Exception:
+                pass
+        try:
+            Display.deinit()
+        except Exception:
+            pass
+        try:
+            os.exitpoint(os.EXITPOINT_ENABLE_SLEEP)
+        except Exception:
+            pass
         time.sleep_ms(100)
-        try: MediaManager.deinit()
-        except Exception: pass
+        try:
+            MediaManager.deinit()
+        except Exception:
+            pass
         print("exit")
 
-# ============================================================================
-# 六、YOLO KPU模式
-#    使用K230 PipeLine框架进行KPU推理
-#    功能: 目标检测 → 中心偏差 → 距离 → 串口
-#    前提: SD卡上有model.kmodel, KPU库可用
-# ============================================================================
 
-def _yolo_ok():
-    """检测KPU库是否可用 — 不可用时打印原因并回退CV模式"""
-    try:
-        import nncase_runtime as _t
-    except ImportError as e:
-        print("YOLO fallback: nncase_runtime missing — %s" % e)
-        return False
-    try:
-        from libs.PipeLine import PipeLine as _t
-    except ImportError as e:
-        print("YOLO fallback: libs.PipeLine missing — %s" % e)
-        return False
-    try:
-        from libs.YOLO import YOLOv8 as _t
-    except ImportError as e:
-        print("YOLO fallback: libs.YOLO missing — %s" % e)
-        return False
-    return True
+# ============================================================================
+# 八、YOLO 模式主循环
+# ============================================================================
 
 def run_yolo():
     from libs.PipeLine import PipeLine, ScopedTiming
     from libs.YOLO import YOLOv8
 
-    MP     = YOLO_CFG.get("model_path", "/sdcard/model/model.kmodel")
+    MP = YOLO_CFG.get("model_path", "/sdcard/model/model.kmodel")
     LABELS = YOLO_CFG.get("labels", ["target"])
-    ISIZE  = YOLO_CFG.get("input_size", [320, 320])
-    CONF   = YOLO_CFG.get("confidence", 0.5)
-    NMS    = YOLO_CFG.get("nms_threshold", 0.45)
-    MB     = YOLO_CFG.get("max_boxes", 50)
+    ISIZE = YOLO_CFG.get("input_size", [320, 320])
+    CONF = YOLO_CFG.get("confidence", 0.5)
+    NMS = YOLO_CFG.get("nms_threshold", 0.45)
+    MB = YOLO_CFG.get("max_boxes", 50)
     SELECT = YOLO_CFG.get("select", "max_conf")
-    TASK   = YOLO_CFG.get("task", "detect")
-    MASK_THRESH = YOLO_CFG.get("mask_threshold", 0.5)
+    TASK = YOLO_CFG.get("task", "detect")
 
-    # segment 用 [320,320], detect 用 [640,360]
-    if TASK == "segment":
-        RGB888P_SIZE = [320, 320]
-    else:
-        RGB888P_SIZE = [640, 360]
+    RGB888P_SIZE = [320, 320] if TASK == "segment" else [640, 360]
 
-    print("=" * 60)
-    print("YOLOv8 KPU mode  task: %s" % TASK)
-    print("model : %s" % MP)
-    print("labels: %s" % LABELS)
-    print("input : %s  rgb888p: %s" % (ISIZE, RGB888P_SIZE))
-    print("conf  : %.2f  nms: %.2f  select: %s" % (CONF, NMS, SELECT))
-    print("=" * 60)
+    print("YOLOv8  task=%s  model=%s  conf=%.2f" % (TASK, MP, CONF))
 
     pl = PipeLine(rgb888p_size=RGB888P_SIZE, display_mode="lcd")
     pl.create()
     ds = pl.get_display_size()
     disp_w = ds[0] if ds else DISPLAY_W
     disp_h = ds[1] if ds else DISPLAY_H
-    print("display: %dx%d" % (disp_w, disp_h))
 
-    if TASK == "segment":
-        yolo = YOLOv8(task_type="segment", mode="video",
-                      kmodel_path=MP, labels=LABELS,
-                      rgb888p_size=RGB888P_SIZE, model_input_size=ISIZE,
-                      display_size=ds,
-                      conf_thresh=CONF, nms_thresh=NMS,
-                      mask_thresh=MASK_THRESH,
-                      max_boxes_num=MB, debug_mode=0)
-    else:
-        yolo = YOLOv8(task_type="detect", mode="video",
-                      kmodel_path=MP, labels=LABELS,
-                      rgb888p_size=RGB888P_SIZE, model_input_size=ISIZE,
-                      display_size=ds,
-                      conf_thresh=CONF, nms_thresh=NMS,
-                      max_boxes_num=MB, debug_mode=0)
+    yolo = YOLOv8(task_type=TASK, mode="video",
+                  kmodel_path=MP, labels=LABELS,
+                  rgb888p_size=RGB888P_SIZE, model_input_size=ISIZE,
+                  display_size=ds, conf_thresh=CONF, nms_thresh=NMS,
+                  max_boxes_num=MB, debug_mode=0)
     yolo.config_preprocess()
-    print("running...")
 
-    lost_count = 0
-    fps_count = 0
-    fps = 0
+    lost_count = fps_count = fps = 0
     fps_tick = time.ticks_ms()
 
     try:
@@ -649,28 +712,23 @@ def run_yolo():
                 res = yolo.run(img)
                 yolo.draw_result(res, pl.osd_img)
 
-            # ---- FPS ----
             fps_count += 1
             now = time.ticks_ms()
             if time.ticks_diff(now, fps_tick) >= 1000:
                 fps = fps_count * 1000 // time.ticks_diff(now, fps_tick)
-                fps_count = 0; fps_tick = now
+                fps_count = 0
+                fps_tick = now
 
-            # ---- 选取最佳目标 ----
             if res and len(res[0]) > 0:
-                boxes   = res[0]
-                cls_ids = res[1]
-                confs   = res[2]
-
-                best_idx = 0
-                best_score = -1
+                boxes, cls_ids, confs = res[0], res[1], res[2]
+                best_idx, best_score = 0, -1
                 for i in range(len(boxes)):
                     x, y, w, h = [int(round(v, 0)) for v in boxes[i]]
                     if SELECT == "max_area":
                         score = w * h
                     elif SELECT == "nearest":
-                        bcx, bcy = x + w//2, y + h//2
-                        score = -((bcx - disp_w//2)**2 + (bcy - disp_h//2)**2)
+                        bcx, bcy = x + w // 2, y + h // 2
+                        score = -((bcx - disp_w // 2) ** 2 + (bcy - disp_h // 2) ** 2)
                     else:
                         score = confs[i]
                     if score > best_score:
@@ -678,23 +736,21 @@ def run_yolo():
                         best_idx = i
 
                 x, y, w, h = [int(round(v, 0)) for v in boxes[best_idx]]
-                cx, cy = x + w//2, y + h//2
-                best_label = LABELS[cls_ids[best_idx]] if cls_ids[best_idx] < len(LABELS) else "?"
-                best_conf  = confs[best_idx]
-
-                fdx, fdy = kf_update(cx - disp_w//2, cy - disp_h//2)
-                dist = math.sqrt(fdx*fdx + fdy*fdy)
-                uart_send(int(fdx), int(fdy), dist, "track")
+                # 识别框中心 → 偏移
+                cx, cy = x + w // 2, y + h // 2
+                dx, dy = cx - disp_w // 2, cy - disp_h // 2
+                dist = math.sqrt(dx * dx + dy * dy)
+                servo_send(int(dx), int(dy), dist, "track")
                 lost_count = 0
 
+                label = LABELS[cls_ids[best_idx]] if cls_ids[best_idx] < len(LABELS) else "?"
                 pl.osd_img.draw_string_advanced(4, 4, 24,
-                    "%s %.2f | dx:%+d dy:%+d dist:%.0f" % (best_label, best_conf, int(fdx), int(fdy), dist),
+                    "%s %.2f | dx:%+d dy:%+d" % (label, confs[best_idx], dx, dy),
                     color=(0, 255, 0))
             else:
                 lost_count += 1
-                if lost_count > LOST_KEEP_FRAMES:
-                    kf_reset()
-                    uart_send(0, 0, 0, "lost")
+                if lost_count > 2:
+                    servo_send(0, 0, 0, "lost")
                 pl.osd_img.draw_string_advanced(4, 4, 24, "LOST", color=(255, 0, 0))
 
             pl.osd_img.draw_string_advanced(4, disp_h - 28, 24, "FPS:%d" % fps, color=(0, 255, 0))
@@ -702,25 +758,20 @@ def run_yolo():
             gc.collect()
 
     except KeyboardInterrupt:
-        print("\nstopped")
+        print("stopped")
     except BaseException as e:
         print("error:", e)
     finally:
         yolo.deinit()
         pl.destroy()
 
+
 # ============================================================================
-# 七、入口 — 根据 config.json 中 detection.mode 选择运行模式
+# 九、入口 — 模式切换
 # ============================================================================
 
 print("=" * 50)
-print("mode: %s" % MODE.upper())
-if MODE == "cv":
-    print("detect: %dx%d  downscale: %s  kalman: %s  uart: %s" %
-          (SENSOR_W, SENSOR_H, USE_DOWNSCALE, KALMAN_ENABLED, UART_ENABLED))
-elif MODE == "yolo":
-    print("model: %s  input: %s  conf: %.2f" %
-          (YOLO_CFG.get("model_path", ""), YOLO_CFG.get("input_size", []), YOLO_CFG.get("confidence", 0.3)))
+print("mode: %s  servo: %s" % (MODE.upper(), SERVO_ENABLED))
 print("=" * 50)
 
 if MODE == "yolo":
