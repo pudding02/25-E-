@@ -1,133 +1,206 @@
 {
-  "_说明": "K230 物体追踪双轴舵机云台 — 运行时配置。修改后重启 main.py 生效",
+  "_说明": "K230 双轴云台追踪 — 运行时配置。改完重启 main.py 生效。以 _ 开头的键是注释, 程序会自动跳过。",
+
+  "_架构": "左右(yaw)轴 = Emm42_V5.0 闭环步进驱动器(UART3, 串口速度模式); 上下(pitch)轴 = FashionStar FSUS 总线舵机(UART2, 增量位置控制)。两轴独立, 各有死区。",
+
+  "_调参入口": "现场最常动的几个: [motor] reverse(方向) / min_rpm,max_rpm(快慢) / acc(加速) ; [servo] pitch_reverse(方向) / pitch_k(快慢)",
+
+  "_接线": "yaw: GPIO32(Pin37)→驱动器RXD, GPIO33(Pin40)→驱动器TXD, 共地, V+独立7~32V; pitch: GPIO5(Pin11)串1kΩ→信号线, GPIO6(Pin13)直连, 共地。引脚以 skill/LUSHAN-PI-K230-PINOUT-SKILL.md 第一节 40Pin 图为准; 舵机接线图见 云台/舵机接线图.png",
 
   "detection": {
+    "_说明": "用哪种检测方式",
     "mode": "cv",
-    "_mode_选项": "cv=矩形靶标检测 / yolo=KPU目标检测",
+    "_mode": "cv = 矩形靶标检测(白心+黑边) / yolo = KPU 目标检测(需模型)",
     "detect_every": 1,
-    "_detect_every": "跳帧检测: 1=每帧, 2=隔帧(帧率翻倍但响应变慢)"
+    "_detect_every": "跳帧检测: 1=每帧都检测; 2=隔帧检测(帧率翻倍, 但响应慢一拍)"
   },
 
   "camera": {
+    "_说明": "摄像头输出分辨率。改这里必须同步改 [center] 的 x/y, 否则追踪中心会偏",
     "sensor_width": 640,
     "sensor_height": 480,
-    "fps": 90
+    "fps": 90,
+    "_fps": "摄像头帧率上限; 相机初始化失败时可先降到 30 试"
   },
 
   "display": {
+    "_说明": "LCD 显示(ST7701, 800x480)",
     "lcd_width": 800,
     "lcd_height": 480,
     "show_osd": true,
-    "_show_osd": "左上角显示dx/dy偏差和FPS",
+    "_show_osd": "画面上叠加 dx/dy 和 FPS 文字, 调试时开, 比赛时可关省算力",
     "x_offset": 80,
     "y_offset": 0,
-    "to_ide": false
+    "_offset": "画面在 LCD 上的偏移(640 宽的图居中显示到 800 宽的屏 → x_offset=80)",
+    "to_ide": false,
+    "_to_ide": "true=把画面同时推到 CanMV IDE(调试用, 会拖慢帧率)"
   },
 
   "center": {
+    "_说明": "屏幕中心像素坐标 = 追踪目标点。分辨率改变时必须同步改, 否则云台会稳定停偏",
     "x": 320,
     "y": 240,
-    "_说明": "屏幕中心像素坐标, 追踪目标点。分辨率改变时需同步更新"
+    "_取值": "一般 = sensor_width/2, sensor_height/2"
   },
 
   "rectangle": {
-    "_说明": "CV模式矩形检测阈值, 现场调参入口",
+    "_说明": "CV 模式矩形靶标检测阈值 —— 现场光照变了主要调这里的 white/black 范围",
+
     "white_low": [135, 135, 115],
     "white_high": [255, 255, 255],
-    "_white": "白色掩膜RGB范围(靶标白色内部)",
+    "_white": "白色掩膜 RGB 范围(靶标内部的白色区域)。检不到靶标→放宽(把 low 调小)",
+
     "black_low": [0, 0, 0],
     "black_high": [85, 85, 85],
-    "_black": "黑色边框RGB范围(验证矩形四边)",
+    "_black": "黑色掩膜 RGB 范围(靶标边框)。误检到白纸→收紧(把 high 调小)",
+
     "min_area": 3500,
     "max_area": 180000,
-    "_area": "矩形面积范围(像素²), 过滤太小(噪点)和太大(全画面)",
+    "_area": "候选矩形面积范围(像素²), 过滤太小的噪点和太大的整屏。靶标离得远/近时按需放开",
+
     "min_aspect": 1.05,
     "max_aspect": 2.80,
-    "_aspect": "宽高比范围, 正方形≈1.0, 横长方形>1.0",
+    "_aspect": "外接矩形宽高比范围。正方形≈1.0, 横长方形 >1.0",
+
     "border_expand_x": 16,
     "border_expand_y": 16,
-    "_border_expand": "检测框向外扩展像素, 用于黑边/白心验证",
+    "_border_expand": "检测框向外扩几像素再验黑边/白心(补偿掩膜收缩), 框太贴边就调大",
+
     "black_check_step": 4,
     "min_black_hits": 3,
-    "_black_check": "黑边验证: 四边中至少min_black_hits边有足够黑色像素",
+    "_black_check": "黑边验证: 四条边里至少 min_black_hits 条要有足够黑像素(阈值 = 边长/black_check_step)",
+
     "center_white_step": 3,
-    "_center_white": "白心验证: 中心区域白色像素占比阈值(1/step)",
+    "_center_white": "白心验证: 中心 1/4 区域里白色占比要 > 1/center_white_step。漏检调小, 误检调大",
+
     "max_center_jump": 220,
-    "_max_center_jump": "帧间中心跳跃上限(像素), 超过此值的候选框被忽略",
+    "_max_center_jump": "帧间中心跳跃上限(px), 超过的候选框直接丢弃(抗跳变)",
+
     "max_area_ratio": 3,
-    "_max_area_ratio": "帧间面积变化比例上限",
+    "_max_area_ratio": "帧间面积变化倍数上限, 超过则丢弃(抗突变)",
+
     "min_rect_fill": 45,
-    "_min_rect_fill": "轮廓面积/外接矩形面积 最小百分比(%)",
+    "_min_rect_fill": "轮廓面积 / 外接矩形面积 的最小百分比(%), 太小的说明不是实心四边形",
+
     "max_side_ratio": 3,
-    "_max_side_ratio": "四边形对边长度比上限",
+    "_max_side_ratio": "四边形对边长度比上限, 太扁的四边形丢弃",
+
     "approx_epsilon": 0.04,
-    "_approx_epsilon": "多边形逼近精度=轮廓周长×此值"
+    "_approx_epsilon": "多边形逼近精度 = 轮廓周长 × 此值; 逼近不出 4 个顶点就调大",
+    "_调参顺序": "漏检 → 先放宽 white/black, 再放开 min_area / center_white_step; 误检 → 反向收紧"
   },
 
   "yolo": {
+    "_说明": "KPU 目标检测(仅当 detection.mode = yolo 时生效)。需先把 .kmodel 放到板子上",
     "task": "detect",
-    "_task": "detect=检测框 / segment=检测框+填充蒙版",
+    "_task": "detect = 只出检测框 / segment = 检测框 + 填充蒙版",
     "model_path": "/sdcard/kmodel/model_v4.kmodel",
-    "_input_size_hint": "必须与模型训练时的imgsz严格一致",
     "labels": ["bird", "drone", "plane"],
+    "_labels": "类别名, 顺序必须与训练时一致",
     "confidence": 0.5,
+    "_confidence": "置信度阈值, 调高=更严(漏检多), 调低=更松(误检多)",
     "nms_threshold": 0.45,
+    "_nms_threshold": "非极大值抑制的 IoU 阈值, 同一个目标出多个框就调小",
     "mask_threshold": 0.5,
+    "_mask_threshold": "预留(仅 segment 模式用), 当前 main.py 未读取",
     "input_size": [320, 320],
+    "_input_size": "模型输入尺寸, 必须与训练时的 imgsz 严格一致, 否则精度崩",
     "max_boxes": 50,
+    "_max_boxes": "单帧最多输出多少个框",
     "select": "max_conf",
-    "_select": "max_conf=最高置信度 / max_area=最大面积 / nearest=最靠近中心"
+    "_select": "多目标时追哪个: max_conf=置信度最高 / max_area=面积最大 / nearest=离屏幕中心最近"
+  },
+
+  "motor": {
+    "_说明": "左右(yaw)轴 —— Emm42_V5.0 闭环步进驱动器, 串口「速度模式」。追踪时: |dx| 线性映射成转速, dx 符号定方向",
+
+    "enabled": true,
+    "_enabled": "false=完全不初始化(纯视觉调试, 或只让 pitch 工作)",
+
+    "test_mode": false,
+    "_test_mode": "true=不跑视觉, 只做串口在线探测 + 持续旋转自检(验证驱动器接线用); false=正常视觉追踪",
+
+    "test_rpm": 10,
+    "_test_rpm": "仅 test_mode=true 时用: 自检时的持续转速(RPM)",
+
+    "port": 3,
+    "baud": 115200,
+    "tx_pin": 32,
+    "rx_pin": 33,
+    "_pins": "K230 TX=GPIO32(Pin37) → 驱动器 RXD; K230 RX=GPIO33(Pin40) → 驱动器 TXD(交叉接)。注意: 一个 UART 控制器只能有一组引脚, 不能与 [servo] 的 port 相同",
+
+    "addr": 1,
+    "_addr": "驱动器串口 ID(1~255), 必须与驱动器 OLED/上位机里设的 ID 一致",
+
+    "enable_on_boot": true,
+    "_enable_on_boot": "上电发使能帧(F3)。若驱动器没被使能, 收到速度指令也不会转",
+
+    "acc": 200,
+    "_acc": "加减速档位 0~255, 越大加速越快(0≈最慢, 255≈最急)。追得发飘/滞后就调大; 起步顿挫就调小",
+
+    "min_rpm": 1,
+    "max_rpm": 30,
+    "_rpm": "转速区间(RPM)。|dx|≤deadband_px → 停转; 之后从 min_rpm 线性升到 max_rpm; |dx|≥dx_full_px 时达 max_rpm。整体想更快就调大这两个; min_rpm 太小会『哼着不转』(步进低速扭矩小)",
+
+    "dx_full_px": 200,
+    "_dx_full_px": "|dx| 达到此像素值时给到 max_rpm。调小=小偏差就满速(更凶), 调大=转速爬升更平缓",
+
+    "deadband_px": 5,
+    "_deadband_px": "死区(px)。|dx| 小于此值直接停转, 防止在中心附近来回抖。抖动就调大, 对不准则调小",
+
+    "reverse": false,
+    "_reverse": "转向和偏差方向相反时改 true(方向反了只改这一个)"
   },
 
   "servo": {
-    "_说明": "K230直控FashionStar总线舵机云台。接线: UART2 TX(GPIO5/Pin11)串1kΩ接信号线, RX(GPIO6/Pin13)直连, 共地, 舵机独立供电",
+    "_说明": "上下(pitch)轴 —— FSUS 总线舵机, 增量位置控制。追踪时: 每帧角度 += pitch_k × dy, 带限位。接线见 云台/舵机接线图.png",
+
     "enabled": true,
-    "mode": "track",
-    "_mode": "track=视觉追踪(物体中心→舵机增量控制) / spin=持续正反转 / ping=持续ping",
+    "_enabled": "false=不初始化舵机(纯视觉调试, 或只让 yaw 工作)",
+
+    "test_mode": false,
+    "_test_mode": "true=不跑视觉, 只 ping 舵机 + 往返扫动(0→max→0→min)验证接线/协议; false=正常视觉追踪",
+
     "port": 2,
     "baud": 115200,
     "tx_pin": 5,
     "rx_pin": 6,
-    "_pins": "UART2默认: TX=GPIO5(Pin11), RX=GPIO6(Pin13)",
+    "_pins": "UART2: TX=GPIO5(Pin11) 串 1kΩ 接舵机信号线, RX=GPIO6(Pin13) 直连同一根信号线(半双工单总线)",
 
-    "yaw_id": 1,
     "pitch_id": 0,
-    "_ids": "yaw=左右轴舵机ID, pitch=上下轴舵机ID",
+    "_pitch_id": "舵机在总线上的 ID, 必须与舵机内部设的 ID 一致",
 
-    "yaw_vel_scale": 0.01,
-    "_yaw_vel_scale": "左右轴每帧角度增量系数: 每帧角度 += yaw_vel_scale × dx(左右偏移)。越大转越快, 典型0.01~0.1",
     "pitch_k": 0.02,
-    "_pitch_k": "上下轴每帧角度增量系数: 每帧角度 += pitch_k × dy(上下偏移)。典型0.01~0.05",
+    "_pitch_k": "每帧角度增量系数: 角度 += pitch_k × dy。越大跟得越快越猛, 典型 0.01~0.05; 震荡就调小",
 
-    "yaw_reverse": false,
-    "pitch_reverse": true,
-    "_reverse": "舵机转向与偏差方向相反时翻转对应轴(true/false)",
+    "pitch_reverse": false,
+    "_pitch_reverse": "上下方向和偏差方向相反时改 true",
 
-    "yaw_min": -360,
-    "yaw_max": 360,
     "pitch_min": -30,
     "pitch_max": 30,
-    "_range": "角度限位(度)。yaw支持±360°多圈, pitch通常±30°",
+    "_range": "软件角度限位(度), 累加后的目标角度会夹在这个区间内。防止转到机械限位卡住",
 
     "interval_ms": 40,
-    "_interval_ms": "舵机行程周期(ms), ≈视觉帧周期",
+    "_interval_ms": "舵机每次动作的行程时间(ms), 约等于视觉帧周期; 调大=动作更柔和",
+
     "power": 0,
-    "_power": "功率上限(mW), 0=不限制",
+    "_power": "舵机功率上限(mW), 0=不限制",
 
     "deadband_px": 5,
-    "_deadband_px": "死区(像素), 偏差小于此值不动作, 防止抖动",
+    "_deadband_px": "死区(px)。|dy| 小于此值不动作, 防止在中心附近抖",
 
     "lost_hold": true,
-    "_lost_hold": "丢靶处理: true=保持最后位置, false=进入阻尼(安全卸力)",
+    "_lost_hold": "丢靶时: true=舵机保持最后位置 / false=进入阻尼卸力(安全)。注意 yaw 步进丢靶时一律停转, 不受此项影响",
 
     "center_on_boot": true,
-    "_center_on_boot": "上电后2s缓慢回中0°(要求上电时云台机械位置大致居中)"
+    "_center_on_boot": "上电后舵机 2s 缓慢回中 0°。步进没有位置概念不回中, 所以云台要在机械上居中安装"
   },
 
   "debug": {
+    "_说明": "串口打印与内存回收的节奏",
     "print_every": 60,
-    "_print_every": "每N帧打印一次检测信息",
+    "_print_every": "每 N 帧打印一次检测结果(OK center=... / LOST)。调小便于观察, 但会拖慢帧率",
     "gc_every": 30,
-    "_gc_every": "每N帧执行一次垃圾回收"
+    "_gc_every": "每 N 帧执行一次垃圾回收。内存吃紧就调小(更频繁), 卡顿就调大"
   }
 }

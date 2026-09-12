@@ -13,32 +13,29 @@ description: "立创庐山派K230-CanMV开发板完整引脚图速查(40Pin排�
 
 庐山派 40Pin 排针**兼容树莓派物理布局**，但 GPIO 编号与树莓派不同。所有 IO 电平 **3.3V**，不可接 5V 信号。
 
-```
-┌─────────────┬──────────┬──────┬──────────┬─────────────┐
-│  左列(奇)   │  GPIO    │ Pin  │ Pin      │  GPIO/功能   │
-├─────────────┼──────────┼──────┼──────────┼─────────────┤
-│ 3.3V        │ ─        │  1   │  2       │ 5V          │
-│ I2C1_SDA    │ GPIO41   │  3   │  4       │ 5V          │
-│ I2C1_SCL    │ GPIO40   │  5   │  6       │ GND         │
-│ JTAG_TCK    │ GPIO2    │  7   │  8       │ GPIO3 UART1_TX│
-│ GND         │ ─        │  9   │ 10       │ GPIO4 UART1_RX│
-│ UART2_TXD   │ GPIO5    │ 11   │ 12       │ GPIO23      │
-│ UART2_RXD   │ GPIO6    │ 13   │ 14       │ GND         │
-│ OSPI_D6     │ GPIO22   │ 15   │ 16       │ GPIO18 OSPI_D2│
-│ 3.3V        │ ─        │ 17   │ 18       │ GPIO24 OSPI_DQS│
-│ QSPI0_D0    │ GPIO16   │ 19   │ 20       │ GND         │
-│ QSPI0_CS0   │ GPIO14   │ 21   │ 22       │ GPIO25 PWM5  │
-│ QSPI0_CLK   │ GPIO15   │ 23   │ 24       │ GPIO17 OSPI_D1│
-│ GND         │ ─        │ 25   │ 26       │ GPIO19 OSPI_D3│
-│ I2C0_SDA    │ GPIO49   │ 27   │ 28       │ GPIO48 I2C0_SCL│
-│ PWM2/I2C4   │ GPIO7    │ 29   │ 30       │ GND         │
-│ PWM3/I2C4   │ GPIO8    │ 31   │ 32       │ GPIO20 OSPI_D4│
-│ PWM4/UART1  │ GPIO9    │ 33   │ 34       │ GND         │
-│ UART1_RX    │ GPIO10   │ 35   │ 36       │ GPIO21 OSPI_D5│
-│ GPIO        │ GPIO11   │ 37   │ 38       │ GPIO12 M_CLK1│
-│ GND         │ ─        │ 39   │ 40       │ GPIO13 M_CLK1│
-└─────────────┴──────────┴──────┴──────────┴─────────────┘
-```
+| 复用功能   | GPIO    | 引脚编号 |        | GPIO    | 复用功能   |
+| ---------- | ------- | -------- | ------ | ------- | ---------- |
+| POWER 3V3  | 3V3     | 1        | 2      | 5V0     | POWER 5V0  |
+| I2C0_SDA   | GPIO 49 | 3        | 4      | 5V0     | POWER 5V0  |
+| I2C0_SCL   | GPIO 48 | 5        | 6      | GND     | GND        |
+| JTAG_TCK   | GPIO 02 | 7        | 8      | GPIO 03 | UART1_TXD  |
+| GND        | GND     | 9        | 10     | GPIO 04 | UART1_RXD  |
+| UART2_TXD  | GPIO 05 | 11       | 12     | GPIO 47 | I2C4_SDA   |
+| UART2_RXD  | GPIO 06 | 13       | 14     | GND     | GND        |
+| PDM_CLK    | GPIO 26 | 15       | 16     | GPIO 18 | QSPI0_D2   |
+| POWER 3V3  | 3.3V    | 17       | 18     | GPIO 19 | QSPI0_D3   |
+| QSPI0_D0   | GPIO 16 | 19       | 20     | GND     | GND        |
+| QSPI0_D1   | GPIO 17 | 21       | 22     | GPIO 27 | PDM_IN0    |
+| QSPI0_CLK  | GPIO 15 | 23       | 24     | GPIO 14 | QSPI0_CS0  |
+| GND        | GND     | 25       | 26     | GPIO 61 | QSPI0_CS1  |
+| I2C1_SDA   | GPIO 41 | 27       | 28     | GPIO 40 | I2C1_SCL   |
+| I2C3_SCL   | GPIO 36 | 29       | 30     | GND     | GND        |
+| I2C3_SDA   | GPIO 37 | 31       | 32     | GPIO 46 | PWM2       |
+| PWM4       | GPIO 52 | 33       | 34     | GND     | GND        |
+| PWM0       | GPIO 42 | 35       | 36     | GPIO 35 | I2C1_SDA   |
+| I2C0_SCL   | GPIO 32 | 37       | 38     | GPIO 34 | I2C1_SCL   |
+| GND        | GND     | 39       | 40     | GPIO 33 | I2C0_SDA   |
+
 
 **供电脚汇总**：
 - 3.3V：Pin 1、Pin 17
@@ -244,19 +241,23 @@ fpioa.set_function(2, FPIOA.GPIO2, ie=1, oe=1, pu=0, pd=0, st=1, ds=7)
 
 ## 八、Lite 版（128MB）与标准版（1GB）引脚差异
 
+> ⚠️ 本节「标准版」列历史上写错过（2026-09-11 用万用表验证后更正）。**标准版一律以第一节 40Pin 引脚图为准**，本节标准版列已同步为第一节的值；「Lite 版」列未经实测，仅供参考，使用前需核实。
+
 两版共享相同 FPIOA 复用矩阵，但 40Pin 排针有 **7 处物理引脚差异**：
 
-| 物理 Pin | Lite 版 GPIO | 标准版 GPIO |
+| 物理 Pin | Lite 版 GPIO | 标准版 GPIO（=第一节引脚图） |
 |----------|:---:|:---:|
 | Pin 12 | GPIO62 | GPIO23 |
 | Pin 15 | GPIO52 | GPIO22 |
 | Pin 22 | GPIO53 | GPIO25 |
-| Pin 26 | GPIO63 | GPIO24 |
-| Pin 32 | GPIO42 (UART3_TXD) | GPIO19 |
-| Pin 33 | GPIO43 (UART3_RXD) | GPIO18 |
-| Pin 35 | GPIO10 | GPIO17 |
+| Pin 26 | GPIO63 | **GPIO19** |
+| Pin 32 | GPIO42 | **GPIO20** |
+| Pin 33 | GPIO43 | **GPIO9** |
+| Pin 35 | GPIO10 | **GPIO10** |
 
 其余 33 个物理引脚两版完全一致。
+
+> 历史勘误：标准版 Pin26 曾误记为 GPIO24、Pin32 误记为 GPIO19、Pin33 误记为 GPIO18、Pin35 误记为 GPIO17。这些是错的，实为 GPIO19 / GPIO20 / GPIO9 / GPIO10。
 
 ---
 
