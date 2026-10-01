@@ -2,7 +2,7 @@
 K230 物体追踪 — 双轴云台 (双步进)
 ================================
   左右(yaw)轴:  Emm42_V5.0 闭环步进驱动器  (UART3, 串口速度模式)
-  上下(pitch)轴: Emm42_V5.0 闭环步进驱动器  (UART2, 串口位置模式)
+  上下(pitch)轴: Emm42_V5.0 闭环步进驱动器  (UART2, 串口速度模式)
 
 ═══════════════════════════════════════════════════════════════
   功能说明
@@ -13,10 +13,9 @@ K230 物体追踪 — 双轴云台 (双步进)
     cv    : 矩形靶标检测(白心+黑边验证)   偏移 = 四边形中心 - 屏幕中心
     yolo  : KPU 目标检测                 偏移 = 识别框中心 - 屏幕中心
 
-  执行器 (两轴都是 Emm42 闭环步进, 各有死区, 由 config.json 的 motor / pitch_motor 段配置):
+  执行器 (两轴都是 Emm42 闭环步进, 控制逻辑完全相同, 由 config.json 的 motor / pitch_motor 段配置):
     左右轴(yaw)  : 按 dx 做「速度」控制 —— |dx| 越大转速越快; 死区内停转; 丢靶停转
-    上下轴(pitch): 按 dy 做「位置」控制 —— K230 记账俯仰角(每帧 += pitch_k × dy)
-                   并下发绝对位置目标; 上电以当时物理位置为 0°(上电前先摆到行程中部)
+    上下轴(pitch): 按 dy 做「速度」控制 —— |dy| 越大转速越快; 死区内停转; 丢靶停转(与 yaw 相同逻辑)
 
   dx = 目标中心x - 屏幕中心x   (右偏为正)
   dy = 目标中心y - 屏幕中心y   (下偏为正)
@@ -158,14 +157,14 @@ APPROX_EPSILON  = r.get("approx_epsilon", 0.04)
 YOLO_CFG = _get(CFG, "yolo", {})
 
 # ---- 执行器配置 ----
-# 左右(yaw)轴: [motor] 段, Emm42 步进-速度模式;  上下(pitch)轴: [pitch_motor] 段, Emm42 步进-位置模式
+# 左右(yaw)轴: [motor] 段, Emm42 步进-速度模式;  上下(pitch)轴: [pitch_motor] 段, Emm42 步进-速度模式(同逻辑)
 mv = _get(CFG, "motor", {})                 # [motor] 段 → yaw
 MOTOR_ENABLED = mv.get("enabled", False)
 pm = _get(CFG, "pitch_motor", {})           # [pitch_motor] 段 → pitch
 PITCH_ENABLED = pm.get("enabled", False)
 
 # ============================================================================
-# 三、Emm42_V5.0 闭环步进驱动 —— yaw(速度模式) + pitch(位置模式)
+# 三、Emm42_V5.0 闭环步进驱动 —— yaw / pitch(均为速度模式)
 #    协议来自 云台/Emm_V5.0步进闭环驱动说明书Rev1.3.pdf
 # ============================================================================
 #  帧格式: [地址][功能码][数据...][校验]
@@ -175,7 +174,7 @@ PITCH_ENABLED = pm.get("enabled", False)
 #    使能       addr F3 AB <en> <sync> 6B     en: 01=使能 00=失能
 #    速度模式   addr F6 <dir> <spdH> <spdL> <acc> <sync> 6B          —— yaw 轴用
 #               dir: 00=CCW 01=CW;  spd=0~3000(RPM);  acc=0~255(越大加速越快)
-#    位置模式   addr FD <dir> <spdH> <spdL> <acc> <p3><p2><p1><p0> <abs> <sync> 6B   —— pitch 轴用
+#    位置模式   addr FD <dir> <spdH> <spdL> <acc> <p3><p2><p1><p0> <abs> <sync> 6B   —— 备用(未接入)
 #               16细分下 3200 脉冲/圈; abs: 00=相对 01=绝对; 目标为32位(负数用补码)
 #    位置清零   addr 0A 6D 6B                  (把当前物理位置定义为 0° —— pitch 上电用)
 #    触发回零   addr 9A <mode> <sync> 6B      (0=单圈就近 1=单圈方向 2=多圈碰撞 3=限位开关; 预留)
@@ -200,9 +199,9 @@ class EmmStepper:
     驱动器侧需预先设好(上位机/OLED 菜单): 校验=固定0x6B, 波特率=115200,
     串口ID=addr, 运动模式=UART_FUN
 
-    速度模式: 追踪时由 |dx| 算出目标转速, 由 dx 符号定方向    (yaw 轴)
-    位置模式: 下发绝对目标位置(脉冲); 上电时 clear_position() (pitch 轴)
-    把当前物理位置定义为 0°; 脉冲/角度换算依赖驱动器细分(16细分=3200脉冲/圈)。
+    速度模式: 追踪时由 |偏差| 算出目标转速, 由偏差符号定方向    (yaw / pitch 现用)
+    位置模式: 下发绝对目标位置(脉冲), 配合 clear_position() 定义 0°;
+              当前未接入控制流(备用, 见 move/home; 脉冲换算依赖细分, 16细分=3200/圈)。
     """
 
     def __init__(self, uart_id=3, baud=115200, tx_pin=32, rx_pin=33,
@@ -353,7 +352,7 @@ class EmmStepper:
 # 四、云台执行器初始化 + gimbal_send
 #    gimbal_send(dx, dy, dist, status) 是「视觉」与「执行器」之间唯一的接口:
 #      dx → 左右轴(yaw, 步进)  : 速度模式 —— |dx| 决定转速, dx 符号决定方向
-#      dy → 上下轴(pitch, 步进): 位置模式 —— K230 记账俯仰角, 下发绝对位置目标
+#      dy → 上下轴(pitch, 步进): 速度模式 —— |dy| 决定转速, dy 符号决定方向(与 yaw 相同逻辑)
 #    status: "track"=追踪中 / "lost"=丢靶
 #
 #    !! 本段整体包在 try 里: 任何一条轴初始化失败都会打印
@@ -362,12 +361,10 @@ class EmmStepper:
 # ============================================================================
 
 _yaw = None        # yaw 轴: EmmStepper 实例(速度模式)
-_pitch = None      # pitch 轴: EmmStepper 实例(位置模式)
-_pitch_ang = 0.0   # pitch 角度记账(度); 0 = 上电清零时的物理位置
-_pitch_pulses = 0  # pitch 上一次下发的目标脉冲(去重, 避免重复发送)
+_pitch = None      # pitch 轴: EmmStepper 实例(速度模式)
 
 try:
-    # ---------------- pitch 上下轴: Emm42 闭环步进(UART2, 位置模式) ----------------
+    # ---------------- pitch 上下轴: Emm42 闭环步进(UART2, 速度模式, 与 yaw 同逻辑) ----------------
     if PITCH_ENABLED:
         P_PORT = pm.get("port", 2)          # UART 控制器编号
         P_BAUD = pm.get("baud", 115200)     # 波特率
@@ -375,15 +372,11 @@ try:
         P_RX = pm.get("rx_pin", 6)          # K230 RX  -> 驱动器② TXD
         P_ADDR = pm.get("addr", 1)          # 驱动器串口 ID
         P_ACC = pm.get("acc", 200)          # 加减速档位 0~255
-        P_RPM = pm.get("rpm", 30)           # 位置模式单次运动的最高转速(RPM)
-        P_PULSES_REV = pm.get("pulse_per_rev", 3200)   # 每圈脉冲数(16细分=3200)
-        P_K = pm.get("pitch_k", 0.02)                  # 每帧角度增量系数
-        P_REV = -1.0 if pm.get("pitch_reverse", False) else 1.0  # 方向翻转
-        P_LIMIT_EN = pm.get("limit_enabled", False)    # 软件角度限位开关(默认关)
-        P_MIN = pm.get("pitch_min", -90)               # 限位下限(度, 仅 limit_enabled 时生效)
-        P_MAX = pm.get("pitch_max", 90)                # 限位上限(度)
+        P_MIN_RPM = pm.get("min_rpm", 1)    # 最低转速: |dy| 刚越过死区时
+        P_MAX_RPM = pm.get("max_rpm", 30)   # 最高转速: |dy| >= dy_full_px 时
+        P_DY_FULL = pm.get("dy_full_px", 200)
         P_DEADBAND = pm.get("deadband_px", 5)          # pitch 死区 px
-        P_MIN_STEP = pm.get("min_step_pulses", 1)      # 目标变化≥此脉冲数才下发
+        P_REV = -1 if pm.get("reverse", False) else 1  # 方向翻转
 
         # 一个 UART 控制器只能有一组引脚, 两轴配成同一个 port 会互相覆盖
         if MOTOR_ENABLED and mv.get("port", 3) == P_PORT:
@@ -392,11 +385,8 @@ try:
 
         _pitch = EmmStepper(P_PORT, P_BAUD, P_TX, P_RX, P_ADDR, P_ACC)
         if pm.get("enable_on_boot", True):
-            _pitch.enable(True)     # 使能(不使能的话收到位置指令也不转)
+            _pitch.enable(True)     # 使能电机(不使能的话收到速度指令也不转)
         _pitch.stop()               # 上电先停住, 防止误转
-        # 上电 0 点: 把当前物理位置定义为 0°(上电前请手动把云台摆到行程中部)
-        _pitch.clear_position()
-        print("  pitch 0点 = 上电位置(上电前云台应位于行程中部)")
 
     # ---------------- yaw 左右轴: Emm42 闭环步进(UART3) ----------------
     if MOTOR_ENABLED:
@@ -417,10 +407,6 @@ try:
             _yaw.enable(True)       # 使能电机(不使能的话收到速度指令也不转)
         _yaw.stop()                 # 上电先停住, 防止误转
 
-    def _s_clamp(v, lo, hi):
-        """把 v 夹到 [lo, hi]"""
-        return lo if v < lo else (hi if v > hi else v)
-
     def gimbal_send(dx, dy, dist, status):
         """每帧调用一次, 把视觉偏差送给两条轴
 
@@ -428,12 +414,12 @@ try:
         dist   : 偏差欧氏距离(本实现未用到, 仅为接口完整保留)
         status : "track"=追踪中 / "lost"=丢靶
         """
-        global _pitch_ang, _pitch_pulses
         try:
             if status == "lost":
                 if _yaw:
                     _yaw.stop()                    # 丢靶: yaw 一律停转
-                # pitch 位置模式: 不发新目标 = 保持原位(最后的行程走完即静止)
+                if _pitch:
+                    _pitch.stop()                  # 丢靶: pitch 一律停转(同 yaw)
                 return
 
             # ---- yaw: |dx| 线性映射到转速, 符号定方向, 死区内停 ----
@@ -445,15 +431,14 @@ try:
                 else:
                     _yaw.stop()
 
-            # ---- pitch: 角度记账(+可选软限位) → 换算脉冲 → 变化才下发绝对目标 ----
-            if _pitch and abs(dy) > P_DEADBAND:
-                _pitch_ang = _pitch_ang + P_REV * P_K * dy
-                if P_LIMIT_EN:
-                    _pitch_ang = _s_clamp(_pitch_ang, P_MIN, P_MAX)
-                _pp = int(_pitch_ang * P_PULSES_REV / 360.0 + (0.5 if _pitch_ang >= 0 else -0.5))
-                if abs(_pp - _pitch_pulses) >= P_MIN_STEP:
-                    _pitch.move(_pp, P_RPM, absolute=True)
-                    _pitch_pulses = _pp
+            # ---- pitch: |dy| 线性映射到转速, 符号定方向, 死区内停(与 yaw 相同逻辑) ----
+            if _pitch:
+                if abs(dy) > P_DEADBAND:
+                    ratio = min(1.0, abs(dy) / float(P_DY_FULL))
+                    rpm = P_MIN_RPM + (P_MAX_RPM - P_MIN_RPM) * ratio
+                    _pitch.set_speed(P_REV * (1 if dy > 0 else -1), rpm)
+                else:
+                    _pitch.stop()
         except Exception:
             pass
 
@@ -468,9 +453,9 @@ try:
     _pitch_info = "off"
     if _pitch:
         _v = _pitch.read_bus_voltage()      # 兼作在线探测: 有回包说明驱动器和串口都通
-        _pitch_info = "emm-pos(addr=%d UART%d TX=GPIO%d RX=GPIO%d %dRPM k=%.3f lim=%s rev=%s)%s" % (
-            P_ADDR, P_PORT, P_TX, P_RX, P_RPM, P_K,
-            "ON" if P_LIMIT_EN else "OFF", "Y" if P_REV < 0 else "N",
+        _pitch_info = "emm(addr=%d UART%d TX=GPIO%d RX=GPIO%d %d~%dRPM rev=%s)%s" % (
+            P_ADDR, P_PORT, P_TX, P_RX, P_MIN_RPM, P_MAX_RPM,
+            "Y" if P_REV < 0 else "N",
             (" online %dmV" % _v) if _v else " (no resp)")
     print("actuator: yaw=%s | pitch=%s" % (_yaw_info, _pitch_info))
 
@@ -914,11 +899,13 @@ if MOTOR_ENABLED and mv.get("test_mode", False) and _yaw:
         _yaw.set_speed(_dirn, _rpm)     # 持续重发, 防止丢帧后停住
         _t.sleep_ms(500)
 
-# pitch 步进测试模式(不跑视觉): 在线探测 + 位置清零 + ±角度往返自检
+# pitch 步进测试模式(不跑视觉): 在线探测 + 持续旋转自检(与 yaw 相同逻辑)
 if PITCH_ENABLED and pm.get("test_mode", False) and _pitch:
     import time as _t
 
-    print(">>> PITCH TEST (Emm42 步进, 位置模式往返自检)")
+    _rpm = pm.get("test_rpm", 10)
+    _dirn = P_REV if P_REV else 1
+    print(">>> PITCH TEST (Emm42 步进, 持续旋转自检)")
     print("  串口: UART%d @%dbps, ID=%d, 校验=固定0x6B" % (P_PORT, P_BAUD, P_ADDR))
     print("  接线: K230 TX=GPIO%d -> 驱动器RXD,  RX=GPIO%d -> 驱动器TXD" % (P_TX, P_RX))
     print("  共地 + 驱动器 V+ 独立供电 7~32V(勿接 K230 5V)")
@@ -948,19 +935,14 @@ if PITCH_ENABLED and pm.get("test_mode", False) and _pitch:
             print("  RX 原始字节: %s" % _hx(_raw))
             print("    (本机发出的是: %s)" % _hx(_sent))
             print("    → 收到字节但不是自身回环: 多半驱动器「校验方式」不是 固定0x6B")
-
     _pitch.enable(True)
-    _pitch.clear_position()
-    print("  0 点 = 当前物理位置(上电前应位于行程中部)")
-    _ang = pm.get("test_angle", 10)
-    _seq = [0, _ang, 0, -_ang, 0]
-    print("  位置模式往返扫动 %s 度, Ctrl+C 退出" % _seq)
+    _t.sleep_ms(100)
+    print("\n  持续%s %dRPM (reverse=%s; Ctrl+C 退出)" %
+          ("正转" if _dirn > 0 else "反转", _rpm, pm.get("reverse", False)))
+    print("  电机不动 → 先看上面'在线探测'是否 OK")
     while True:
-        for _a in _seq:
-            _pp = int(_a * P_PULSES_REV / 360.0 + (0.5 if _a >= 0 else -0.5))
-            print("  -> %+.0f deg (%+d pulses)" % (_a, _pp))
-            _pitch.move(_pp, P_RPM, absolute=True)
-            _t.sleep_ms(1500)
+        _pitch.set_speed(_dirn, _rpm)     # 持续重发, 防止丢帧后停住
+        _t.sleep_ms(500)
 
 if MODE == "yolo":
     if _yolo_ok():

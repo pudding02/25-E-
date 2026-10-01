@@ -1,9 +1,9 @@
 {
   "_说明": "K230 双轴云台追踪 — 运行时配置。改完重启 main.py 生效。以 _ 开头的键是注释, 程序会自动跳过。",
 
-  "_架构": "左右(yaw)轴 = Emm42_V5.0 闭环步进驱动器(UART3, 串口速度模式); 上下(pitch)轴 = Emm42_V5.0 闭环步进驱动器(UART2, 串口位置模式)。两轴独立, 各有死区。",
+  "_架构": "左右(yaw)轴 = Emm42_V5.0 闭环步进驱动器(UART3, 串口速度模式); 上下(pitch)轴 = Emm42_V5.0 闭环步进驱动器(UART2, 串口速度模式, 与 yaw 相同逻辑)。两轴独立, 各有死区。",
 
-  "_调参入口": "现场最常动的几个: [motor] reverse(方向) / min_rpm,max_rpm(快慢) / acc(加速) ; [pitch_motor] pitch_reverse(方向) / pitch_k(快慢) / rpm(限速)",
+  "_调参入口": "现场最常动的几个: [motor] reverse(方向) / min_rpm,max_rpm(快慢) / acc(加速) ; [pitch_motor] 同名参数, 两轴同构",
 
   "_接线": "yaw: GPIO32(Pin37)→驱动器①RXD, GPIO33(Pin40)→驱动器①TXD, 共地, 驱动器①V+独立7~32V; pitch: GPIO5(Pin11)→驱动器②RXD, GPIO6(Pin13)→驱动器②TXD(交叉接), 共地, 驱动器②V+独立7~32V。引脚以 skill/LUSHAN-PI-K230-PINOUT-SKILL.md 第一节 40Pin 图为准",
 
@@ -153,16 +153,16 @@
   },
 
   "pitch_motor": {
-    "_说明": "上下(pitch)轴 —— Emm42_V5.0 闭环步进驱动器, 串口「位置模式」。K230 记账俯仰角(每帧 += pitch_k × dy), 向驱动器下发绝对位置目标; 上电时以当时物理位置为 0°(上电前请把云台摆到行程中部)",
+    "_说明": "上下(pitch)轴 —— Emm42_V5.0 闭环步进驱动器, 串口「速度模式」(与 yaw 相同逻辑)。追踪时: |dy| 线性映射成转速, dy 符号定方向",
 
     "enabled": true,
-    "_enabled": "false=不初始化(纯视觉调试, 或只让 yaw 工作)",
+    "_enabled": "false=完全不初始化(纯视觉调试, 或只让 yaw 工作)",
 
     "test_mode": false,
-    "_test_mode": "true=不跑视觉, 只做 在线探测 + 位置清零 + ±角度往返自检(验证驱动器接线用); false=正常视觉追踪",
+    "_test_mode": "true=不跑视觉, 只做串口在线探测 + 持续旋转自检(验证驱动器接线用); false=正常视觉追踪",
 
-    "test_angle": 10,
-    "_test_angle": "仅 test_mode=true 时用: 自检往返角度(度)",
+    "test_rpm": 10,
+    "_test_rpm": "仅 test_mode=true 时用: 自检时的持续转速(RPM)",
 
     "port": 2,
     "baud": 115200,
@@ -174,35 +174,23 @@
     "_addr": "驱动器串口 ID(1~255), 必须与驱动器 OLED/上位机里设的 ID 一致",
 
     "enable_on_boot": true,
-    "_enable_on_boot": "上电发使能帧(F3)。若驱动器没被使能, 收到位置指令也不会转",
-
-    "pulse_per_rev": 3200,
-    "_pulse_per_rev": "每圈脉冲数 = 200 × 驱动器细分。16细分=3200(默认), 8细分=1600 —— 必须与驱动器菜单里的细分一致, 否则角度换算全错",
-
-    "rpm": 30,
-    "_rpm": "位置模式单次运动的速度上限(RPM, 0~3000)。追得慢就调大; 太猛/过冲就调小",
+    "_enable_on_boot": "上电发使能帧(F3)。若驱动器没被使能, 收到速度指令也不会转",
 
     "acc": 200,
-    "_acc": "加减速档位 0~255, 越大加速越快(0≈不启用曲线加减速)",
+    "_acc": "加减速档位 0~255, 越大加速越快(0≈最慢, 255≈最急)。追得发飘/滞后就调大; 起步顿挫就调小",
 
-    "pitch_k": 0.02,
-    "_pitch_k": "每帧角度增量系数: 目标角度 += pitch_k × dy (度)。越大跟得越快越猛, 典型 0.01~0.05; 震荡就调小",
+    "min_rpm": 1,
+    "max_rpm": 30,
+    "_rpm": "转速区间(RPM)。|dy|≤deadband_px → 停转; 之后从 min_rpm 线性升到 max_rpm; |dy|≥dy_full_px 时达 max_rpm。整体想更快就调大这两个; min_rpm 太小会『哼着不转』(步进低速扭矩小)",
 
-    "pitch_reverse": false,
-    "_pitch_reverse": "上下方向和偏差方向相反时改 true",
+    "dy_full_px": 200,
+    "_dy_full_px": "|dy| 达到此像素值时给到 max_rpm。调小=小偏差就满速(更凶), 调大=转速爬升更平缓",
 
     "deadband_px": 5,
-    "_deadband_px": "死区(px)。|dy| 小于此值不再更新目标角度(保持原位), 防止在中心附近抖",
+    "_deadband_px": "死区(px)。|dy| 小于此值直接停转, 防止在中心附近来回抖。抖动就调大, 对不准则调小",
 
-    "limit_enabled": false,
-    "_limit_enabled": "软件角度限位开关。默认 false=不夹取(角度只记账, 不设边界); true=超出下面范围的目标会被夹住",
-
-    "pitch_min": -90,
-    "pitch_max": 90,
-    "_range": "软件限位范围(度), 仅 limit_enabled=true 时生效; 0 = 上电清零时的物理位置",
-
-    "min_step_pulses": 1,
-    "_min_step_pulses": "目标变化 ≥ 此脉冲数才真正下发(去重/滤波)。1 = 每 0.1125° 都发; 抖动可调大(如 4 ≈ 0.45°)"
+    "reverse": false,
+    "_reverse": "转向和偏差方向相反时改 true(方向反了只改这一个)"
   },
 
   "debug": {

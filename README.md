@@ -1,7 +1,7 @@
 # 电赛E题 — K230 双轴云台追踪系统 (CV/YOLO + 双步进)
 
 基于 Simple_Tracking_Device 原项目思路的完整复刻：K230-CanMV **单板**完成视觉检测与云台控制，
-双轴执行器均为 **Emm42_V5.0 闭环步进**（42 电机）——左右 yaw 走串口「速度模式」、上下 pitch 走串口「位置模式」。
+双轴执行器均为 **Emm42_V5.0 闭环步进**（42 电机）——左右 yaw 与上下 pitch 都走串口「速度模式」（两轴同逻辑）。
 
 > 历史沿革：原版跑在 MaixCam (MaixPy) + STM32F407 中继架构上（K230→STM32→云台）；
 > 本仓库已演进为 **K230 直控**（不经 STM32），且 pitch 轴从 FashionStar 总线舵机改为第二台 Emm42 步进。
@@ -22,7 +22,7 @@
        ▼          ▼
   驱动器①      驱动器②
   Emm42_V5.0   Emm42_V5.0
-  (速度模式)    (位置模式)
+  (速度模式)    (速度模式)
        │          │
        ▼          ▼
    42 步进      42 步进
@@ -40,7 +40,7 @@
 | 检测方式 | YOLO NN 模型 | 经典CV + YOLO KPU 双模式 |
 | 云台链路 | MaixCam→STM32→执行器 | **K230 直控**（无 STM32） |
 | 左右轴 (yaw) | 舵机/开环 | Emm42 步进 · 速度模式（\|dx\|→RPM） |
-| 上下轴 (pitch) | 舵机/开环 | Emm42 步进 · 位置模式（角度记账→绝对位置） |
+| 上下轴 (pitch) | 舵机/开环 | Emm42 步进 · 速度模式（与 yaw 同逻辑） |
 | 串口协议 | `0x88*8` 固定字节 | Emm42 帧（固定 0x6B 校验） |
 | 分辨率 | 448×448 | 640×480 (检测可选降采样至 320×240) |
 | 帧率 | ~25fps | ~45fps (CV模式) |
@@ -92,10 +92,10 @@ cp model.kmodel /sdcard/model/
 # 3. SD 卡插入 K230，CanMV IDE 中打开 main.py 运行
 ```
 
-### 1.3 上电流程（pitch 是步进，有纪律）
+### 1.3 上电流程
 
-1. **上电前把云台俯仰摆到行程中部**（步进断电无保持力，pitch 可能因重力下垂）
-2. 上电后核对串口第一行：`actuator:` 两轴均应 `online`；以及 `pitch 0点 = 上电位置`（以当时位置为 0°）
+1. **上电前把云台俯仰摆到行程中部**（步进断电无保持力，pitch 可能因重力下垂；两轴都建议机械居中安装）
+2. 上电后核对串口第一行：`actuator:` 两轴均应 `online`
 3. 首次联调先单轴自检：config 里 `motor.test_mode` / `pitch_motor.test_mode` 置 `true`，不跑视觉只看动作
 
 ## 二、配置文件说明 (config.json)
@@ -111,7 +111,7 @@ cp model.kmodel /sdcard/model/
 | `rectangle` | CV 矩形检测阈值（现场光照变化主要调这里）|
 | `yolo` | KPU 模型路径 / labels / input_size（见第四节规则）|
 | `motor` | **yaw 轴**：Emm42 速度模式（RPM 区间 / 死区 / 方向 / 使能）|
-| `pitch_motor` | **pitch 轴**：Emm42 位置模式（pitch_k / 限速 rpm / 0 点纪律 / 软件限位 / 每圈脉冲数）|
+| `pitch_motor` | **pitch 轴**：Emm42 速度模式（与 yaw 同构：min_rpm/max_rpm/dy_full_px/死区/方向）|
 | `debug` | 打印与 GC 节奏 |
 
 ## 三、检测模式（CV / YOLO）
@@ -151,22 +151,21 @@ cp model.kmodel /sdcard/model/
 
 `|dx| ≤ deadband_px` → 停转；之后从 `min_rpm` 线性升到 `max_rpm`（`|dx| ≥ dx_full_px` 时满速）；丢靶停转。
 
-### 4.2 上下轴 (pitch) —— 位置模式
+### 4.2 上下轴 (pitch) —— 速度模式（与 yaw 相同逻辑）
 
-- K230 每帧记账：`角度 += pitch_k × dy`，换算成脉冲后向驱动器下发**绝对位置目标**（变化 ≥ `min_step_pulses` 才发）
-- **上电 0 点** = 上电时物理位置（K230 启动时发「位置清零」）；上电前须人工把云台摆到行程中部
-- 软件角度限位：`limit_enabled`（**默认 false**）；开启后把角度夹在 `pitch_min/max` 内
-- 丢靶：不再下发新目标（保持原位，最后行程走完即静止）
+`|dy| ≤ deadband_px` → 停转；之后从 `min_rpm` 线性升到 `max_rpm`（`|dy| ≥ dy_full_px` 时满速）；丢靶停转。
+
+> 历史：曾试行位置模式（角度记账 + 绝对位置目标，需上电摆中位校准 0 点），实测驱动器②不工作，已改为速度模式。
 
 ### 4.3 调参速查
 
 | 现象 | 调整 |
 |------|------|
-| 云台振荡/过冲 | `pitch_k` 调小（pitch）/ 降 `motor.max_rpm`（yaw）|
-| 对准慢 | `pitch_k` 调大 / `motor.max_rpm` 调大 |
-| yaw 低速"哼着不转" | `motor.min_rpm` 调大（步进低速扭矩小） |
-| 中心附近抖动 | 调大对应轴 `deadband_px` / `min_step_pulses` |
-| 方向反了 | `motor.reverse` 或 `pitch_motor.pitch_reverse` 置 true |
+| 云台振荡/过冲 | 降对应轴 `max_rpm` / 调大 `deadband_px` |
+| 对准慢 | 调大 `max_rpm` / 调小 `dx_full_px`(yaw)、`dy_full_px`(pitch) |
+| 低速"哼着不转" | 对应轴 `min_rpm` 调大（步进低速扭矩小） |
+| 中心附近抖动 | 调大对应轴 `deadband_px` |
+| 方向反了 | `motor.reverse` / `pitch_motor.reverse` 置 true |
 | 跟踪不平滑 | 增大检测端滤波/跳帧参数 |
 
 ## 五、激光标定
@@ -194,10 +193,10 @@ python tools/test_emm_protocol.py
 
 ## 七、现场部署检查清单
 
-- [ ] 两台驱动器均按 `接线图.md` 预置（校验 0x6B / 115200 / UART_FUN / 应答 Receive / 细分与 `pulse_per_rev` 一致）
+- [ ] 两台驱动器均按 `接线图.md` 预置（校验 0x6B / 115200 / UART_FUN / 应答 Receive）
 - [ ] K230 与两台驱动器电源**共地**
 - [ ] 上电前：云台 pitch 已摆到行程中部（步进断电会下垂）
-- [ ] 上电后 `actuator:` 行两轴均 `online`；`pitch 0点 = 上电位置` 已打印
+- [ ] 上电后 `actuator:` 行两轴均 `online`
 - [ ] `config.json` 中 mode、input_size、labels、task 与模型匹配（YOLO 模式）
 - [ ] 摄像头画面正常
 - [ ] 先单轴 `test_mode` 自检（yaw 持续旋转 / pitch 往返±角度），再跑视觉追踪
@@ -214,7 +213,7 @@ python tools/test_emm_protocol.py
 | 帧率低 | 启用 `detect_resolution.enabled: true`（如配置），降低分辨率到 320×240 |
 | 某轴电机不动 | 先看 `actuator:` 行是否 `online`；`(no resp)` → 按 `接线图.md` 第六节排障（共地/交叉/预置/回环）|
 | 云台乱转/抖动 | 调死区 / 降低 K 参数 / 检查方向位（`reverse`）|
-| pitch 上电跑偏 | 确认上电时云台在行程中部；确认驱动器细分与 `pulse_per_rev` 一致 |
+| pitch 电机不动/动作不对 | 与 yaw 同排查路径（接线图第六节）；确认 `[pitch_motor]` 参数与 `[motor]` 同构 |
 | 电机被"卡住"后拒绝指令 | 堵转保护触发 → 检查机械卡阻，用上位机/命令解除堵转保护（0x0E 52）|
 | K230 画面卡 | 增大 `debug.gc_every`，降低检测分辨率 |
 | YOLO模式报错 | 确认 kmodel 路径正确、KPU 库已安装 |

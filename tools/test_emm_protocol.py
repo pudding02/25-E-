@@ -154,7 +154,7 @@ class TestEmmFrames(unittest.TestCase):
         self.assertEqual(self.last(), bytes.fromhex("01 24 6B"))
         self.assertIsNone(v)
 
-    # ---- 位置模式(本项目 pitch 轴使用) ----
+    # ---- 位置模式(备用接口 —— 当前控制流两轴均用速度模式; 此处对拍说明书例帧) ----
 
     def test_move_relative_matches_manual(self):
         # 说明书位置模式例帧: 01 FD 01 05 DC 00 00 00 7D 00 00 00 6B

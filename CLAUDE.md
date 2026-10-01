@@ -7,9 +7,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Drone-competition rectangle-target tracking system (电赛E题). A K230-CanMV board performs computer vision **and drives the gimbal directly** — no intermediate microcontroller. Both axes use Emm42_V5.0 closed-loop stepper drivers with 42 steppers:
 
 - **yaw (left/right)** — UART3, serial **speed mode**: `|dx|` linearly mapped to RPM.
-- **pitch (up/down)** — UART2, serial **position mode**: K230 book-keeps the pitch angle
-  (`angle += pitch_k × dy`) and sends absolute position targets; the boot position is
-  cleared to 0° (park the gimbal mid-travel before power-on).
+- **pitch (up/down)** — UART2, serial **speed mode**: identical logic to yaw (`|dy|` → RPM).
+  (A position-mode path exists in `EmmStepper` — `move`/`clear_position`/`home` — but is NOT
+  wired into the control flow: driver ② failed with it on hardware. Both axes are now the
+  same speed-mode logic.)
 
 (The original MaixCam + STM32F407 relay architecture is retired — there is no `stm32/` directory and no `fs_servo.py`; all code is single-file in `k230/main.py`.)
 
@@ -18,7 +19,7 @@ Drone-competition rectangle-target tracking system (电赛E题). A K230-CanMV bo
 ```
 K230-CanMV (vision + gimbal control)
     MIPI CSI camera (GC2093)     UART3 → Emm42 driver ① → 42 stepper   [yaw · speed mode]
-    LCD ST7701 800×480           UART2 → Emm42 driver ② → 42 stepper   [pitch · position mode]
+    LCD ST7701 800×480           UART2 → Emm42 driver ② → 42 stepper   [pitch · speed mode]
     Optional laser GPIO
 ```
 
@@ -78,12 +79,11 @@ fdx, fdy = kf_update(dx, dy)  # works identically whether Kalman is on or off
 - Used commands:
   - enable `F3 AB <en> <sync>`, stop `FE 98 <sync>`
   - speed mode `F6 <dir> <spd×2> <acc> <sync>` (yaw)
-  - position mode `FD <dir> <spd×2> <acc> <pulses×4> <abs> <sync>` (pitch; abs=01 absolute, negative targets two's-complement)
+  - position mode `FD <dir> <spd×2> <acc> <pulses×4> <abs> <sync>` (reserved — not wired into control flow; abs=01 absolute, negative targets two's-complement)
   - position clear `0A 6D` (defines current physical position as 0° — pitch boot)
   - home `9A <mode> <sync>` (reserved, not wired into the control flow)
   - read bus voltage `24` (online probe)
-- 16 microsteps → 3200 pulses/rev; `pitch_motor.pulse_per_rev` must match the driver's
-  microstep setting or angle conversion is wrong.
+- 16 microsteps → 3200 pulses/rev (only relevant to the reserved position-mode path).
 - Driver-side presets (checksum 0x6B, 115200, UART_FUN, Response=Receive, ID) — see `接线图.md`.
 
 ## Testing
@@ -93,8 +93,8 @@ fdx, fdy = kf_update(dx, dy)  # works identically whether Kalman is on or off
   asserts emitted frame bytes equal the manufacturer manual example frames. Always run after
   touching protocol code.
 - **Hardware**: `motor.test_mode` / `pitch_motor.test_mode` in config.json perform power-on
-  self-checks (online probe + motion) without running vision. `main.py` also self-reports at
-  boot: the `actuator:` line (both axes + online voltage) and `pitch 0点 = 上电位置`.
+  self-checks (online probe + continuous rotation) without running vision. `main.py` also
+  self-reports at boot: the `actuator:` line (both axes + online voltage).
 
 ## Detection modes
 
@@ -120,7 +120,7 @@ fdx, fdy = kf_update(dx, dy)  # works identically whether Kalman is on or off
 | Axis | UART | TX | RX | Driver |
 |---|---|---|---|---|
 | yaw | UART3 | GPIO32 (Pin37) | GPIO33 (Pin40) | ① (speed mode) |
-| pitch | UART2 | GPIO5 (Pin11) | GPIO6 (Pin13) | ② (position mode) |
+| pitch | UART2 | GPIO5 (Pin11) | GPIO6 (Pin13) | ② (speed mode) |
 
 One UART controller can only own one pin set — never configure both axes on the same `port`
 (the program prints a WARN at boot if it happens). Full wiring in `接线图.md`.
