@@ -1,8 +1,8 @@
 """
-K230 物体追踪 — 双轴云台
-========================
+K230 物体追踪 — 双轴云台 (双步进)
+================================
   左右(yaw)轴:  Emm42_V5.0 闭环步进驱动器  (UART3, 串口速度模式)
-  上下(pitch)轴: FashionStar FSUS 总线舵机 (UART2, 增量位置控制)
+  上下(pitch)轴: Emm42_V5.0 闭环步进驱动器  (UART2, 串口位置模式)
 
 ═══════════════════════════════════════════════════════════════
   功能说明
@@ -13,9 +13,10 @@ K230 物体追踪 — 双轴云台
     cv    : 矩形靶标检测(白心+黑边验证)   偏移 = 四边形中心 - 屏幕中心
     yolo  : KPU 目标检测                 偏移 = 识别框中心 - 屏幕中心
 
-  执行器 (两轴独立, 各有死区, 分别由 config.json 的 motor / servo 段配置):
+  执行器 (两轴都是 Emm42 闭环步进, 各有死区, 由 config.json 的 motor / pitch_motor 段配置):
     左右轴(yaw)  : 按 dx 做「速度」控制 —— |dx| 越大转速越快; 死区内停转; 丢靶停转
-    上下轴(pitch): 按 dy 做「增量位置」控制 —— 每帧角度 += pitch_k × dy, 带限位
+    上下轴(pitch): 按 dy 做「位置」控制 —— K230 记账俯仰角(每帧 += pitch_k × dy)
+                   并下发绝对位置目标; 上电以当时物理位置为 0°(上电前先摆到行程中部)
 
   dx = 目标中心x - 屏幕中心x   (右偏为正)
   dy = 目标中心y - 屏幕中心y   (下偏为正)
@@ -25,17 +26,18 @@ K230 物体追踪 — 双轴云台
   !! 完整接线文档见 项目根目录 接线图.md
 ═══════════════════════════════════════════════════════════════
   yaw 步进 (Emm42_V5.0, TTL 串口 UART3):
-      K230 TX = GPIO32(Pin37) → 驱动器 RXD
-      K230 RX = GPIO33(Pin40) → 驱动器 TXD        (交叉接)
-      共地; 驱动器 V+ 独立供电 7~32V(勿接 K230 的 5V)
+      K230 TX = GPIO32(Pin37) → 驱动器① RXD
+      K230 RX = GPIO33(Pin40) → 驱动器① TXD        (交叉接)
+      共地; 驱动器① V+ 独立供电 7~32V(勿接 K230 的 5V)
       驱动器侧需预置: 校验方式=固定0x6B, 波特率=115200, 串口ID=motor.addr, 运动模式=UART_FUN
 
-  pitch 舵机 (FSUS 总线, UART2):  接线图见 云台/舵机接线图.png
-      K230 TX = GPIO5(Pin11) --串1kΩ--→ 舵机信号线 S
-      K230 RX = GPIO6(Pin13) ---------→ 同一根信号线 S     (半双工单总线)
-      共地; 舵机 V+ 独立供电; 总线 ID = servo.pitch_id (0)
+  pitch 步进 (Emm42_V5.0, TTL 串口 UART2):   ← 原总线舵机方案已改为步进(第二台驱动器)
+      K230 TX = GPIO5(Pin11) → 驱动器② RXD
+      K230 RX = GPIO6(Pin13) → 驱动器② TXD        (交叉接, 全双工)
+      共地; 驱动器② V+ 独立供电 7~32V(勿接 K230 的 5V)
+      驱动器侧需预置: 校验方式=固定0x6B, 波特率=115200, 串口ID=pitch_motor.addr, 运动模式=UART_FUN
 
-  !! 一个 UART 控制器只能有一组引脚: 步进固定占 UART3、舵机固定占 UART2, 不可混用。
+  !! 一个 UART 控制器只能有一组引脚: yaw 固定占 UART3、pitch 固定占 UART2, 不可混用。
      两者若配成同一个 port, 程序启动时会打印 WARN。
 
 ═══════════════════════════════════════════════════════════════
@@ -43,14 +45,13 @@ K230 物体追踪 — 双轴云台
 ═══════════════════════════════════════════════════════════════
    一  配置加载          从 /sdcard/config.json 读参数(跳过 _ 开头的注释键)
    二  运行参数          把配置铺平成模块级常量
-   三  FSUS 协议驱动     FSServoBus(总线) / FSServo(单舵机)        → pitch
-   四  Emm 步进驱动      EmmStepper                               → yaw
-   五  执行器初始化      gimbal_send(dx,dy,dist,status) —— 视觉与执行器之间的唯一接口
-   六  CV 矩形检测       find_paper_box() 等
-   七  YOLO 支持         _yolo_ok()
-   八  CV 主循环         run_cv()
-   九  YOLO 主循环       run_yolo()
-   十  入口              test_mode 自检 → 按 mode 进对应主循环
+   三  Emm 步进驱动      EmmStepper (速度模式 + 位置模式)          → yaw / pitch
+   四  执行器初始化      gimbal_send(dx,dy,dist,status) —— 视觉与执行器之间的唯一接口
+   五  CV 矩形检测       find_paper_box() 等
+   六  YOLO 支持         _yolo_ok()
+   七  CV 主循环         run_cv()
+   八  YOLO 主循环       run_yolo()
+   九  入口              test_mode 自检 → 按 mode 进对应主循环
 
   所有可调参数都在 config.json 内并附注释; 本文件不含硬编码阈值, 改完重启生效。
 """
@@ -157,140 +158,14 @@ APPROX_EPSILON  = r.get("approx_epsilon", 0.04)
 YOLO_CFG = _get(CFG, "yolo", {})
 
 # ---- 执行器配置 ----
-# 上下(pitch)轴: FSUS 总线舵机;  左右(yaw)轴: Emm42 闭环步进
-sv = _get(CFG, "servo", {})                 # [servo] 段 → pitch
-SERVO_ENABLED = sv.get("enabled", False)
+# 左右(yaw)轴: [motor] 段, Emm42 步进-速度模式;  上下(pitch)轴: [pitch_motor] 段, Emm42 步进-位置模式
 mv = _get(CFG, "motor", {})                 # [motor] 段 → yaw
 MOTOR_ENABLED = mv.get("enabled", False)
+pm = _get(CFG, "pitch_motor", {})           # [pitch_motor] 段 → pitch
+PITCH_ENABLED = pm.get("enabled", False)
 
 # ============================================================================
-# 三、FSUS 协议驱动 —— 上下(pitch)轴总线舵机
-#    协议: Fashion Star Uart Servo, 小端字节序, 角度单位 0.1°
-#    请求帧: [0x12, 0x4C, cmd, size, content..., checksum]      (checksum = 累加和低8位)
-#    应答帧: [0x05, 0x1C, cmd, size, content..., checksum]
-#    半双工单总线: 总线上可挂多个舵机, 靠 ID 区分(本项目只挂 pitch 一个, ID=0)
-# ============================================================================
-
-# ---- 本程序用到的 FSUS 指令 ----
-CMD_PING = 1        # 通信检测(用于启动时判断舵机在线)
-CMD_READ = 3        # 读参数(用于读角度限位)
-CMD_SET_ANGLE = 8   # 单圈设角度 ±180°, 带行程时间 —— pitch 用它
-CMD_STOP = 24       # 停止: 0=卸力 1=锁力 2=阻尼
-
-# ---- FSUS 参数地址(配合 CMD_READ 使用) ----
-ADDR_ANGLE_LIMIT_SW = 48      # 角度限位开关 开/关
-ADDR_ANGLE_LIMIT_HIGH = 51    # 角度上限(0.1°)
-ADDR_ANGLE_LIMIT_LOW = 52     # 角度下限(0.1°)
-
-
-class FSServoBus:
-    """一条舵机总线 = 一个 UART(总线上可挂多个舵机, 靠 ID 区分)
-
-    接线: TX 串 1kΩ 接信号线, RX 直连同一根信号线, 共地(见 云台/舵机接线图.png)
-    默认 UART2: TX=GPIO5(Pin11), RX=GPIO6(Pin13)
-    """
-
-    def __init__(self, uart_id=2, baud=115200, tx_pin=5, rx_pin=6, timeout_ms=200):
-        from machine import UART, FPIOA
-        fp = FPIOA()
-        fn_tx = getattr(FPIOA, "UART%d_TXD" % uart_id, FPIOA.UART2_TXD)
-        fn_rx = getattr(FPIOA, "UART%d_RXD" % uart_id, FPIOA.UART2_RXD)
-        fp.set_function(tx_pin, fn_tx)
-        fp.set_function(rx_pin, fn_rx)
-        self.uart = UART(uart_id, baudrate=baud)
-        self.tmo = timeout_ms
-
-    def _pack(self, cmd, content):
-        """请求帧: [0x12,0x4C, cmd, size, content..., checksum]"""
-        n = len(content)
-        f = bytearray(4 + n + 1)
-        f[0] = 0x12
-        f[1] = 0x4C
-        f[2] = cmd
-        f[3] = n
-        f[4:4 + n] = content
-        chk = 0x12 + 0x4C + cmd + n
-        for b in content:
-            chk += b
-        f[4 + n] = chk & 0xFF
-        return f
-
-    def _read_n(self, n):
-        """读满 n 字节, 超时返回 None"""
-        buf = bytearray()
-        t0 = time.ticks_ms()
-        while len(buf) < n:
-            if time.ticks_diff(time.ticks_ms(), t0) > self.tmo:
-                return None
-            m = self.uart.any()
-            if m:
-                buf += self.uart.read(min(m, n - len(buf)))
-        return buf
-
-    def txrx(self, cmd, content, wait_resp=True, retry=1):
-        """发一帧; wait_resp=False 纯写. 成功返回(cmdId, content), 失败 None"""
-        for _ in range(retry + 1):
-            try:
-                self.uart.read()
-                self.uart.write(self._pack(cmd, content))
-                if not wait_resp:
-                    return None
-                time.sleep_ms(5)  # 等舵机开始回应
-                hdr = self._read_n(4)
-                if hdr is None or hdr[0] != 0x05 or hdr[1] != 0x1C:
-                    continue
-                size = hdr[3]
-                body = self._read_n(size + 1)
-                if body is None:
-                    continue
-                cont = body[:size]
-                chk = (0x05 + 0x1C + hdr[2] + size + sum(cont)) & 0xFF
-                if chk == body[size]:
-                    return hdr[2], cont
-            except Exception:
-                continue
-        return None
-
-
-class FSServo:
-    """单个总线舵机"""
-
-    def __init__(self, bus, sid):
-        self.bus = bus
-        self.id = sid
-
-    def ping(self):
-        """通信检测, 成功返回 True"""
-        r = self.bus.txrx(CMD_PING, bytes([self.id]), retry=2)
-        return r is not None and len(r[1]) > 0 and r[1][0] == self.id
-
-    def set_angle(self, angle_deg, interval_ms=0, power=0):
-        """单圈设角度 ±180°; interval_ms=行程时间(ms)"""
-        a = int(max(-180.0, min(180.0, angle_deg)) * 10)
-        self.bus.txrx(CMD_SET_ANGLE, bytes([
-            self.id,
-            a & 0xFF, (a >> 8) & 0xFF,
-            interval_ms & 0xFF, (interval_ms >> 8) & 0xFF,
-            power & 0xFF, (power >> 8) & 0xFF]), wait_resp=False)
-
-    def stop(self, mode=2, power=500):
-        """停止: 0=卸力 1=锁力 2=阻尼(默认最安全)"""
-        self.bus.txrx(CMD_STOP, bytes([
-            self.id, (mode | 0x10) & 0xFF,
-            power & 0xFF, (power >> 8) & 0xFF]), wait_resp=False)
-
-    def read_param(self, addr):
-        """读参数, 返回 int(小端解码); 失败 None"""
-        r = self.bus.txrx(CMD_READ, bytes([self.id, addr]), retry=2)
-        if r is None or len(r[1]) < 4:
-            return None
-        c = r[1]
-        val = c[2] | (c[3] << 8)
-        return val
-
-
-# ============================================================================
-# 四、Emm42_V5.0 闭环步进驱动 —— 左右(yaw)轴
+# 三、Emm42_V5.0 闭环步进驱动 —— yaw(速度模式) + pitch(位置模式)
 #    协议来自 云台/Emm_V5.0步进闭环驱动说明书Rev1.3.pdf
 # ============================================================================
 #  帧格式: [地址][功能码][数据...][校验]
@@ -298,8 +173,12 @@ class FSServo:
 #    - 地址: 1~255, 0=广播
 #  本程序用到的命令:
 #    使能       addr F3 AB <en> <sync> 6B     en: 01=使能 00=失能
-#    速度模式   addr F6 <dir> <spdH> <spdL> <acc> <sync> 6B
+#    速度模式   addr F6 <dir> <spdH> <spdL> <acc> <sync> 6B          —— yaw 轴用
 #               dir: 00=CCW 01=CW;  spd=0~3000(RPM);  acc=0~255(越大加速越快)
+#    位置模式   addr FD <dir> <spdH> <spdL> <acc> <p3><p2><p1><p0> <abs> <sync> 6B   —— pitch 轴用
+#               16细分下 3200 脉冲/圈; abs: 00=相对 01=绝对; 目标为32位(负数用补码)
+#    位置清零   addr 0A 6D 6B                  (把当前物理位置定义为 0° —— pitch 上电用)
+#    触发回零   addr 9A <mode> <sync> 6B      (0=单圈就近 1=单圈方向 2=多圈碰撞 3=限位开关; 预留)
 #    立即停止   addr FE 98 <sync> 6B
 #    读总线电压 addr 24 6B  →  回 addr 24 <VH> <VL> 6B  (mV, 兼作在线探测)
 #  !! 注意: 本协议所有多字节字段均为"高字节在前"(大端), 与 Modbus 相反。
@@ -311,17 +190,19 @@ EMM_CHECKSUM = 0x6B   # 校验方式=固定值时, 末字节恒为该值
 
 
 class EmmStepper:
-    """Emm42_V5.0 闭环步进驱动器 (TTL 串口, 速度模式调速)
+    """Emm42_V5.0 闭环步进驱动器 (TTL 串口; 速度模式 + 位置模式)
 
-    接线(config.json [motor] 段可改 port/tx_pin/rx_pin/addr):
-      K230 TX = GPIO32(Pin37) -> 驱动器 RXD
-      K230 RX = GPIO33(Pin40) -> 驱动器 TXD      (交叉接)
+    接线(port/tx_pin/rx_pin/addr 由 config.json 各段提供, 如 [motor]/[pitch_motor]):
+      K230 TX = tx_pin -> 驱动器 RXD
+      K230 RX = rx_pin -> 驱动器 TXD      (交叉接)
       GND 必须共地;  驱动器 V+ 独立供电 7~32V (勿接 K230 5V)
 
     驱动器侧需预先设好(上位机/OLED 菜单): 校验=固定0x6B, 波特率=115200,
     串口ID=addr, 运动模式=UART_FUN
 
-    本类只实现"速度模式"调速: 追踪时由 |dx| 算出目标转速, 由 dx 符号定方向。
+    速度模式: 追踪时由 |dx| 算出目标转速, 由 dx 符号定方向    (yaw 轴)
+    位置模式: 下发绝对目标位置(脉冲); 上电时 clear_position() (pitch 轴)
+    把当前物理位置定义为 0°; 脉冲/角度换算依赖驱动器细分(16细分=3200脉冲/圈)。
     """
 
     def __init__(self, uart_id=3, baud=115200, tx_pin=32, rx_pin=33,
@@ -395,6 +276,45 @@ class EmmStepper:
                                 a & 0xFF,
                                 0x01 if sync else 0x00]))
 
+    def move(self, pulses, rpm, acc=None, absolute=True, sync=False):
+        """位置模式 (FD): 目标位置=脉冲数; absolute=True 时按绝对位置下发。
+
+        16细分下 3200 脉冲/圈; 负目标用 32 位补码编码; dir 位按目标正负给
+        (>=0 → CCW 0x01)。绝对模式下 dir 位的实际作用以实机验证为准。
+        """
+        p = int(pulses) & 0xFFFFFFFF
+        s = int(rpm)
+        if s < 0:
+            s = 0
+        elif s > 3000:
+            s = 3000
+        a = self.acc if acc is None else acc
+        if a < 0:
+            a = 0
+        elif a > 255:
+            a = 255
+        self._send(0xFD, bytes([
+            0x01 if pulses >= 0 else 0x00,
+            (s >> 8) & 0xFF, s & 0xFF,
+            a & 0xFF,
+            (p >> 24) & 0xFF, (p >> 16) & 0xFF, (p >> 8) & 0xFF, p & 0xFF,
+            0x01 if absolute else 0x00,
+            0x01 if sync else 0x00]))
+
+    def clear_position(self):
+        """位置清零 (0A 6D): 把当前位置角度/误差/脉冲数全部清零。
+
+        pitch 轴用它把「上电位置」定义为 0°(要求上电前云台位于行程中部)。
+        """
+        self._send(0x0A, bytes([0x6D]))
+
+    def home(self, mode=0, sync=False):
+        """触发回零 (9A): mode 0=单圈就近 1=单圈方向 2=多圈无限位碰撞 3=多圈限位开关。
+
+        本项目当前未接入常规流程(预留); 回零参数需先在驱动器菜单里设好。
+        """
+        self._send(0x9A, bytes([mode & 0xFF, 0x01 if sync else 0x00]))
+
     def read_bus_voltage(self):
         """读总线电压 (24) → mV; 无应答/校验错返回 None (兼作在线探测)"""
         try:
@@ -430,10 +350,10 @@ class EmmStepper:
 
 
 # ============================================================================
-# 五、云台执行器初始化 + gimbal_send
+# 四、云台执行器初始化 + gimbal_send
 #    gimbal_send(dx, dy, dist, status) 是「视觉」与「执行器」之间唯一的接口:
-#      dx → 左右轴(yaw, 步进) : 速度模式 —— |dx| 决定转速, dx 符号决定方向
-#      dy → 上下轴(pitch, 舵机): 增量位置 —— 每帧 角度 += pitch_k × dy, 带限位
+#      dx → 左右轴(yaw, 步进)  : 速度模式 —— |dx| 决定转速, dx 符号决定方向
+#      dy → 上下轴(pitch, 步进): 位置模式 —— K230 记账俯仰角, 下发绝对位置目标
 #    status: "track"=追踪中 / "lost"=丢靶
 #
 #    !! 本段整体包在 try 里: 任何一条轴初始化失败都会打印
@@ -441,31 +361,42 @@ class EmmStepper:
 #       所以上电后第一眼就看这行日志, 确认两条轴都正常。
 # ============================================================================
 
-_yaw = None        # yaw 轴: EmmStepper 实例(步进驱动器)
-_pitch = None      # pitch 轴: FSServo 实例(总线舵机)
-_pitch_ang = 0.0   # pitch 角度积分(增量位置控制用, 单位: 度)
+_yaw = None        # yaw 轴: EmmStepper 实例(速度模式)
+_pitch = None      # pitch 轴: EmmStepper 实例(位置模式)
+_pitch_ang = 0.0   # pitch 角度记账(度); 0 = 上电清零时的物理位置
+_pitch_pulses = 0  # pitch 上一次下发的目标脉冲(去重, 避免重复发送)
 
 try:
-    # pitch 参数先给默认值, 即使舵机未启用也保证 gimbal_send 里变量存在
-    S_INTERVAL = 40      # 舵机行程时间 ms
-    S_POWER = 0          # 舵机功率上限 mW, 0=不限
-    S_DEADBAND = 5       # pitch 死区 px
-    S_LOST_HOLD = True   # 丢靶时舵机是否保持位置
+    # ---------------- pitch 上下轴: Emm42 闭环步进(UART2, 位置模式) ----------------
+    if PITCH_ENABLED:
+        P_PORT = pm.get("port", 2)          # UART 控制器编号
+        P_BAUD = pm.get("baud", 115200)     # 波特率
+        P_TX = pm.get("tx_pin", 5)          # K230 TX  -> 驱动器② RXD
+        P_RX = pm.get("rx_pin", 6)          # K230 RX  -> 驱动器② TXD
+        P_ADDR = pm.get("addr", 1)          # 驱动器串口 ID
+        P_ACC = pm.get("acc", 200)          # 加减速档位 0~255
+        P_RPM = pm.get("rpm", 30)           # 位置模式单次运动的最高转速(RPM)
+        P_PULSES_REV = pm.get("pulse_per_rev", 3200)   # 每圈脉冲数(16细分=3200)
+        P_K = pm.get("pitch_k", 0.02)                  # 每帧角度增量系数
+        P_REV = -1.0 if pm.get("pitch_reverse", False) else 1.0  # 方向翻转
+        P_LIMIT_EN = pm.get("limit_enabled", False)    # 软件角度限位开关(默认关)
+        P_MIN = pm.get("pitch_min", -90)               # 限位下限(度, 仅 limit_enabled 时生效)
+        P_MAX = pm.get("pitch_max", 90)                # 限位上限(度)
+        P_DEADBAND = pm.get("deadband_px", 5)          # pitch 死区 px
+        P_MIN_STEP = pm.get("min_step_pulses", 1)      # 目标变化≥此脉冲数才下发
 
-    # ---------------- pitch 上下轴: FSUS 总线舵机(UART2) ----------------
-    if SERVO_ENABLED:
-        _sbus = FSServoBus(uart_id=sv.get("port", 2), baud=sv.get("baud", 115200),
-                           tx_pin=sv.get("tx_pin", 5), rx_pin=sv.get("rx_pin", 6))
-        _pitch = FSServo(_sbus, sv.get("pitch_id", 0))
+        # 一个 UART 控制器只能有一组引脚, 两轴配成同一个 port 会互相覆盖
+        if MOTOR_ENABLED and mv.get("port", 3) == P_PORT:
+            print("  WARN: yaw 与 pitch 都配在 UART%d 上, 会互相覆盖!" % P_PORT)
+            print("        → 把其中一条改到别的 UART, 或把对应轴 enabled 置 false")
 
-        PITCH_K = sv.get("pitch_k", 0.02)                            # 每帧角度增量系数
-        PITCH_REV = -1.0 if sv.get("pitch_reverse", False) else 1.0  # 方向翻转
-        PITCH_MIN = sv.get("pitch_min", -30)                         # 角度下限(度)
-        PITCH_MAX = sv.get("pitch_max", 30)                          # 角度上限(度)
-        S_INTERVAL = sv.get("interval_ms", 40)
-        S_POWER = sv.get("power", 0)
-        S_DEADBAND = sv.get("deadband_px", 5)
-        S_LOST_HOLD = sv.get("lost_hold", True)
+        _pitch = EmmStepper(P_PORT, P_BAUD, P_TX, P_RX, P_ADDR, P_ACC)
+        if pm.get("enable_on_boot", True):
+            _pitch.enable(True)     # 使能(不使能的话收到位置指令也不转)
+        _pitch.stop()               # 上电先停住, 防止误转
+        # 上电 0 点: 把当前物理位置定义为 0°(上电前请手动把云台摆到行程中部)
+        _pitch.clear_position()
+        print("  pitch 0点 = 上电位置(上电前云台应位于行程中部)")
 
     # ---------------- yaw 左右轴: Emm42 闭环步进(UART3) ----------------
     if MOTOR_ENABLED:
@@ -480,11 +411,6 @@ try:
         M_DX_FULL = mv.get("dx_full_px", 200)
         M_DEADBAND = mv.get("deadband_px", 5)
         M_REV = -1 if mv.get("reverse", False) else 1
-
-        # 一个 UART 控制器只能有一组引脚, 配成同一个 port 会互相覆盖
-        if SERVO_ENABLED and sv.get("port", 2) == M_PORT:
-            print("  WARN: pitch 舵机与 yaw 步进都配在 UART%d 上, 会互相覆盖!" % M_PORT)
-            print("        → 把其中一条改到别的 UART, 或把 servo.enabled 置 false")
 
         _yaw = EmmStepper(M_PORT, M_BAUD, M_TX, M_RX, M_ADDR, M_ACC)
         if mv.get("enable_on_boot", True):
@@ -502,13 +428,12 @@ try:
         dist   : 偏差欧氏距离(本实现未用到, 仅为接口完整保留)
         status : "track"=追踪中 / "lost"=丢靶
         """
-        global _pitch_ang
+        global _pitch_ang, _pitch_pulses
         try:
             if status == "lost":
                 if _yaw:
                     _yaw.stop()                    # 丢靶: yaw 一律停转
-                if _pitch and not S_LOST_HOLD:
-                    _pitch.stop(2)                 # 丢靶: 舵机是否卸力看配置
+                # pitch 位置模式: 不发新目标 = 保持原位(最后的行程走完即静止)
                 return
 
             # ---- yaw: |dx| 线性映射到转速, 符号定方向, 死区内停 ----
@@ -520,33 +445,17 @@ try:
                 else:
                     _yaw.stop()
 
-            # ---- pitch: 增量位置控制, 角度积分后限位 ----
-            if _pitch and abs(dy) > S_DEADBAND:
-                _pitch_ang = _s_clamp(_pitch_ang + PITCH_REV * PITCH_K * dy,
-                                      PITCH_MIN, PITCH_MAX)
-                _pitch.set_angle(_pitch_ang, S_INTERVAL, S_POWER)
+            # ---- pitch: 角度记账(+可选软限位) → 换算脉冲 → 变化才下发绝对目标 ----
+            if _pitch and abs(dy) > P_DEADBAND:
+                _pitch_ang = _pitch_ang + P_REV * P_K * dy
+                if P_LIMIT_EN:
+                    _pitch_ang = _s_clamp(_pitch_ang, P_MIN, P_MAX)
+                _pp = int(_pitch_ang * P_PULSES_REV / 360.0 + (0.5 if _pitch_ang >= 0 else -0.5))
+                if abs(_pp - _pitch_pulses) >= P_MIN_STEP:
+                    _pitch.move(_pp, P_RPM, absolute=True)
+                    _pitch_pulses = _pp
         except Exception:
             pass
-
-    # ---- 上电回中: 舵机 2s 缓慢回 0°(步进无位置概念, 需机械居中安装) ----
-    if SERVO_ENABLED and sv.get("center_on_boot", False):
-        _pitch.set_angle(0.0, 2000, S_POWER)
-
-    # ---- 读一次舵机角度限位(仅打印, 不参与控制) ----
-    if SERVO_ENABLED:
-        try:
-            lim_sw = _pitch.read_param(ADDR_ANGLE_LIMIT_SW)
-            if lim_sw is None:
-                print("  pitch limit: read fail")
-            else:
-                lim_hi = _pitch.read_param(ADDR_ANGLE_LIMIT_HIGH)
-                lim_lo = _pitch.read_param(ADDR_ANGLE_LIMIT_LOW)
-                hi = (lim_hi - 65536 if lim_hi >= 32768 else lim_hi) / 10.0
-                lo = (lim_lo - 65536 if lim_lo >= 32768 else lim_lo) / 10.0
-                print("  pitch limit: sw=%s hi=%.1f lo=%.1f" %
-                      ("ON" if lim_sw else "OFF", hi, lo))
-        except Exception as _e:
-            print("  pitch limit read fail:", _e)
 
     # ---- 打印执行器状态(上电自检的第一手信息) ----
     _yaw_info = "off"
@@ -558,9 +467,11 @@ try:
             (" online %dmV" % _v) if _v else " (no resp)")
     _pitch_info = "off"
     if _pitch:
-        _pitch_info = "servo(id=%d k=%.3f rev=%s)%s" % (
-            _pitch.id, PITCH_K, "Y" if PITCH_REV < 0 else "N",
-            " online" if _pitch.ping() else " (no resp)")
+        _v = _pitch.read_bus_voltage()      # 兼作在线探测: 有回包说明驱动器和串口都通
+        _pitch_info = "emm-pos(addr=%d UART%d TX=GPIO%d RX=GPIO%d %dRPM k=%.3f lim=%s rev=%s)%s" % (
+            P_ADDR, P_PORT, P_TX, P_RX, P_RPM, P_K,
+            "ON" if P_LIMIT_EN else "OFF", "Y" if P_REV < 0 else "N",
+            (" online %dmV" % _v) if _v else " (no resp)")
     print("actuator: yaw=%s | pitch=%s" % (_yaw_info, _pitch_info))
 
 except Exception as e:
@@ -569,7 +480,7 @@ except Exception as e:
 
 
 # ============================================================================
-# 六、CV 矩形检测
+# 五、CV 矩形检测
 # ============================================================================
 
 def point_xy(point):
@@ -722,7 +633,7 @@ def draw_box(frame_np, box):
 
 
 # ============================================================================
-# 七、YOLO 检测支持
+# 六、YOLO 检测支持
 # ============================================================================
 
 def _yolo_ok():
@@ -742,7 +653,7 @@ def _yolo_ok():
 
 
 # ============================================================================
-# 八、CV 模式主循环
+# 七、CV 模式主循环
 # ============================================================================
 
 def run_cv():
@@ -848,7 +759,7 @@ def run_cv():
 
 
 # ============================================================================
-# 九、YOLO 模式主循环
+# 八、YOLO 模式主循环
 # ============================================================================
 
 def run_yolo():
@@ -947,12 +858,12 @@ def run_yolo():
 
 
 # ============================================================================
-# 十、入口 — 模式切换
+# 九、入口 — 模式切换
 # ============================================================================
 
 print("=" * 50)
 print("mode: %s | pitch: %s | yaw: %s" %
-      (MODE.upper(), SERVO_ENABLED, MOTOR_ENABLED))
+      (MODE.upper(), PITCH_ENABLED, MOTOR_ENABLED))
 print("=" * 50)
 
 # 电机测试模式优先执行(不跑视觉)
@@ -1003,27 +914,52 @@ if MOTOR_ENABLED and mv.get("test_mode", False) and _yaw:
         _yaw.set_speed(_dirn, _rpm)     # 持续重发, 防止丢帧后停住
         _t.sleep_ms(500)
 
-# 舵机测试模式(不跑视觉): ping + 往返扫动
-if SERVO_ENABLED and sv.get("test_mode", False) and _pitch:
+# pitch 步进测试模式(不跑视觉): 在线探测 + 位置清零 + ±角度往返自检
+if PITCH_ENABLED and pm.get("test_mode", False) and _pitch:
     import time as _t
-    _sid = sv.get("pitch_id", 0)
-    print(">>> SERVO TEST (pitch id=%d)" % _sid)
-    print("  接线: UART%d TX=GPIO%d(Pin11)串1kΩ接信号线, RX=GPIO%d(Pin13)直连" %
-          (sv.get("port", 2), sv.get("tx_pin", 5), sv.get("rx_pin", 6)))
-    print("  共地 + 舵机独立供电")
-    if _pitch.ping():
-        print("  ping OK")
-    else:
-        print("  ping FAIL —— 查 1kΩ串阻 / 共地 / 舵机供电 / 舵机ID(应=%d)" % _sid)
 
-    _lo = sv.get("pitch_min", -30)
-    _hi = sv.get("pitch_max", 30)
-    _seq = [0, _hi, 0, _lo, 0]
-    print("  往返扫动 %s 度, Ctrl+C 退出" % _seq)
+    print(">>> PITCH TEST (Emm42 步进, 位置模式往返自检)")
+    print("  串口: UART%d @%dbps, ID=%d, 校验=固定0x6B" % (P_PORT, P_BAUD, P_ADDR))
+    print("  接线: K230 TX=GPIO%d -> 驱动器RXD,  RX=GPIO%d -> 驱动器TXD" % (P_TX, P_RX))
+    print("  共地 + 驱动器 V+ 独立供电 7~32V(勿接 K230 5V)")
+    _v = _pitch.read_bus_voltage()
+    if _v:
+        print("  在线探测: OK, 母线电压 %dmV" % _v)
+    else:
+        print("  在线探测: 无应答")
+
+        def _hx(b):
+            return " ".join("%02X" % x for x in b)
+
+        _sent, _raw = _pitch.raw_probe()
+        if not _raw:
+            print("  RX 原始字节: (无) —— 一个字节都没收到")
+            print("    → K230 发出去了但没人回。依次查:")
+            print("      1. 驱动器 OLED 是否正常 / 显示什么(Waiting V+ Power!?)")
+            print("      2. 共地: K230 GND 与驱动器电源 GND 是否连通")
+            print("      3. 交叉接线: TX GPIO%d -> 驱动器RXD, RX GPIO%d -> 驱动器TXD" % (P_TX, P_RX))
+            print("      4. 驱动器菜单: 串口功能=UART_FUN, 串口ID=%d, 波特率=%d," % (P_ADDR, P_BAUD))
+            print("         校验方式=固定0x6B, 应答=Receive")
+        elif _raw == _sent:
+            print("  RX 原始字节: %s   <- 正是我们自己发出去的帧" % _hx(_raw))
+            print("    → 回环测试通过: K230 的 UART%d(GPIO%d/GPIO%d) 收发都正常" % (P_PORT, P_TX, P_RX))
+            print("      拔掉 TX/RX 之间的短接线, 接驱动器")
+        else:
+            print("  RX 原始字节: %s" % _hx(_raw))
+            print("    (本机发出的是: %s)" % _hx(_sent))
+            print("    → 收到字节但不是自身回环: 多半驱动器「校验方式」不是 固定0x6B")
+
+    _pitch.enable(True)
+    _pitch.clear_position()
+    print("  0 点 = 当前物理位置(上电前应位于行程中部)")
+    _ang = pm.get("test_angle", 10)
+    _seq = [0, _ang, 0, -_ang, 0]
+    print("  位置模式往返扫动 %s 度, Ctrl+C 退出" % _seq)
     while True:
         for _a in _seq:
-            print("  -> %.0f deg" % _a)
-            _pitch.set_angle(_a, 800, 0)
+            _pp = int(_a * P_PULSES_REV / 360.0 + (0.5 if _a >= 0 else -0.5))
+            print("  -> %+.0f deg (%+d pulses)" % (_a, _pp))
+            _pitch.move(_pp, P_RPM, absolute=True)
             _t.sleep_ms(1500)
 
 if MODE == "yolo":

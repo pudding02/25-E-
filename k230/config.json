@@ -1,11 +1,11 @@
 {
   "_说明": "K230 双轴云台追踪 — 运行时配置。改完重启 main.py 生效。以 _ 开头的键是注释, 程序会自动跳过。",
 
-  "_架构": "左右(yaw)轴 = Emm42_V5.0 闭环步进驱动器(UART3, 串口速度模式); 上下(pitch)轴 = FashionStar FSUS 总线舵机(UART2, 增量位置控制)。两轴独立, 各有死区。",
+  "_架构": "左右(yaw)轴 = Emm42_V5.0 闭环步进驱动器(UART3, 串口速度模式); 上下(pitch)轴 = Emm42_V5.0 闭环步进驱动器(UART2, 串口位置模式)。两轴独立, 各有死区。",
 
-  "_调参入口": "现场最常动的几个: [motor] reverse(方向) / min_rpm,max_rpm(快慢) / acc(加速) ; [servo] pitch_reverse(方向) / pitch_k(快慢)",
+  "_调参入口": "现场最常动的几个: [motor] reverse(方向) / min_rpm,max_rpm(快慢) / acc(加速) ; [pitch_motor] pitch_reverse(方向) / pitch_k(快慢) / rpm(限速)",
 
-  "_接线": "yaw: GPIO32(Pin37)→驱动器RXD, GPIO33(Pin40)→驱动器TXD, 共地, V+独立7~32V; pitch: GPIO5(Pin11)串1kΩ→信号线, GPIO6(Pin13)直连, 共地。引脚以 skill/LUSHAN-PI-K230-PINOUT-SKILL.md 第一节 40Pin 图为准; 舵机接线图见 云台/舵机接线图.png",
+  "_接线": "yaw: GPIO32(Pin37)→驱动器①RXD, GPIO33(Pin40)→驱动器①TXD, 共地, 驱动器①V+独立7~32V; pitch: GPIO5(Pin11)→驱动器②RXD, GPIO6(Pin13)→驱动器②TXD(交叉接), 共地, 驱动器②V+独立7~32V。引脚以 skill/LUSHAN-PI-K230-PINOUT-SKILL.md 第一节 40Pin 图为准",
 
   "detection": {
     "_说明": "用哪种检测方式",
@@ -127,7 +127,7 @@
     "baud": 115200,
     "tx_pin": 32,
     "rx_pin": 33,
-    "_pins": "K230 TX=GPIO32(Pin37) → 驱动器 RXD; K230 RX=GPIO33(Pin40) → 驱动器 TXD(交叉接)。注意: 一个 UART 控制器只能有一组引脚, 不能与 [servo] 的 port 相同",
+    "_pins": "K230 TX=GPIO32(Pin37) → 驱动器① RXD; K230 RX=GPIO33(Pin40) → 驱动器① TXD(交叉接)。注意: 一个 UART 控制器只能有一组引脚, 不能与 [pitch_motor] 的 port 相同",
 
     "addr": 1,
     "_addr": "驱动器串口 ID(1~255), 必须与驱动器 OLED/上位机里设的 ID 一致",
@@ -152,48 +152,57 @@
     "_reverse": "转向和偏差方向相反时改 true(方向反了只改这一个)"
   },
 
-  "servo": {
-    "_说明": "上下(pitch)轴 —— FSUS 总线舵机, 增量位置控制。追踪时: 每帧角度 += pitch_k × dy, 带限位。接线见 云台/舵机接线图.png",
+  "pitch_motor": {
+    "_说明": "上下(pitch)轴 —— Emm42_V5.0 闭环步进驱动器, 串口「位置模式」。K230 记账俯仰角(每帧 += pitch_k × dy), 向驱动器下发绝对位置目标; 上电时以当时物理位置为 0°(上电前请把云台摆到行程中部)",
 
     "enabled": true,
-    "_enabled": "false=不初始化舵机(纯视觉调试, 或只让 yaw 工作)",
+    "_enabled": "false=不初始化(纯视觉调试, 或只让 yaw 工作)",
 
     "test_mode": false,
-    "_test_mode": "true=不跑视觉, 只 ping 舵机 + 往返扫动(0→max→0→min)验证接线/协议; false=正常视觉追踪",
+    "_test_mode": "true=不跑视觉, 只做 在线探测 + 位置清零 + ±角度往返自检(验证驱动器接线用); false=正常视觉追踪",
+
+    "test_angle": 10,
+    "_test_angle": "仅 test_mode=true 时用: 自检往返角度(度)",
 
     "port": 2,
     "baud": 115200,
     "tx_pin": 5,
     "rx_pin": 6,
-    "_pins": "UART2: TX=GPIO5(Pin11) 串 1kΩ 接舵机信号线, RX=GPIO6(Pin13) 直连同一根信号线(半双工单总线)",
+    "_pins": "K230 TX=GPIO5(Pin11) → 驱动器② RXD; K230 RX=GPIO6(Pin13) → 驱动器② TXD(交叉接)。注意: 一个 UART 控制器只能有一组引脚, 不能与 [motor] 的 port 相同",
 
-    "pitch_id": 0,
-    "_pitch_id": "舵机在总线上的 ID, 必须与舵机内部设的 ID 一致",
+    "addr": 1,
+    "_addr": "驱动器串口 ID(1~255), 必须与驱动器 OLED/上位机里设的 ID 一致",
+
+    "enable_on_boot": true,
+    "_enable_on_boot": "上电发使能帧(F3)。若驱动器没被使能, 收到位置指令也不会转",
+
+    "pulse_per_rev": 3200,
+    "_pulse_per_rev": "每圈脉冲数 = 200 × 驱动器细分。16细分=3200(默认), 8细分=1600 —— 必须与驱动器菜单里的细分一致, 否则角度换算全错",
+
+    "rpm": 30,
+    "_rpm": "位置模式单次运动的速度上限(RPM, 0~3000)。追得慢就调大; 太猛/过冲就调小",
+
+    "acc": 200,
+    "_acc": "加减速档位 0~255, 越大加速越快(0≈不启用曲线加减速)",
 
     "pitch_k": 0.02,
-    "_pitch_k": "每帧角度增量系数: 角度 += pitch_k × dy。越大跟得越快越猛, 典型 0.01~0.05; 震荡就调小",
+    "_pitch_k": "每帧角度增量系数: 目标角度 += pitch_k × dy (度)。越大跟得越快越猛, 典型 0.01~0.05; 震荡就调小",
 
     "pitch_reverse": false,
     "_pitch_reverse": "上下方向和偏差方向相反时改 true",
 
-    "pitch_min": -30,
-    "pitch_max": 30,
-    "_range": "软件角度限位(度), 累加后的目标角度会夹在这个区间内。防止转到机械限位卡住",
-
-    "interval_ms": 40,
-    "_interval_ms": "舵机每次动作的行程时间(ms), 约等于视觉帧周期; 调大=动作更柔和",
-
-    "power": 0,
-    "_power": "舵机功率上限(mW), 0=不限制",
-
     "deadband_px": 5,
-    "_deadband_px": "死区(px)。|dy| 小于此值不动作, 防止在中心附近抖",
+    "_deadband_px": "死区(px)。|dy| 小于此值不再更新目标角度(保持原位), 防止在中心附近抖",
 
-    "lost_hold": true,
-    "_lost_hold": "丢靶时: true=舵机保持最后位置 / false=进入阻尼卸力(安全)。注意 yaw 步进丢靶时一律停转, 不受此项影响",
+    "limit_enabled": false,
+    "_limit_enabled": "软件角度限位开关。默认 false=不夹取(角度只记账, 不设边界); true=超出下面范围的目标会被夹住",
 
-    "center_on_boot": true,
-    "_center_on_boot": "上电后舵机 2s 缓慢回中 0°。步进没有位置概念不回中, 所以云台要在机械上居中安装"
+    "pitch_min": -90,
+    "pitch_max": 90,
+    "_range": "软件限位范围(度), 仅 limit_enabled=true 时生效; 0 = 上电清零时的物理位置",
+
+    "min_step_pulses": 1,
+    "_min_step_pulses": "目标变化 ≥ 此脉冲数才真正下发(去重/滤波)。1 = 每 0.1125° 都发; 抖动可调大(如 4 ≈ 0.45°)"
   },
 
   "debug": {
