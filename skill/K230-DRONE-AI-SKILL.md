@@ -10,7 +10,7 @@ description: "K230 AI视觉应用层：K230实机部署（YOLOv8部署模板/AI2
 该Skill覆盖 K230 实机部署、FPV仿真数据采集、图像伺服追踪闭环与MAVLink自主控制的**应用层流程**。
 
 > **模型训练与转换**（数据集准备、YOLOv8训练、ONNX导出、NNCase转KModel）已迁移至独立 skill：
-> **[k230-yolo-train-deploy](file:///c:/Users/12553/Desktop/视觉/复刻/.trae/skills/k230-yolo-train-deploy/SKILL.md)**
+> **[k230-yolo-train-deploy](file:///c:/Users/12553/Desktop/视觉/复刻/skill/K230-YOLO-TRAIN-DEPLOY-SKILL.md)**
 
 ---
 
@@ -29,7 +29,7 @@ description: "K230 AI视觉应用层：K230实机部署（YOLOv8部署模板/AI2
 
 ### 1.2 K230 庐山派 40-Pin 引脚定义
 
-> 完整引脚速查（含GH1.25座子、GPIO0-63复用表）见 [lushan-pi-k230-pinout skill](file:///c:/Users/12553/Desktop/视觉/复刻/.trae/skills/lushan-pi-k230-pinout/SKILL.md)。
+> 完整引脚速查（含GH1.25座子、GPIO0-63复用表）见 [lushan-pi-k230-pinout skill](file:///c:/Users/12553/Desktop/视觉/复刻/skill/LUSHAN-PI-K230-PINOUT-SKILL.md)。
 
 **UART 引脚速查：**
 
@@ -564,7 +564,7 @@ AirSim / Colosseum
 
 **原因**：模型转换配置错误（最常见）
 
-**解决**（详见 [k230-yolo-train-deploy skill 第六节速查表](file:///c:/Users/12553/Desktop/视觉/复刻/.trae/skills/k230-yolo-train-deploy/SKILL.md)）：
+**解决**（详见 [k230-yolo-train-deploy skill 第六节速查表](file:///c:/Users/12553/Desktop/视觉/复刻/skill/K230-YOLO-TRAIN-DEPLOY-SKILL.md)）：
 1. `compile_options.preprocess = True`
 2. `compile_options.input_type = "uint8"`
 3. `ptq_options.calibrate_method = "NoClip"`
@@ -641,7 +641,7 @@ drone_ai_project/
 
 ## 十一、配置速查总表
 
-> 训练配置与转换配置（★必须严格遵守项）见 [k230-yolo-train-deploy skill](file:///c:/Users/12553/Desktop/视觉/复刻/.trae/skills/k230-yolo-train-deploy/SKILL.md) 第三、六节。
+> 训练配置与转换配置（★必须严格遵守项）见 [k230-yolo-train-deploy skill](file:///c:/Users/12553/Desktop/视觉/复刻/skill/K230-YOLO-TRAIN-DEPLOY-SKILL.md) 第三、六节。
 
 ### 部署配置
 
@@ -719,6 +719,6 @@ PRINT_EVERY = 60  # 每60帧才print一次
 - [K230 NNCase开发指南](https://developer.canaan-creative.com/k230_rtos/zh/v0.1/app_develop_guide/ai/nncase.html)
 - [K230 CanMV用户指南](https://developer.canaan-creative.com/k230_canmv/main/zh/userguide/)
 - [NNCase API手册](https://developer.canaan-creative.com/k230_rtos/zh/main/api_reference/nncase/)
-- 模型训练与KModel转换 → [k230-yolo-train-deploy skill](file:///c:/Users/12553/Desktop/视觉/复刻/.trae/skills/k230-yolo-train-deploy/SKILL.md)
-- K230 直控舵机云台 → [fashionstar-servo-k230 skill](file:///c:/Users/12553/Desktop/视觉/复刻/.trae/skills/fashionstar-servo-k230/SKILL.md)
-- 庐山派引脚速查 → [lushan-pi-k230-pinout skill](file:///c:/Users/12553/Desktop/视觉/复刻/.trae/skills/lushan-pi-k230-pinout/SKILL.md)
+- 模型训练与KModel转换 → [k230-yolo-train-deploy skill](file:///c:/Users/12553/Desktop/视觉/复刻/skill/K230-YOLO-TRAIN-DEPLOY-SKILL.md)
+- K230 直控舵机云台（历史存档，已改双步进）→ [FASHIONSTAR-SERVO-K230 skill](file:///c:/Users/12553/Desktop/视觉/复刻/skill/FASHIONSTAR-SERVO-K230-SKILL.md)
+- 庐山派引脚速查 → [lushan-pi-k230-pinout skill](file:///c:/Users/12553/Desktop/视觉/复刻/skill/LUSHAN-PI-K230-PINOUT-SKILL.md)

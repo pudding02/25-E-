@@ -1,7 +1,10 @@
 ---
 name: "fashionstar-servo-k230"
-description: "在庐山派K230(CanMV/MicroPython)上经UART直接控制FashionStar总线伺服舵机：FSUS协议帧、MicroPython驱动、双轴舵机云台视觉追踪、同步指令、保护参数与PID调试。当需要K230直控舵机、舵机云台追踪或排查舵机通信时调用。"
+description: "【已弃用·存档】原：在庐山派K230(CanMV/MicroPython)上经UART直接控制FashionStar总线伺服舵机。本项目 pitch 轴已改为 Emm42 步进(见 接线图.md 与 k230/main.py)，本skill仅作历史存档与其它舵机项目参考。"
 ---
+
+> ⚠️ **已弃用**：本项目云台 pitch 轴已从 FashionStar 总线舵机改为 **Emm42_V5.0 闭环步进**（双步进方案）。
+> 当前实现与接线见项目根目录 `接线图.md` 与 `k230/main.py`；本文件仅作**历史存档**，以及给「仍使用总线舵机的其它项目」参考。
 
 # FashionStar 总线舵机 — 庐山派 K230 直控 Skill
 

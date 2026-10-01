@@ -16,7 +16,7 @@ description: "K230 YOLO模型训练与转换全流程：数据集准备与标注
 
 **不适用：**
 - K230 实机部署代码、FPV 仿真、MAVLink → 见 [k230-drone-ai skill](file:///c:/Users/12553/Desktop/视觉/复刻/skill/K230-DRONE-AI-SKILL.md)（其「阶段1：K230部署」章节）
-- K230 直控舵机云台 → 见 [fashionstar-servo-k230 skill](file:///c:/Users/12553/Desktop/视觉/复刻/.trae/skills/fashionstar-servo-k230/SKILL.md)
+- K230 直控舵机云台（历史存档，本项目已改为双 Emm42 步进）→ 见 [FASHIONSTAR-SERVO-K230 skill](file:///c:/Users/12553/Desktop/视觉/复刻/skill/FASHIONSTAR-SERVO-K230-SKILL.md)
 
 **整体流程**：
 ```
