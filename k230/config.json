@@ -138,8 +138,8 @@
     "acc": 200,
     "_acc": "加减速档位 0~255, 越大加速越快(0≈最慢, 255≈最急)。追得发飘/滞后就调大; 起步顿挫就调小",
 
-    "min_rpm": 1,
-    "max_rpm": 30,
+    "min_rpm": 5,
+    "max_rpm": 60,
     "_rpm": "转速区间(RPM)。|dx|≤deadband_px → 停转; 之后从 min_rpm 线性升到 max_rpm; |dx|≥dx_full_px 时达 max_rpm。整体想更快就调大这两个; min_rpm 太小会『哼着不转』(步进低速扭矩小)",
 
     "dx_full_px": 200,
@@ -148,8 +148,15 @@
     "deadband_px": 5,
     "_deadband_px": "死区(px)。|dx| 小于此值直接停转, 防止在中心附近来回抖。抖动就调大, 对不准则调小",
 
-    "reverse": false,
-    "_reverse": "转向和偏差方向相反时改 true(方向反了只改这一个)"
+    "reverse": true,
+    "_reverse": "转向和偏差方向相反时改 true(方向反了只改这一个)",
+
+    "coast_enabled": true,
+    "_coast_enabled": "丢靶预判: 目标从左右两侧(边缘)丢失后, 不立即停, 朝最后方向续转一小段去找(无目标追踪)。false=丢靶立即停(旧行为)",
+    "coast_edge_px": 160,
+    "_coast_edge_px": "预判触发门槛: 丢失时最后偏差 |dx| ≥ 此值才启动(即目标最后在画面两侧)。默认160≈画面两侧各1/4区域; 调小=更易触发",
+    "coast_ms": 800,
+    "_coast_ms": "预判持续时长(ms); 到点未重新捕获目标则停转。目标走得快可试 1000~1500, 怕乱转可降到 500"
   },
 
   "pitch_motor": {
@@ -179,8 +186,8 @@
     "acc": 200,
     "_acc": "加减速档位 0~255, 越大加速越快(0≈最慢, 255≈最急)。追得发飘/滞后就调大; 起步顿挫就调小",
 
-    "min_rpm": 1,
-    "max_rpm": 30,
+    "min_rpm": 10,
+    "max_rpm": 60,
     "_rpm": "转速区间(RPM)。|dy|≤deadband_px → 停转; 之后从 min_rpm 线性升到 max_rpm; |dy|≥dy_full_px 时达 max_rpm。整体想更快就调大这两个; min_rpm 太小会『哼着不转』(步进低速扭矩小)",
 
     "dy_full_px": 200,

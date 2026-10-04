@@ -13,9 +13,10 @@ K230 物体追踪 — 双轴云台 (双步进)
     cv    : 矩形靶标检测(白心+黑边验证)   偏移 = 四边形中心 - 屏幕中心
     yolo  : KPU 目标检测                 偏移 = 识别框中心 - 屏幕中心
 
-  执行器 (两轴都是 Emm42 闭环步进, 控制逻辑完全相同, 由 config.json 的 motor / pitch_motor 段配置):
-    左右轴(yaw)  : 按 dx 做「速度」控制 —— |dx| 越大转速越快; 死区内停转; 丢靶停转
-    上下轴(pitch): 按 dy 做「速度」控制 —— |dy| 越大转速越快; 死区内停转; 丢靶停转(与 yaw 相同逻辑)
+  执行器 (两轴都是 Emm42 闭环步进, 速度控制逻辑相同, 由 config.json 的 motor / pitch_motor 段配置):
+    左右轴(yaw)  : 按 dx 做「速度」控制 —— |dx| 越大转速越快; 死区内停转;
+                   丢靶预判: 目标从左右两侧丢失后, 朝最后方向续追一小段时间(可关, 见 coast_step)
+    上下轴(pitch): 按 dy 做「速度」控制 —— |dy| 越大转速越快; 死区内停转; 丢靶停转
 
   dx = 目标中心x - 屏幕中心x   (右偏为正)
   dy = 目标中心y - 屏幕中心y   (下偏为正)
@@ -354,6 +355,8 @@ class EmmStepper:
 #      dx → 左右轴(yaw, 步进)  : 速度模式 —— |dx| 决定转速, dx 符号决定方向
 #      dy → 上下轴(pitch, 步进): 速度模式 —— |dy| 决定转速, dy 符号决定方向(与 yaw 相同逻辑)
 #    status: "track"=追踪中 / "lost"=丢靶
+#    "lost" 时: yaw 支持「丢靶预判」—— 目标从左右两侧丢失后朝最后方向续转一段
+#    (无目标追踪, 见 coast_step 与 config [motor].coast_* 键); pitch 丢靶即停。
 #
 #    !! 本段整体包在 try 里: 任何一条轴初始化失败都会打印
 #       "!!! actuator init failed: ..." 并把 gimbal_send 降级成空操作(两轴都不动)。
@@ -362,6 +365,31 @@ class EmmStepper:
 
 _yaw = None        # yaw 轴: EmmStepper 实例(速度模式)
 _pitch = None      # pitch 轴: EmmStepper 实例(速度模式)
+
+# 丢靶预判(coast)状态 —— 由 gimbal_send 维护(见 coast_step)
+_last_dx = 0           # 最后一次追踪的 yaw 偏差(带符号); 丢靶期间保留, 供预判参考
+_coast_active = False  # 是否正在丢靶预判中
+_coast_start = 0       # 预判启动时刻(time.ticks_ms())
+
+
+def coast_step(now_ms, active, start_ms, last_dx, edge_px, coast_ms):
+    """丢靶预判状态机(纯函数 —— tools/test_coast_logic.py 抓取本函数做主机侧测试)。
+
+    返回 (mode, new_active, new_start, new_last_dx):
+      "start" = 本帧启动预判(开始朝最后方向续转)   "run" = 预判进行中
+      "stop"  = 预判超时终止(停转)                 "idle"= 未达触发条件
+    规则: 未激活且 |last_dx| >= edge_px → 启动(记 now_ms);
+          已激活且未到 coast_ms → 续跑;
+          已激活且到点 → 终止, 并把 last_dx 清 0(防止超时后反复重启)。
+    """
+    if not active:
+        if abs(last_dx) >= edge_px:
+            return ("start", True, now_ms, last_dx)
+        return ("idle", False, 0, last_dx)
+    if time.ticks_diff(now_ms, start_ms) < coast_ms:
+        return ("run", True, start_ms, last_dx)
+    return ("stop", False, 0, 0)
+
 
 try:
     # ---------------- pitch 上下轴: Emm42 闭环步进(UART2, 速度模式, 与 yaw 同逻辑) ----------------
@@ -401,6 +429,9 @@ try:
         M_DX_FULL = mv.get("dx_full_px", 200)
         M_DEADBAND = mv.get("deadband_px", 5)
         M_REV = -1 if mv.get("reverse", False) else 1
+        M_COAST_EN = mv.get("coast_enabled", True)     # 丢靶预判开关
+        M_COAST_EDGE = mv.get("coast_edge_px", 160)    # 触发门槛: 最后 |dx| >= 此值
+        M_COAST_MS = mv.get("coast_ms", 800)           # 预判持续时长(ms)
 
         _yaw = EmmStepper(M_PORT, M_BAUD, M_TX, M_RX, M_ADDR, M_ACC)
         if mv.get("enable_on_boot", True):
@@ -413,14 +444,40 @@ try:
         dx, dy : 目标中心相对屏幕中心的像素偏差(右偏/下偏为正)
         dist   : 偏差欧氏距离(本实现未用到, 仅为接口完整保留)
         status : "track"=追踪中 / "lost"=丢靶
+
+        丢靶预判(coast): 丢靶且最后偏差 |_last_dx| >= coast_edge_px 时,
+        不立即停, 而是朝最后方向续转 coast_ms 毫秒(无目标追踪)去找目标;
+        超时停转, 期间一旦重新捕获(track)立即恢复常规追踪。
+        pitch 轴不参与预判(丢靶即停, 与旧行为一致)。
         """
+        global _last_dx, _coast_active, _coast_start
         try:
             if status == "lost":
-                if _yaw:
-                    _yaw.stop()                    # 丢靶: yaw 一律停转
+                if _yaw and M_COAST_EN:
+                    mode, _coast_active, _coast_start, _last_dx = coast_step(
+                        time.ticks_ms(), _coast_active, _coast_start, _last_dx,
+                        M_COAST_EDGE, M_COAST_MS)
+                    if mode == "stop":
+                        print("COAST stop (timeout)")
+                        _yaw.stop()
+                    elif mode == "idle":
+                        _yaw.stop()
+                    else:
+                        # start / run: 朝最后方向续转, 转速=最后偏差的映射值
+                        ratio = min(1.0, abs(_last_dx) / float(M_DX_FULL))
+                        rpm = M_MIN_RPM + (M_MAX_RPM - M_MIN_RPM) * ratio
+                        _yaw.set_speed(M_REV * (1 if _last_dx > 0 else -1), rpm)
+                        if mode == "start":
+                            print("COAST start (last dx=%+d)" % _last_dx)
+                elif _yaw:
+                    _yaw.stop()                    # 丢靶: yaw 停转(预判未启用)
                 if _pitch:
-                    _pitch.stop()                  # 丢靶: pitch 一律停转(同 yaw)
+                    _pitch.stop()                  # 丢靶: pitch 一律停转
                 return
+
+            # ---- 追踪中: 记录最后偏差(供丢靶预判), 并复位预判状态 ----
+            _last_dx = dx
+            _coast_active = False
 
             # ---- yaw: |dx| 线性映射到转速, 符号定方向, 死区内停 ----
             if _yaw:
@@ -712,6 +769,22 @@ def run_cv():
                 fps_tick = now
             cv2.putText(frame_np, "FPS:%d" % fps, (4, SENSOR_H - 8),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+            # ---- 临时诊断(定位"画面偏左", 拿到结论后可删) ----
+            # ① 标尺: 帧左边界线 / 帧中心竖线 / 帧右边界线 / 水平中线 (每帧绘制)
+            try:
+                _fw, _fh = frame.width(), frame.height()
+                cv2.line(frame_np, (0, 0), (0, _fh - 1), (255, 0, 0), 2)
+                cv2.line(frame_np, (_fw // 2, 0), (_fw // 2, _fh - 1), (0, 255, 0), 2)
+                cv2.line(frame_np, (_fw - 1, 0), (_fw - 1, _fh - 1), (0, 0, 255), 2)
+                cv2.line(frame_np, (0, _fh // 2), (_fw - 1, _fh // 2), (255, 255, 255), 1)
+            except Exception:
+                _fw, _fh = "?", "?"
+            # ② 每 60 帧打印一次: 实际帧尺寸 + 显示/中心配置
+            if frame_id % 60 == 1:
+                print("DIAG frame=%sx%s | disp x/y=%d/%d lcd=%dx%d | sensor_cfg=%dx%d | center=%d/%d" % (
+                    _fw, _fh, DISPLAY_X, DISPLAY_Y, DISPLAY_W, DISPLAY_H,
+                    SENSOR_W, SENSOR_H, CENTER_X, CENTER_Y))
 
             Display.show_image(frame, x=DISPLAY_X, y=DISPLAY_Y)
             if frame_id % GC_EVERY == 0:

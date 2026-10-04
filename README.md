@@ -149,7 +149,12 @@ cp model.kmodel /sdcard/model/
 
 ### 4.1 左右轴 (yaw) —— 速度模式
 
-`|dx| ≤ deadband_px` → 停转；之后从 `min_rpm` 线性升到 `max_rpm`（`|dx| ≥ dx_full_px` 时满速）；丢靶停转。
+`|dx| ≤ deadband_px` → 停转；之后从 `min_rpm` 线性升到 `max_rpm`（`|dx| ≥ dx_full_px` 时满速）。
+
+**丢靶预判**：目标丢失时若最后偏差 `|dx| ≥ coast_edge_px`（默认 160，即最后在画面左右两侧），
+不立即停，而是朝最后方向按最后偏差映射的转速续转 `coast_ms`（默认 800ms）去找（无目标追踪）；
+期间重新捕获立即恢复常规追踪，超时则停。开关/参数在 `[motor]` 段 `coast_enabled` / `coast_edge_px` / `coast_ms`；
+`coast_enabled=false` 回到「丢靶即停」。
 
 ### 4.2 上下轴 (pitch) —— 速度模式（与 yaw 相同逻辑）
 
@@ -162,10 +167,12 @@ cp model.kmodel /sdcard/model/
 | 现象 | 调整 |
 |------|------|
 | 云台振荡/过冲 | 降对应轴 `max_rpm` / 调大 `deadband_px` |
-| 对准慢 | 调大 `max_rpm` / 调小 `dx_full_px`(yaw)、`dy_full_px`(pitch) |
+| 对准慢 | 调大 `max_rpm` / 调小 `dx_full_px`(yaw)、`dy_full_px`(pitch)；起步肉可调大 `acc` |
 | 低速"哼着不转" | 对应轴 `min_rpm` 调大（步进低速扭矩小） |
 | 中心附近抖动 | 调大对应轴 `deadband_px` |
 | 方向反了 | `motor.reverse` / `pitch_motor.reverse` 置 true |
+| 目标甩出画面后跟丢 | `coast_ms` 调大（续追更久）/ `coast_edge_px` 调小（更易触发） |
+| 丢靶后乱转 | `coast_enabled` 置 false（回「丢靶即停」）或调小 `coast_ms` |
 | 跟踪不平滑 | 增大检测端滤波/跳帧参数 |
 
 ## 五、激光标定
