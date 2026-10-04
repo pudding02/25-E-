@@ -356,7 +356,8 @@ class EmmStepper:
 #      dy → 上下轴(pitch, 步进): 速度模式 —— |dy| 决定转速, dy 符号决定方向(与 yaw 相同逻辑)
 #    status: "track"=追踪中 / "lost"=丢靶
 #    "lost" 时: yaw 支持「丢靶预判」—— 目标从左右两侧丢失后朝最后方向续转一段
-#    (无目标追踪, 见 coast_step 与 config [motor].coast_* 键); pitch 丢靶即停。
+#    (无目标追踪, 见 coast_step 与 config [motor].coast_* 键; 默认关, coast_test=true 可单独自检)
+#    pitch 丢靶即停。
 #
 #    !! 本段整体包在 try 里: 任何一条轴初始化失败都会打印
 #       "!!! actuator init failed: ..." 并把 gimbal_send 降级成空操作(两轴都不动)。
@@ -429,7 +430,7 @@ try:
         M_DX_FULL = mv.get("dx_full_px", 200)
         M_DEADBAND = mv.get("deadband_px", 5)
         M_REV = -1 if mv.get("reverse", False) else 1
-        M_COAST_EN = mv.get("coast_enabled", True)     # 丢靶预判开关
+        M_COAST_EN = mv.get("coast_enabled", False)    # 丢靶预判开关(默认关, 先自检验证再启用)
         M_COAST_EDGE = mv.get("coast_edge_px", 160)    # 触发门槛: 最后 |dx| >= 此值
         M_COAST_MS = mv.get("coast_ms", 800)           # 预判持续时长(ms)
 
@@ -770,22 +771,6 @@ def run_cv():
             cv2.putText(frame_np, "FPS:%d" % fps, (4, SENSOR_H - 8),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
-            # ---- 临时诊断(定位"画面偏左", 拿到结论后可删) ----
-            # ① 标尺: 帧左边界线 / 帧中心竖线 / 帧右边界线 / 水平中线 (每帧绘制)
-            try:
-                _fw, _fh = frame.width(), frame.height()
-                cv2.line(frame_np, (0, 0), (0, _fh - 1), (255, 0, 0), 2)
-                cv2.line(frame_np, (_fw // 2, 0), (_fw // 2, _fh - 1), (0, 255, 0), 2)
-                cv2.line(frame_np, (_fw - 1, 0), (_fw - 1, _fh - 1), (0, 0, 255), 2)
-                cv2.line(frame_np, (0, _fh // 2), (_fw - 1, _fh // 2), (255, 255, 255), 1)
-            except Exception:
-                _fw, _fh = "?", "?"
-            # ② 每 60 帧打印一次: 实际帧尺寸 + 显示/中心配置
-            if frame_id % 60 == 1:
-                print("DIAG frame=%sx%s | disp x/y=%d/%d lcd=%dx%d | sensor_cfg=%dx%d | center=%d/%d" % (
-                    _fw, _fh, DISPLAY_X, DISPLAY_Y, DISPLAY_W, DISPLAY_H,
-                    SENSOR_W, SENSOR_H, CENTER_X, CENTER_Y))
-
             Display.show_image(frame, x=DISPLAY_X, y=DISPLAY_Y)
             if frame_id % GC_EVERY == 0:
                 gc.collect()
@@ -1016,6 +1001,33 @@ if PITCH_ENABLED and pm.get("test_mode", False) and _pitch:
     while True:
         _pitch.set_speed(_dirn, _rpm)     # 持续重发, 防止丢帧后停住
         _t.sleep_ms(500)
+
+# 丢靶预判自检(不跑视觉): 模拟左右两侧丢靶 + 中途重捕获, 单独验证续追行为
+if MOTOR_ENABLED and mv.get("coast_test", False) and _yaw:
+    M_COAST_EN = True    # 测试模式强制启用预判(不受 coast_enabled 影响)
+    print(">>> COAST TEST (丢靶预判自检, 不跑视觉; Ctrl+C 退出)")
+    print("  预期: 每侧丢靶后 yaw 朝该侧续转约 %dms 再停; 中途'重捕获'应立即停" % M_COAST_MS)
+    for _side, _dx in (("右", 250), ("左", -250)):
+        print("---- [%s] 丢靶续追 (最后偏差 dx=%+d) ----" % (_side, _dx))
+        gimbal_send(_dx, 0, _dx, "track")      # 模拟"最后看到目标"的一帧
+        time.sleep_ms(100)
+        _c0 = time.ticks_ms()
+        while time.ticks_diff(time.ticks_ms(), _c0) < M_COAST_MS + 1200:
+            gimbal_send(0, 0, 0, "lost")       # 连续丢靶 → 观察 COAST start / COAST stop 打印
+            time.sleep_ms(20)
+        time.sleep_ms(1200)                    # 停顿, 确认已停稳
+    print("---- [重捕获] 续追中途目标回到中心 → 应立即停(且无 COAST stop 打印) ----")
+    gimbal_send(250, 0, 250, "track")
+    time.sleep_ms(100)
+    _c0 = time.ticks_ms()
+    while time.ticks_diff(time.ticks_ms(), _c0) < M_COAST_MS // 2:
+        gimbal_send(0, 0, 0, "lost")
+        time.sleep_ms(20)
+    gimbal_send(0, 0, 0, "track")              # 目标回到画面中心(死区内) → 停转
+    time.sleep_ms(1000)
+    print(">>> COAST TEST done (Ctrl+C 退出)")
+    while True:
+        time.sleep_ms(1000)
 
 if MODE == "yolo":
     if _yolo_ok():

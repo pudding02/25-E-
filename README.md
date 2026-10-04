@@ -151,10 +151,13 @@ cp model.kmodel /sdcard/model/
 
 `|dx| ≤ deadband_px` → 停转；之后从 `min_rpm` 线性升到 `max_rpm`（`|dx| ≥ dx_full_px` 时满速）。
 
-**丢靶预判**：目标丢失时若最后偏差 `|dx| ≥ coast_edge_px`（默认 160，即最后在画面左右两侧），
+**丢靶预判**（默认关闭；先单独验证、再启用）：目标丢失时若最后偏差 `|dx| ≥ coast_edge_px`（默认 160，即最后在画面左右两侧），
 不立即停，而是朝最后方向按最后偏差映射的转速续转 `coast_ms`（默认 800ms）去找（无目标追踪）；
-期间重新捕获立即恢复常规追踪，超时则停。开关/参数在 `[motor]` 段 `coast_enabled` / `coast_edge_px` / `coast_ms`；
-`coast_enabled=false` 回到「丢靶即停」。
+期间重新捕获立即恢复常规追踪，超时则停。
+
+单独验证：`[motor].coast_test` 置 `true` 上机跑——不跑视觉，自动模拟左右两侧丢靶 + 中途重捕获，观察云台续追方向/时长/停止
+（串口打印 `COAST start` / `COAST stop`）；验证满意后把 `coast_enabled` 改 `true` 正式启用。
+`coast_enabled=false`（默认）即「丢靶即停」，不影响日常追踪。
 
 ### 4.2 上下轴 (pitch) —— 速度模式（与 yaw 相同逻辑）
 
@@ -171,8 +174,8 @@ cp model.kmodel /sdcard/model/
 | 低速"哼着不转" | 对应轴 `min_rpm` 调大（步进低速扭矩小） |
 | 中心附近抖动 | 调大对应轴 `deadband_px` |
 | 方向反了 | `motor.reverse` / `pitch_motor.reverse` 置 true |
-| 目标甩出画面后跟丢 | `coast_ms` 调大（续追更久）/ `coast_edge_px` 调小（更易触发） |
-| 丢靶后乱转 | `coast_enabled` 置 false（回「丢靶即停」）或调小 `coast_ms` |
+| 目标甩出画面后跟丢 | 先 `coast_test` 自检预判，确认行为后 `coast_enabled` 置 true；力度不够再调大 `coast_ms` / 调小 `coast_edge_px` |
+| 丢靶后乱转/干扰追踪 | `coast_enabled` 保持/置 false（回「丢靶即停」）；或调小 `coast_ms` |
 | 跟踪不平滑 | 增大检测端滤波/跳帧参数 |
 
 ## 五、激光标定

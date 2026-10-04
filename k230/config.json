@@ -151,12 +151,14 @@
     "reverse": true,
     "_reverse": "转向和偏差方向相反时改 true(方向反了只改这一个)",
 
-    "coast_enabled": true,
-    "_coast_enabled": "丢靶预判: 目标从左右两侧(边缘)丢失后, 不立即停, 朝最后方向续转一小段去找(无目标追踪)。false=丢靶立即停(旧行为)",
+    "coast_enabled": false,
+    "_coast_enabled": "丢靶预判开关。默认 false=追踪保持原版行为(丢靶立即停), 不影响日常追踪; 单独验证(见 coast_test)满意后再改 true 启用",
     "coast_edge_px": 160,
     "_coast_edge_px": "预判触发门槛: 丢失时最后偏差 |dx| ≥ 此值才启动(即目标最后在画面两侧)。默认160≈画面两侧各1/4区域; 调小=更易触发",
     "coast_ms": 800,
-    "_coast_ms": "预判持续时长(ms); 到点未重新捕获目标则停转。目标走得快可试 1000~1500, 怕乱转可降到 500"
+    "_coast_ms": "预判持续时长(ms); 到点未重新捕获目标则停转。目标走得快可试 1000~1500, 怕乱转可降到 500",
+    "coast_test": false,
+    "_coast_test": "true=不跑视觉, 专测丢靶预判: 自动模拟左右两侧丢靶+中途重捕获, 观察 yaw 续追方向/时长/停止(串口打印 COAST start/stop)"
   },
 
   "pitch_motor": {
