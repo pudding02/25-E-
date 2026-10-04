@@ -356,7 +356,7 @@ class EmmStepper:
 #      dy → 上下轴(pitch, 步进): 速度模式 —— |dy| 决定转速, dy 符号决定方向(与 yaw 相同逻辑)
 #    status: "track"=追踪中 / "lost"=丢靶
 #    "lost" 时: yaw 支持「丢靶预判」—— 目标从左右两侧丢失后朝最后方向续转一段
-#    (无目标追踪, 见 coast_step 与 config [motor].coast_* 键; 默认关, coast_test=true 可单独自检)
+#    (无目标追踪, 见 coast_step 与 config [motor].coast_* 键; 默认关, coast_test=true 可单独自检, 先于 test_mode 执行)
 #    pitch 丢靶即停。
 #
 #    !! 本段整体包在 try 里: 任何一条轴初始化失败都会打印
@@ -366,6 +366,7 @@ class EmmStepper:
 
 _yaw = None        # yaw 轴: EmmStepper 实例(速度模式)
 _pitch = None      # pitch 轴: EmmStepper 实例(速度模式)
+_gimbal_ok = False # gimbal_send 是否已就绪(执行器初始化成功)——自检脚本用它防"静默假通过"
 
 # 丢靶预判(coast)状态 —— 由 gimbal_send 维护(见 coast_step)
 _last_dx = 0           # 最后一次追踪的 yaw 偏差(带符号); 丢靶期间保留, 供预判参考
@@ -516,6 +517,7 @@ try:
             "Y" if P_REV < 0 else "N",
             (" online %dmV" % _v) if _v else " (no resp)")
     print("actuator: yaw=%s | pitch=%s" % (_yaw_info, _pitch_info))
+    _gimbal_ok = True    # 执行器就绪: gimbal_send 为真实实现(供 coast_test 等自检判断)
 
 except Exception as e:
     print("\n!!! actuator init failed: %s" % str(e))
@@ -909,6 +911,42 @@ print("mode: %s | pitch: %s | yaw: %s" %
       (MODE.upper(), PITCH_ENABLED, MOTOR_ENABLED))
 print("=" * 50)
 
+# 丢靶预判自检(不跑视觉): 模拟左右两侧丢靶 + 中途重捕获, 单独验证续追行为
+# 本块先于 test_mode 判断执行: 与 motor/pitch_motor 的 test_mode 不要同时开(同开时本项优先)。
+if mv.get("coast_test", False):
+    if not (MOTOR_ENABLED and _yaw and _gimbal_ok):
+        print(">>> coast_test=true, 但 yaw 电机未启用 / 初始化未成功 → 跳过丢靶预判自检")
+    else:
+        M_COAST_EN = True    # 测试模式强制启用预判(不受 coast_enabled 影响)
+        print(">>> COAST TEST (丢靶预判自检, 不跑视觉; Ctrl+C 退出)")
+        print("  预期: 每侧丢靶后 yaw 朝该侧续转约 %dms 再停; 中途'重捕获'应立即停" % M_COAST_MS)
+        for _side, _dx in (("右", 250), ("左", -250)):
+            print("---- [%s] 丢靶续追 (最后偏差 dx=%+d) ----" % (_side, _dx))
+            gimbal_send(_dx, 0, _dx, "track")      # 模拟"最后看到目标"的一帧
+            time.sleep_ms(100)
+            _c0 = time.ticks_ms()
+            while time.ticks_diff(time.ticks_ms(), _c0) < M_COAST_MS + 1200:
+                gimbal_send(0, 0, 0, "lost")       # 连续丢靶 → 观察 COAST start / COAST stop 打印
+                time.sleep_ms(20)
+            time.sleep_ms(1200)                    # 停顿, 确认已停稳
+        print("---- [重捕获] 续追中途目标回到中心 → 应立即停 ----")
+        gimbal_send(250, 0, 250, "track")
+        time.sleep_ms(100)
+        _c0 = time.ticks_ms()
+        while time.ticks_diff(time.ticks_ms(), _c0) < M_COAST_MS // 2:
+            gimbal_send(0, 0, 0, "lost")
+            time.sleep_ms(20)
+        gimbal_send(0, 0, 0, "track")              # 目标回到画面中心(死区内) → 停转, 同时复位预判
+        time.sleep_ms(100)
+        _c0 = time.ticks_ms()
+        while time.ticks_diff(time.ticks_ms(), _c0) < 1000:
+            gimbal_send(0, 0, 0, "lost")           # 继续丢靶: 若复位失效, 这里会暴露(继续转/打印 COAST stop)
+            time.sleep_ms(20)
+        print("  验证点: 上一步后云台应保持静止, 且无 COAST start/stop 打印")
+        print(">>> COAST TEST done (Ctrl+C 退出)")
+        while True:
+            time.sleep_ms(1000)
+
 # 电机测试模式优先执行(不跑视觉)
 if MOTOR_ENABLED and mv.get("test_mode", False) and _yaw:
     import time as _t
@@ -1001,33 +1039,6 @@ if PITCH_ENABLED and pm.get("test_mode", False) and _pitch:
     while True:
         _pitch.set_speed(_dirn, _rpm)     # 持续重发, 防止丢帧后停住
         _t.sleep_ms(500)
-
-# 丢靶预判自检(不跑视觉): 模拟左右两侧丢靶 + 中途重捕获, 单独验证续追行为
-if MOTOR_ENABLED and mv.get("coast_test", False) and _yaw:
-    M_COAST_EN = True    # 测试模式强制启用预判(不受 coast_enabled 影响)
-    print(">>> COAST TEST (丢靶预判自检, 不跑视觉; Ctrl+C 退出)")
-    print("  预期: 每侧丢靶后 yaw 朝该侧续转约 %dms 再停; 中途'重捕获'应立即停" % M_COAST_MS)
-    for _side, _dx in (("右", 250), ("左", -250)):
-        print("---- [%s] 丢靶续追 (最后偏差 dx=%+d) ----" % (_side, _dx))
-        gimbal_send(_dx, 0, _dx, "track")      # 模拟"最后看到目标"的一帧
-        time.sleep_ms(100)
-        _c0 = time.ticks_ms()
-        while time.ticks_diff(time.ticks_ms(), _c0) < M_COAST_MS + 1200:
-            gimbal_send(0, 0, 0, "lost")       # 连续丢靶 → 观察 COAST start / COAST stop 打印
-            time.sleep_ms(20)
-        time.sleep_ms(1200)                    # 停顿, 确认已停稳
-    print("---- [重捕获] 续追中途目标回到中心 → 应立即停(且无 COAST stop 打印) ----")
-    gimbal_send(250, 0, 250, "track")
-    time.sleep_ms(100)
-    _c0 = time.ticks_ms()
-    while time.ticks_diff(time.ticks_ms(), _c0) < M_COAST_MS // 2:
-        gimbal_send(0, 0, 0, "lost")
-        time.sleep_ms(20)
-    gimbal_send(0, 0, 0, "track")              # 目标回到画面中心(死区内) → 停转
-    time.sleep_ms(1000)
-    print(">>> COAST TEST done (Ctrl+C 退出)")
-    while True:
-        time.sleep_ms(1000)
 
 if MODE == "yolo":
     if _yolo_ok():

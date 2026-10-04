@@ -156,7 +156,8 @@ cp model.kmodel /sdcard/model/
 期间重新捕获立即恢复常规追踪，超时则停。
 
 单独验证：`[motor].coast_test` 置 `true` 上机跑——不跑视觉，自动模拟左右两侧丢靶 + 中途重捕获，观察云台续追方向/时长/停止
-（串口打印 `COAST start` / `COAST stop`）；验证满意后把 `coast_enabled` 改 `true` 正式启用。
+（串口打印 `COAST start` / `COAST stop`；与 `test_mode` 不要同时开，同开时 `coast_test` 先执行）；
+验证满意后把 `coast_enabled` 改 `true` 正式启用。
 `coast_enabled=false`（默认）即「丢靶即停」，不影响日常追踪。
 
 ### 4.2 上下轴 (pitch) —— 速度模式（与 yaw 相同逻辑）

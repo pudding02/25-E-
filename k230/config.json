@@ -158,7 +158,7 @@
     "coast_ms": 800,
     "_coast_ms": "预判持续时长(ms); 到点未重新捕获目标则停转。目标走得快可试 1000~1500, 怕乱转可降到 500",
     "coast_test": false,
-    "_coast_test": "true=不跑视觉, 专测丢靶预判: 自动模拟左右两侧丢靶+中途重捕获, 观察 yaw 续追方向/时长/停止(串口打印 COAST start/stop)"
+    "_coast_test": "true=不跑视觉, 专测丢靶预判: 自动模拟左右两侧丢靶+中途重捕获, 观察 yaw 续追方向/时长/停止(串口打印 COAST start/stop)。不要与 motor/pitch_motor 的 test_mode 同时开(本项先执行)"
   },
 
   "pitch_motor": {
@@ -188,8 +188,8 @@
     "acc": 200,
     "_acc": "加减速档位 0~255, 越大加速越快(0≈最慢, 255≈最急)。追得发飘/滞后就调大; 起步顿挫就调小",
 
-    "min_rpm": 10,
-    "max_rpm": 60,
+    "min_rpm": 3,
+    "max_rpm": 30,
     "_rpm": "转速区间(RPM)。|dy|≤deadband_px → 停转; 之后从 min_rpm 线性升到 max_rpm; |dy|≥dy_full_px 时达 max_rpm。整体想更快就调大这两个; min_rpm 太小会『哼着不转』(步进低速扭矩小)",
 
     "dy_full_px": 200,

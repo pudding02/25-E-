@@ -14,6 +14,9 @@
 
 运行: python tools/test_coast_logic.py
 说明: 纯主机侧运行, 不需要 K230 硬件; 不依赖任何第三方库(stdlib only)。
+      覆盖边界: 本测试只覆盖 coast_step 纯函数(状态迁移与边界);
+      gimbal_send 的集成面(门控/rpm 映射/方向/重捕获复位)与实机行为
+      不在主机测试范围内, 由上机跑 config [motor].coast_test 自检覆盖。
 """
 import ast
 import os
