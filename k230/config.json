@@ -40,7 +40,10 @@
     "_说明": "屏幕中心像素坐标 = 追踪目标点。分辨率改变时必须同步改, 否则云台会稳定停偏",
     "x": 320,
     "y": 240,
-    "_取值": "一般 = sensor_width/2, sensor_height/2"
+    "_取值": "一般 = sensor_width/2, sensor_height/2",
+    "laser_offset_x": 0,
+    "laser_offset_y": 0,
+    "_laser_offset": "激光点相对画面中心的像素偏移(激光在右为正/在下为正); 与光轴同轴则保持 0 (瞄准计算统一叠加)"
   },
 
   "rectangle": {
@@ -151,7 +154,7 @@
     "reverse": true,
     "_reverse": "转向和偏差方向相反时改 true(方向反了只改这一个)",
 
-    "coast_enabled": false,
+    "coast_enabled": true,
     "_coast_enabled": "丢靶预判开关。默认 false=追踪保持原版行为(丢靶立即停), 不影响日常追踪; 单独验证(见 coast_test)满意后再改 true 启用",
     "coast_edge_px": 160,
     "_coast_edge_px": "预判触发门槛: 丢失时最后偏差 |dx| ≥ 此值才启动(即目标最后在画面两侧)。默认160≈画面两侧各1/4区域; 调小=更易触发",
@@ -200,6 +203,28 @@
 
     "reverse": false,
     "_reverse": "转向和偏差方向相反时改 true(方向反了只改这一个)"
+  },
+
+  "red_target": {
+    "_说明": "红色标记检测（与矩形检测同帧联合进行）: 中心红点(瞄准用) + 外围红环(画圈用)",
+    "red_low":  [130, 0, 0],
+    "red_high": [255, 120, 120],
+    "_red": "红色掩膜 RGB 范围; 激光光斑过曝偏白时会偏离此范围, 现场按实际调",
+    "dot_min_area": 9,
+    "dot_max_area": 2500,
+    "_dot_area": "红点候选面积范围(px²); 若激光光斑被误捕为红点, 将 dot_min_area 调到大于光斑面积可排除",
+    "dot_standalone": true,
+    "_dot_standalone": "无矩形时单独红点是否可作追踪目标(优先度第三档); 现场受干扰可置 false 一键降级",
+    "ring_min_diam_px": 40,
+    "ring_max_diam_px": 900,
+    "ring_max_aspect": 1.6,
+    "hollow_sample_pct": 50,
+    "hollow_max_hits": 2,
+    "_ring": "红环: 外接边长/宽高比范围 + 空心验证(50% 外径半径处 8 点采样, 红命中 <=2 判为空心环)",
+    "roi_margin_px": 12,
+    "_roi_margin": "检出矩形时红色检测 ROI 外扩量(px); 未检出矩形时红色检测跑全帧",
+    "radius_bias_px": 0,
+    "_radius_bias": "画圈目标半径修正(px): 让光斑踩在环线中心"
   },
 
   "debug": {

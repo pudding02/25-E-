@@ -164,6 +164,25 @@ MOTOR_ENABLED = mv.get("enabled", False)
 pm = _get(CFG, "pitch_motor", {})           # [pitch_motor] 段 → pitch
 PITCH_ENABLED = pm.get("enabled", False)
 
+# ---- V7 红色目标(红点/红环)检测 ----
+rt = _get(CFG, "red_target", {})
+RED_LOW  = tuple(rt.get("red_low", [130, 0, 0]))
+RED_HIGH = tuple(rt.get("red_high", [255, 120, 120]))
+DOT_MIN_AREA = rt.get("dot_min_area", 9)
+DOT_MAX_AREA = rt.get("dot_max_area", 2500)
+DOT_STANDALONE = rt.get("dot_standalone", True)
+RING_MIN_DIAM = rt.get("ring_min_diam_px", 40)
+RING_MAX_DIAM = rt.get("ring_max_diam_px", 900)
+RING_MAX_ASPECT = rt.get("ring_max_aspect", 1.6)
+HOLLOW_SAMPLE_PCT = rt.get("hollow_sample_pct", 50)
+HOLLOW_MAX_HITS = rt.get("hollow_max_hits", 2)
+ROI_MARGIN_PX = rt.get("roi_margin_px", 12)
+RADIUS_BIAS = rt.get("radius_bias_px", 0)
+
+# ---- V7 激光偏移(激光点相对画面中心; 与光轴同轴则 0) ----
+LOX = CENTER_CFG.get("laser_offset_x", 0)
+LOY = CENTER_CFG.get("laser_offset_y", 0)
+
 # ============================================================================
 # 三、Emm42_V5.0 闭环步进驱动 —— yaw / pitch(均为速度模式)
 #    协议来自 云台/Emm_V5.0步进闭环驱动说明书Rev1.3.pdf
@@ -772,6 +791,128 @@ def draw_box(frame_np, box):
     cv2.line(frame_np, (cx, cy - 14), (cx, cy + 14), (255, 255, 0), 2)
     cv2.circle(frame_np, (cx, cy), 4, (0, 0, 255), 1)
     return cx, cy, dx, dy
+
+
+# ---- V7 红色目标检测(与矩形检测同帧联合进行) ----
+
+def _ring_geom_mec(cnt, x, y, bw, bh):
+    """红环几何: 优先最小包围圆(cv2.minEnclosingCircle 可用时); 异常时兜底"""
+    try:
+        c, r = cv2.minEnclosingCircle(cnt)
+        return int(c[0]), int(c[1]), int(r)
+    except Exception:
+        return x + bw // 2, y + bh // 2, (bw + bh) // 4
+
+def _ring_geom_bbox(cnt, x, y, bw, bh):
+    """红环几何兜底: 外接框中心 + (w+h)//4 作半径"""
+    return x + bw // 2, y + bh // 2, (bw + bh) // 4
+
+_RING_GEOM = _ring_geom_mec if hasattr(cv2, "minEnclosingCircle") else _ring_geom_bbox
+
+def _count_red_at(mask, sx, sy, mw, mh):
+    """3x3 窗口内是否有红色像素(sx/sy 已 clamp 在 mask 范围内)"""
+    x0 = sx - 1 if sx > 0 else 0
+    y0 = sy - 1 if sy > 0 else 0
+    x1 = sx + 2 if sx + 2 <= mw else mw
+    y1 = sy + 2 if sy + 2 <= mh else mh
+    return cv2.countNonZero(mask[y0:y1, x0:x1]) > 0
+
+def _hollow_hits(mask, cx, cy, sr, mw, mh):
+    """空心验证采样: 以 (cx,cy) 为心、半径 sr 的 8 个 45° 方向点, 返回红色命中数"""
+    hits = 0
+    for k in range(8):
+        rad = k * 0.7853981634      # k * 45° 的弧度
+        sx = cx + int(sr * math.cos(rad))
+        sy = cy + int(sr * math.sin(rad))
+        if sx < 0:
+            sx = 0
+        elif sx >= mw:
+            sx = mw - 1
+        if sy < 0:
+            sy = 0
+        elif sy >= mh:
+            sy = mh - 1
+        if _count_red_at(mask, sx, sy, mw, mh):
+            hits += 1
+    return hits
+
+def find_red_targets(frame_np, box):
+    """联合检测的红色侧: 找红点(瞄准用)与红环(画圈用), 返回 (dot, ring)。
+
+    box 有效 -> 红色在矩形外扩 ROI_MARGIN_PX 的区域内找(省算力);
+    box 无效 -> 全帧找(保证"单独红点/红环"可见)。无则对应为 None。
+    dot=(cx,cy) 选取: 有矩形取"离矩形中心最近", 无矩形取"离画面中心最近";
+    ring=(cx,cy,r) 选取: 有矩形优先"环心在矩形内"(point_in_quad), 否则取半径最大者。
+    """
+    mw = SENSOR_W
+    mh = SENSOR_H
+    if box:
+        xs = [p[0] for p in box]
+        ys = [p[1] for p in box]
+        ox = min(xs) - ROI_MARGIN_PX
+        oy = min(ys) - ROI_MARGIN_PX
+        ex = max(xs) + ROI_MARGIN_PX
+        ey = max(ys) + ROI_MARGIN_PX
+        if ox < 0: ox = 0
+        if oy < 0: oy = 0
+        if ex > mw: ex = mw
+        if ey > mh: ey = mh
+    else:
+        ox = 0
+        oy = 0
+        ex = mw
+        ey = mh
+    rw = ex - ox
+    rh = ey - oy
+    if rw < 8 or rh < 8:
+        return None, None
+    mask = cv2.inRange(frame_np[oy:ey, ox:ex], RED_LOW, RED_HIGH)
+    contours = get_contours(cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE))
+    dots = []
+    rings = []
+    for cnt in contours:
+        x, y, bw, bh = cv2.boundingRect(cnt)
+        if bw <= 0 or bh <= 0:
+            continue
+        mx = bw if bw > bh else bh
+        sr = (mx // 2) * HOLLOW_SAMPLE_PCT // 100
+        cx = x + bw // 2
+        cy = y + bh // 2
+        hits = _hollow_hits(mask, cx, cy, sr, rw, rh) if sr > 0 else 0
+        kind = classify_blob(bw, bh, cv2.contourArea(cnt), hits)
+        if kind == "dot":
+            dots.append((cx + ox, cy + oy))
+        elif kind == "ring":
+            rx, ry, rr = _RING_GEOM(cnt, x, y, bw, bh)
+            rings.append((rx + ox, ry + oy, rr))
+    # ---- 红点选取: 有矩形取离矩形中心最近; 无矩形取离画面中心最近 ----
+    dot = None
+    if dots:
+        if box:
+            ref = quad_center(box)
+        else:
+            ref = (CENTER_X, CENTER_Y)
+        best = -1
+        for cand in dots:
+            ddx = cand[0] - ref[0]
+            ddy = cand[1] - ref[1]
+            dd = ddx * ddx + ddy * ddy
+            if best < 0 or dd < best:
+                best = dd
+                dot = cand
+    # ---- 红环选取: 有矩形优先环心在矩形内; 否则取半径最大者 ----
+    ring = None
+    if rings:
+        if box:
+            for cand in rings:
+                if point_in_quad(cand[0], cand[1], box):
+                    if ring is None or cand[2] > ring[2]:
+                        ring = cand
+        if ring is None:
+            for cand in rings:
+                if ring is None or cand[2] > ring[2]:
+                    ring = cand
+    return dot, ring
 
 
 # ============================================================================
