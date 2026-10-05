@@ -183,6 +183,26 @@ RADIUS_BIAS = rt.get("radius_bias_px", 0)
 LOX = CENTER_CFG.get("laser_offset_x", 0)
 LOY = CENTER_CFG.get("laser_offset_y", 0)
 
+# ---- V7 上电搜索 ----
+srch = _get(CFG, "search", {})
+SEARCH_EN = srch.get("enabled", True)
+SEARCH_RPM = srch.get("rpm", 12)
+SEARCH_DIR = srch.get("direction", 1)
+SEARCH_MAX_MS = srch.get("max_ms", 0)
+
+# ---- V7 画圈 ----
+cc = _get(CFG, "circle", {})
+CIRC_SPEED = cc.get("speed_deg_s", 60)
+CIRC_DIR = cc.get("direction", 1)
+CIRC_PAUSE = cc.get("pause_px", 120)
+
+# ---- V7 模式引脚(GPIO49: 被供电=画圈) ----
+mp = _get(CFG, "mode_pin", {})
+PIN_ENABLED = mp.get("enabled", True)
+PIN_GPIO = mp.get("gpio", 49)
+PIN_ACTIVE = mp.get("active_level", 1)
+PIN_DEBOUNCE = mp.get("debounce_n", 5)
+
 # ============================================================================
 # 三、Emm42_V5.0 闭环步进驱动 —— yaw / pitch(均为速度模式)
 #    协议来自 云台/Emm_V5.0步进闭环驱动说明书Rev1.3.pdf
@@ -385,12 +405,19 @@ class EmmStepper:
 
 _yaw = None        # yaw 轴: EmmStepper 实例(速度模式)
 _pitch = None      # pitch 轴: EmmStepper 实例(速度模式)
+_mode_pin = None   # 模式引脚(GPIO49): 被供电=画圈; machine.Pin 实例(未启用/初始化失败=None)
 _gimbal_ok = False # gimbal_send 是否已就绪(执行器初始化成功)——自检脚本用它防"静默假通过"
 
 # 丢靶预判(coast)状态 —— 由 gimbal_send 维护(见 coast_step)
 _last_dx = 0           # 最后一次追踪的 yaw 偏差(带符号); 丢靶期间保留, 供预判参考
 _coast_active = False  # 是否正在丢靶预判中
 _coast_start = 0       # 预判启动时刻(time.ticks_ms())
+
+# 上电搜索状态 —— 由 gimbal_send 维护(见 search_step)
+_acquired = False      # 启动后是否已捕获过目标; 一旦置位, 上电搜索永久退出
+_search_spin = False   # 是否正在搜索旋转
+_search_start = 0      # 搜索启动时刻(time.ticks_ms())
+_search_done = False   # 搜索超时后不再重启
 
 
 def coast_step(now_ms, active, start_ms, last_dx, edge_px, coast_ms):
@@ -561,7 +588,7 @@ try:
 
         dx, dy : 目标中心相对屏幕中心的像素偏差(右偏/下偏为正)
         dist   : 偏差欧氏距离(本实现未用到, 仅为接口完整保留)
-        status : "track"=追踪中 / "lost"=丢靶
+        status : "track"=追踪中 / "lost"=丢靶 / "search"=上电搜索(yaw 匀速找靶)
 
         丢靶预判(coast): 丢靶且最后偏差 |_last_dx| >= coast_edge_px 时,
         不立即停, 而是朝最后方向续转 coast_ms 毫秒(无目标追踪)去找目标;
@@ -569,7 +596,31 @@ try:
         pitch 轴不参与预判(丢靶即停, 与旧行为一致)。
         """
         global _last_dx, _coast_active, _coast_start
+        global _acquired, _search_spin, _search_start, _search_done
         try:
+            if status == "search":
+                # 上电搜索(仅"启动后未捕获过目标"期间由 run_cv 调用): yaw 单方向匀速, pitch 停
+                if _yaw:
+                    if _search_done:
+                        _yaw.stop()                     # 超时后不再重启
+                    else:
+                        _prev_spin = _search_spin
+                        _smode, _search_spin, _search_start = search_step(
+                            time.ticks_ms(), _search_spin, _search_start,
+                            SEARCH_EN, False, SEARCH_MAX_MS)
+                        if _smode == "spin":
+                            if not _prev_spin:
+                                print("SEARCH start")
+                            _yaw.set_speed(SEARCH_DIR, SEARCH_RPM)
+                        elif _smode == "timeout":
+                            _search_done = True
+                            print("SEARCH stop (timeout)")
+                            _yaw.stop()
+                        else:                               # idle: 未启用
+                            _yaw.stop()
+                if _pitch:
+                    _pitch.stop()
+                return
             if status == "lost":
                 if _yaw and M_COAST_EN:
                     mode, _coast_active, _coast_start, _last_dx = coast_step(
@@ -593,9 +644,10 @@ try:
                     _pitch.stop()                  # 丢靶: pitch 一律停转
                 return
 
-            # ---- 追踪中: 记录最后偏差(供丢靶预判), 并复位预判状态 ----
+            # ---- 追踪中: 记录最后偏差(供丢靶预判), 复位预判状态, 标记已捕获 ----
             _last_dx = dx
             _coast_active = False
+            _acquired = True     # 上电搜索: 一旦追踪过目标, 永久退出搜索
 
             # ---- yaw: |dx| 线性映射到转速, 符号定方向, 死区内停 ----
             if _yaw:
@@ -633,6 +685,28 @@ try:
             "Y" if P_REV < 0 else "N",
             (" online %dmV" % _v) if _v else " (no resp)")
     print("actuator: yaw=%s | pitch=%s" % (_yaw_info, _pitch_info))
+
+    # ---------------- V7 模式引脚(GPIO49): 被供电=画圈, 其余=仅追踪 ----------------
+    if PIN_ENABLED and PIN_GPIO > 0:
+        try:
+            from machine import Pin, FPIOA
+            _fpio = FPIOA()
+            _fn = getattr(FPIOA, "GPIO%d" % PIN_GPIO, None)
+            if _fn is None:
+                raise ValueError("FPIOA.GPIO%d not found" % PIN_GPIO)
+            try:
+                _fpio.set_function(PIN_GPIO, _fn, ie=1, oe=0)
+            except TypeError:
+                _fpio.set_function(PIN_GPIO, _fn)
+            _mode_pin = Pin(PIN_GPIO, Pin.IN)
+            _pv = _mode_pin.value()
+            _pa = ((_pv != 0) if PIN_ACTIVE == 1 else (_pv == 0))
+            print("mode pin: GPIO%d level=%d -> %s" % (PIN_GPIO, _pv,
+                  "画圈" if _pa else "仅追踪"))
+        except Exception as e:
+            print("WARN: mode pin init failed: %s -> 永久仅追踪" % e)
+            _mode_pin = None
+
     _gimbal_ok = True    # 执行器就绪: gimbal_send 为真实实现(供 coast_test 等自检判断)
 
 except Exception as e:
@@ -943,6 +1017,12 @@ def run_cv():
     sensor = None
     frame_id = lost_count = 0
     last_box = None
+    last_dot = last_ring = None      # 红色检测帧间复用
+    _circle_on = False               # 画圈模式(模式引脚去抖后)
+    _pin_streak = 0
+    _theta = None                    # 画圈 θ(None=未起始; 见环时按当前方位角起转)
+    _theta_tick = time.ticks_ms()    # θ 推进的帧间计时基准
+    last_dist = 0.0                  # 上帧瞄准偏差(画圈误差门控用)
     fps = fps_count = 0
     fps_tick = time.ticks_ms()
 
@@ -974,32 +1054,83 @@ def run_cv():
             frame = sensor.snapshot(chn=CAM_CHN_ID_0)
             frame_np = frame.to_numpy_ref()
 
-            # 检测
+            # ---- V7 模式引脚采样 + 去抖: 被供电=画圈, 其余=仅追踪 ----------------
+            if _mode_pin is not None:
+                _raw = _mode_pin.value()
+                _raw_on = ((_raw != 0) if PIN_ACTIVE == 1 else (_raw == 0))
+                _prev_on = _circle_on
+                _circle_on, _pin_streak = mode_pin_step(_circle_on, _pin_streak,
+                                                        _raw_on, PIN_DEBOUNCE)
+                if _circle_on != _prev_on:
+                    _theta = None                    # 进出画圈沿重置起始角
+                    print("MODE->%s" % ("circle" if _circle_on else "track"))
+
+            # ---- 检测(每检测帧): 矩形 + 红色 联合 ----------------
             if frame_id % DETECT_EVERY == 0 or not last_box:
                 box, contour_count, area_count = find_paper_box(frame_np, last_box)
+                dot, ring = find_red_targets(frame_np, box)
             else:
-                box, contour_count, area_count = last_box, 0, 0
+                box, dot, ring = last_box, last_dot, last_ring
 
-            if box:
-                last_box = box
+            # ---- 目标选择: 画圈(环优先) > 三档级联 ----------------
+            now2 = time.ticks_ms()
+            dtm = time.ticks_diff(now2, _theta_tick)
+            _theta_tick = now2
+            kind, tx, ty = "none", 0, 0
+            if _circle_on and ring is not None:
+                rcx, rcy, rr = ring
+                if box is not None:
+                    draw_box(frame_np, box)          # 仅绘制(目标=环上点)
+                if _theta is None:
+                    _theta = math.degrees(math.atan2(CENTER_Y - rcy, CENTER_X - rcx)) % 360.0
+                _theta = circle_theta_step(_theta, CIRC_SPEED, dtm, CIRC_DIR, last_dist, CIRC_PAUSE)
+                tx, ty = circle_target_point(rcx, rcy, rr + RADIUS_BIAS, _theta)
+                kind = "ring"
+            else:
+                rcx = rcy = 0
+                if box is not None:
+                    rcx, rcy, _dcx, _dcy = draw_box(frame_np, box)   # 画框 + 矩形中心
+                inside = (box is not None and dot is not None
+                          and point_in_quad(dot[0], dot[1], box))
+                dot_eff = dot if (dot is not None and (DOT_STANDALONE or box is not None)) else None
+                kind, tx, ty = select_target(
+                    box is not None, rcx, rcy,
+                    dot_eff is not None,
+                    dot_eff[0] if dot_eff is not None else 0,
+                    dot_eff[1] if dot_eff is not None else 0,
+                    inside)
+
+            # ---- 执行(保持既有 gimbal_send track 语义) ----------------
+            if kind != "none":
                 lost_count = 0
-                cx, cy, dx, dy = draw_box(frame_np, box)
+                if box is not None:
+                    last_box = box
+                last_dot, last_ring = dot, ring
+                dx, dy = tx - CENTER_X - LOX, ty - CENTER_Y - LOY
                 dist = math.sqrt(dx * dx + dy * dy)
+                last_dist = dist
                 gimbal_send(int(dx), int(dy), dist, "track")
+                # OSD: 红点/红环/最终瞄准点 标记 + 目标源文字
+                if SHOW_OSD:
+                    if dot is not None:
+                        cv2.circle(frame_np, dot, 6, (255, 0, 255), 1)
+                    if ring is not None:
+                        cv2.circle(frame_np, (ring[0], ring[1]), ring[2], (255, 128, 0), 1)
+                    cv2.circle(frame_np, (tx, ty), 4, (0, 255, 255), 1)
+                    cv2.putText(frame_np, "[%s] dx:%+d dy:%+d" % (kind, dx, dy),
+                                (4, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
                 if frame_id % PRINT_EVERY == 0:
-                    print("OK  center=(%d,%d)  d=(%d,%d)  dist=%.0f" % (cx, cy, dx, dy, dist))
+                    print("OK [%s] d=(%d,%d) dist=%.0f" % (kind, dx, dy, dist))
             else:
                 lost_count += 1
                 if lost_count > 2:
                     last_box = None
-                    gimbal_send(0, 0, 0, "lost")
+                    if SEARCH_EN and not _acquired:
+                        gimbal_send(0, 0, 0, "search")   # 上电搜索: 未捕获期 yaw 匀速旋转找靶
+                    else:
+                        gimbal_send(0, 0, 0, "lost")
                     if frame_id % PRINT_EVERY == 0:
                         print("LOST")
-
-            # OSD
-            if SHOW_OSD and box:
-                cv2.putText(frame_np, "dx:%+d dy:%+d" % (dx, dy),
-                            (4, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
             # FPS
             fps_count += 1
