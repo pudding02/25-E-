@@ -11,6 +11,10 @@ Drone-competition rectangle-target tracking system (电赛E题). A K230-CanMV bo
   (A position-mode path exists in `EmmStepper` — `move`/`clear_position`/`home` — but is NOT
   wired into the control flow: driver ② failed with it on hardware. Both axes are now the
   same speed-mode logic.)
+- **V7 features** — joint rect+red detection (target priority: dot-in-rect > rect > lone dot),
+  ring-circling mode gated by GPIO49/Pin3 (powered = circle), and boot search (yaw spins
+  single-direction until first acquisition). All params live in `k230/config.json`
+  (`[red_target]` / `[search]` / `[circle]` / `[mode_pin]`).
 
 (The original MaixCam + STM32F407 relay architecture is retired — there is no `stm32/` directory and no `fs_servo.py`; all code is single-file in `k230/main.py`.)
 
@@ -20,7 +24,7 @@ Drone-competition rectangle-target tracking system (电赛E题). A K230-CanMV bo
 K230-CanMV (vision + gimbal control)
     MIPI CSI camera (GC2093)     UART3 → Emm42 driver ① → 42 stepper   [yaw · speed mode]
     LCD ST7701 800×480           UART2 → Emm42 driver ② → 42 stepper   [pitch · speed mode]
-    Optional laser GPIO
+    Optional laser GPIO          GPIO49 (Pin3) mode jumper: 3.3V = circle mode, GND = track-only
 ```
 
 Visual→actuator interface: `gimbal_send(dx, dy, dist, status)` inside `k230/main.py` (section 四).
@@ -37,7 +41,9 @@ Visual→actuator interface: `gimbal_send(dx, dy, dist, status)` inside `k230/ma
 ├── skill/               # methodology docs (reference only, not runtime)
 └── tools/
     ├── calibrate_laser.py      # laser/optical offset calibration
-    └── test_emm_protocol.py    # host-side frame test (AST-extracts EmmStepper from main.py)
+    ├── test_emm_protocol.py    # host-side frame test (AST-extracts EmmStepper from main.py)
+    ├── test_coast_logic.py     # coast state-machine test (AST-extracts coast_step)
+    └── test_circle_logic.py    # V7 pure-function tests (priority/circle/search/pin)
 ```
 
 ## Critical performance constraints (MicroPython on K230)
@@ -68,7 +74,7 @@ fdx, fdy = kf_update(dx, dy)  # works identically whether Kalman is on or off
 
 ## Config system
 
-- `k230/config.json` is the **only tuning surface**. Sections: detection, camera, display, center, rectangle, yolo, motor (yaw), pitch_motor (pitch), debug.
+- `k230/config.json` is the **only tuning surface**. Sections: detection, camera, display, center, rectangle, yolo, motor (yaw), pitch_motor (pitch), red_target, search, circle, mode_pin, debug.
 - The config loader strips keys starting with `_`, so comments can be embedded as `"_说明": "..."`.
 - Values are read at import time into module-level globals; restart `main.py` after edits.
 
@@ -88,10 +94,13 @@ fdx, fdy = kf_update(dx, dy)  # works identically whether Kalman is on or off
 
 ## Testing
 
-- **Host-side (no hardware)**: `python tools/test_emm_protocol.py` — AST-extracts `EMM_CHECKSUM`
-  and `class EmmStepper` from `k230/main.py`, runs them against stub `machine`/`time`, and
-  asserts emitted frame bytes equal the manufacturer manual example frames. Always run after
-  touching protocol code.
+- **Host-side (no hardware)**: three stdlib-only scripts, all AST-extract from `k230/main.py`:
+  - `python tools/test_emm_protocol.py` — frame bytes vs manual examples (12 cases). Always run
+    after touching protocol code.
+  - `python tools/test_coast_logic.py` — coast (lost-target pre-judgment) state machine (10 cases).
+  - `python tools/test_circle_logic.py` — V7 pure functions (33 cases): `select_target` 3-tier
+    priority, quad containment, blob classify, circle geometry, search & pin-debounce machines.
+    Threshold constants are extracted from main.py itself — a missing definition is a hard error.
 - **Hardware**: `motor.test_mode` / `pitch_motor.test_mode` in config.json perform power-on
   self-checks (online probe + continuous rotation) without running vision. `main.py` also
   self-reports at boot: the `actuator:` line (both axes + online voltage).

@@ -107,11 +107,15 @@ cp model.kmodel /sdcard/model/
 | 段 | 作用 |
 |---|---|
 | `detection` | 检测模式（cv / yolo）与跳帧 |
-| `camera` / `display` / `center` | 摄像头分辨率、LCD、追踪中心点 |
+| `camera` / `display` / `center` | 摄像头分辨率、LCD、追踪中心点（含激光偏移 `laser_offset_x/y`）|
 | `rectangle` | CV 矩形检测阈值（现场光照变化主要调这里）|
 | `yolo` | KPU 模型路径 / labels / input_size（见第四节规则）|
 | `motor` | **yaw 轴**：Emm42 速度模式（RPM 区间 / 死区 / 方向 / 使能）|
 | `pitch_motor` | **pitch 轴**：Emm42 速度模式（与 yaw 同构：min_rpm/max_rpm/dy_full_px/死区/方向）|
+| `red_target` | **红色标记检测**（与矩形检测同帧联合进行）：红点（瞄准）＋红环（画圈）的掩膜/面积/直径阈值、`dot_standalone` 安全阀 |
+| `search` | **上电搜索**：未捕获目标时 yaw 单方向匀速旋转找靶（enabled/rpm/direction/max_ms）|
+| `circle` | **画圈运动**：沿红环匀速转圈的角速度/方向/误差门控（speed_deg_s/direction/pause_px）|
+| `mode_pin` | **画圈模式引脚**（GPIO49/Pin3）：被供电=画圈、其余=仅追踪（enabled/gpio/active_level/debounce_n）|
 | `debug` | 打印与 GC 节奏 |
 
 ## 三、检测模式（CV / YOLO）
@@ -179,6 +183,30 @@ cp model.kmodel /sdcard/model/
 | 丢靶后乱转/干扰追踪 | `coast_enabled` 保持/置 false（回「丢靶即停」）；或调小 `coast_ms` |
 | 跟踪不平滑 | 增大检测端滤波/跳帧参数 |
 
+### 4.4 联合检测与三档目标优先度（V7）
+
+矩形检测与红色检测**每检测帧联合进行**；追踪目标按三档优先度选取（`select_target` 纯函数）：
+
+| 优先度 | 场景 | 瞄准点 | 串口目标源 |
+|---|---|---|---|
+| 1 | 矩形中有红点（红点落在矩形内） | **红点** | `OK [red+rect]` |
+| 2 | 仅矩形（红点未检出） | **矩形中心** | `OK [rect]` |
+| 3 | 仅红点（矩形未检出，`dot_standalone=true`） | **红点** | `OK [red]` |
+
+三档全无 → 丢靶逻辑（coast/停）；上电未捕获期 → 自动搜索（见 4.6）。
+
+### 4.5 画圈模式（GPIO49 被供电）
+
+- 画圈模式下红环可见 → 光斑沿红环**连续匀速画圆**（`circle.speed_deg_s` 角速度、`direction` 方向；光斑离目标点超过 `pause_px` 时暂停 θ 推进等伺服追上）。
+- 红环暂不可见 → 保持三档瞄准、**θ 冻结**（不乱转不丢靶），环恢复即续圈。
+- 引脚接法：**三脚跳线**（中间=GPIO49/Pin3，两侧=3.3V/Pin1 与 GND）：拨 3.3V=画圈、拨 GND=仅追踪；**悬空不可信**（I2C0 引脚板载上拉情况以实测为准）。上电串口打印 `mode pin: GPIO49 level=..` 供核对。
+
+### 4.6 上电搜索
+
+- 开机后**未捕获过任何目标**时，yaw 按 `search.rpm` 单方向匀速旋转找靶；捕获任一档目标即停并转入追踪。
+- 一旦捕获过目标（发出过 track），搜索**永久退出**——后续丢靶行为与原来一致（coast/停），不会被搜索干扰。
+- `search.max_ms=0` 表示一直找到为止；>0 为搜索上限（超时停转，不再重启）。
+
 ## 五、激光标定
 
 ```bash
@@ -196,11 +224,14 @@ python tools/calibrate_laser.py
 ## 六、主机侧自检（不接硬件）
 
 ```bash
-python tools/test_emm_protocol.py
+python tools/test_emm_protocol.py    # 协议帧对拍（12 用例）
+python tools/test_coast_logic.py     # 丢靶预判状态机（10 用例）
+python tools/test_circle_logic.py    # V7 纯函数：三档优先度/画圈几何/搜索/引脚去抖（33 用例）
 ```
 
-从 `k230/main.py` 提取 EmmStepper 驱动，对拍说明书例帧（使能/速度/位置/清零等），
-防止字节序/字段序写错。改动协议相关代码后先跑这个，再上机。
+三套均为 stdlib 独立脚本，从 `k230/main.py` AST 提取目标函数/常量后断言（不需要硬件、不需要 pytest）。
+改动协议层先跑第一套；改动视觉/控制逻辑先跑后两套；再上机。
+（`test_circle_logic.py` 的阈值常量直接取 main.py 定义，若 main.py 漏定义会直接报错。）
 
 ## 七、现场部署检查清单
 
@@ -212,7 +243,10 @@ python tools/test_emm_protocol.py
 - [ ] 摄像头画面正常
 - [ ] 先单轴 `test_mode` 自检（yaw 持续旋转 / pitch 往返±角度），再跑视觉追踪
 - [ ] 方向核对：发正 dx → yaw 向减小偏差方向转；正 dy → pitch 同理
-- [ ] 激光偏移量已标定（如使用激光）
+- [ ] 激光偏移量已标定（如使用激光；`center.laser_offset_x/y`）
+- [ ] 画圈跳线接好：GPIO49(Pin3) 三脚跳线，拨 3.3V / GND 两态可用；上电核对 `mode pin:` 电平打印
+- [ ] 红色阈值现场核对：摆全靶应打印 `OK [red+rect]`；遮红点 → `OK [rect]`；遮矩形只露红点 → `OK [red]`
+- [ ] 不摆靶开机 → yaw 匀速搜索；放靶 1~2 秒内停转进入追踪
 - [ ] 准备备用 SD 卡（预烧录系统+代码）
 
 ## 八、故障排查
@@ -229,6 +263,12 @@ python tools/test_emm_protocol.py
 | K230 画面卡 | 增大 `debug.gc_every`，降低检测分辨率 |
 | YOLO模式报错 | 确认 kmodel 路径正确、KPU 库已安装 |
 | YOLO不出框 | ① `input_size` ② `labels` 顺序 ③ `task` 配对 ④ 是否拍到训练过的物体 |
+| 红点检不到（一直 `[rect]`） | 现场调 `red_target.red_low/high`（光照/过曝影响红色掩膜）；检查 `dot_min_area/dot_max_area` 是否把红点尺寸排除 |
+| 激光光斑被误捕为红点 | 把 `dot_min_area` 调到大于光斑面积；或 `dot_standalone` 置 false（只认矩形相关目标）|
+| 画圈不转圈（环不见了） | 属预期退化：θ 冻结保持瞄准；查 `ring_min_diam_px/ring_max_diam_px` 与环的实际像素尺寸、红色阈值 |
+| 画圈方向反了 | `circle.direction` 取反（1/-1）|
+| 开机不搜索 | 确认 `search.enabled=true` 且开机后从未捕获过目标；已捕获过则永不搜索（设计如此）|
+| 引脚切换不生效 | 核对 `mode_pin.gpio/active_level`；看启动 `mode pin:` 打印与实际跳线电平；悬空电平不可信，务必接 3.3V 或 GND |
 | UART报 tx not configured | 检查 config 中 `tx_pin`/`rx_pin` 与 FPIOA 映射 |
 
 > 串口类问题的完整排障顺序（OLED 状态 → 共地 → 回环测试 → 引脚实测）见 `接线图.md` 第六节。
