@@ -10,8 +10,11 @@
   - search_step           上电搜索状态机(未捕获->spin, 已捕获->idle, 超时->timeout)
   - mode_pin_step         模式引脚去抖(连续 N 次一致才切换)
 
-原理: 从 k230/main.py 中用 AST 提取上述函数源码, 在 stub 环境里执行(math +
-stub time + 阈值常量), 逐条断言行为与边界。
+原理: 从 k230/main.py 中用 AST 提取上述函数源码, 连同它们引用的模块级阈值常量
+(_get / 配置段变量 / RING_MIN_DIAM 等) 一并从 main.py 源码中提取, 在 stub 环境里
+执行(math + stub time + CFG={}), 逐条断言行为与边界。
+      阈值常量一律取自 main.py 本身(测试不注入任何值), 因此 main.py 若漏定义常量
+      (classify_blob 生产会 NameError), 这里会直接报错而非虚假绿灯。
 
 运行: python tools/test_circle_logic.py
 说明: 纯主机侧运行, 不需要 K230 硬件; 不依赖任何第三方库(stdlib only)。
@@ -32,6 +35,17 @@ _FUNC_NAMES = (
     "circle_target_point", "circle_theta_step", "search_step", "mode_pin_step",
 )
 
+# classify_blob 引用的模块级阈值常量 —— 必须由 main.py 定义; 本测试**不注入**其取值,
+# 而是从 main.py 源码里提取执行, 缺任何一个都会在此暴露(classify_blob 生产会 NameError)。
+_CONST_NAMES = (
+    "RING_MIN_DIAM", "RING_MAX_DIAM", "RING_MAX_ASPECT",
+    "HOLLOW_MAX_HITS", "DOT_MIN_AREA", "DOT_MAX_AREA",
+)
+# 上述常量取值依赖的模块级名字(也一律从 main.py 提取, 测试不自造值):
+#   _get = 配置取值 helper;  rt = [red_target] 配置段变量
+_PREAMBLE_FUNCS = ("_get",)
+_PREAMBLE_VARS = ("rt",)
+
 
 def _extract_func(src, name):
     """返回顶层函数源码; 找不到时抛 AssertionError"""
@@ -40,6 +54,17 @@ def _extract_func(src, name):
         if isinstance(node, ast.FunctionDef) and node.name == name:
             return ast.get_source_segment(src, node)
     raise AssertionError("k230/main.py 中未找到函数 %s" % name)
+
+
+def _extract_assign(src, name):
+    """返回顶层 `name = ...` 赋值源码; 找不到时抛 AssertionError"""
+    tree = ast.parse(src)
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name) and tgt.id == name:
+                    return ast.get_source_segment(src, node)
+    raise AssertionError("k230/main.py 中未找到模块级赋值 %s = ..." % name)
 
 
 class _FakeTime(types.ModuleType):
@@ -53,20 +78,39 @@ class _FakeTime(types.ModuleType):
 
 
 def load_funcs():
-    """加载并返回 main.py 里的 7 个纯函数"""
+    """加载并返回 main.py 里的 7 个纯函数。
+
+    阈值常量与配置段变量一律从 main.py 源码中提取执行 —— 测试不硬注入任何取值,
+    因此 main.py 若漏定义 classify_blob 引用的常量(生产会 NameError), 这里会直接
+    报错暴露, 而不是靠注入掩盖。
+    """
     with open(_MAIN_PY, encoding="utf-8") as f:
         src = f.read()
     env = {
         "math": math,
         "time": _FakeTime(),
-        # classify_blob 引用的阈值常量(与 config.json [red_target] 默认一致)
-        "RING_MIN_DIAM": 40,
-        "RING_MAX_DIAM": 900,
-        "RING_MAX_ASPECT": 1.6,
-        "HOLLOW_MAX_HITS": 2,
-        "DOT_MIN_AREA": 9,
-        "DOT_MAX_AREA": 2500,
+        "CFG": {},          # 主机侧无 config.json: 常量取 main.py 内默认值
     }
+    # 1) 常量取值依赖的 helper / 配置段变量(同样只从 main.py 取, 缺席即留给第 2 步报错)
+    for fname in _PREAMBLE_FUNCS:
+        exec(_extract_func(src, fname), env)
+    for vname in _PREAMBLE_VARS:
+        try:
+            exec(_extract_assign(src, vname), env)
+        except AssertionError:
+            pass
+    # 2) classify_blob 引用的阈值常量(缺任一个即报错)
+    missing_const = []
+    for cname in _CONST_NAMES:
+        try:
+            exec(_extract_assign(src, cname), env)
+        except AssertionError:
+            missing_const.append(cname)
+    if missing_const:
+        raise AssertionError(
+            "k230/main.py 缺少模块级常量: %s (classify_blob 引用但未定义 → 生产会 NameError)"
+            % ", ".join(missing_const))
+    # 3) 纯函数
     fns = {}
     missing = []
     for name in _FUNC_NAMES:
@@ -239,6 +283,29 @@ class TestModePinStep(unittest.TestCase):
 
     def test_stable_keeps_value(self):
         self.assertEqual(F("mode_pin_step")(True, 0, True, 3), (True, 0))
+
+
+class TestModuleThresholdConstants(unittest.TestCase):
+    """回归守门: classify_blob 引用的阈值常量必须在 main.py 中真实定义。
+
+    原缺陷: classify_blob 引用 6 个未定义的模块级常量 → 生产调用即 NameError;
+    旧测试把这 6 个值硬注入 exec 环境, 结构性掩盖了该缺陷。本用例直接断言
+    main.py 的模块级赋值里确实出现这些名字(与上面 TestClassifyBlob 的行为断言互补)。
+    """
+
+    def test_constants_defined_in_main(self):
+        with open(_MAIN_PY, encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+        defined = set()
+        for node in tree.body:
+            if isinstance(node, ast.Assign):
+                for tgt in node.targets:
+                    if isinstance(tgt, ast.Name):
+                        defined.add(tgt.id)
+        missing = [n for n in _CONST_NAMES if n not in defined]
+        self.assertEqual(
+            missing, [],
+            "k230/main.py 未定义 classify_blob 引用的模块级常量: %s" % missing)
 
 
 if __name__ == "__main__":
