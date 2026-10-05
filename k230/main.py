@@ -393,6 +393,103 @@ def coast_step(now_ms, active, start_ms, last_dx, edge_px, coast_ms):
     return ("stop", False, 0, 0)
 
 
+# ============================================================================
+# 四点五、V7 视觉纯函数(主机可测) —— 目标选择/画圈几何/上电搜索/引脚去抖
+#   tools/test_circle_logic.py 抓取本节函数做主机侧测试(与 coast_step 同模式)
+# ============================================================================
+
+def select_target(has_rect, rcx, rcy, has_dot, dcx, dcy, dot_inside):
+    """目标选择三档优先度(纯函数): 矩形中有红点 > 矩形 > 红点。
+
+    返回 (kind, tx, ty); kind: "red+rect" / "rect" / "red" / "none"。
+    dot_inside 由调用方用 point_in_quad(dot, box) 计算(仅 has_rect and has_dot 时有意义)。
+    """
+    if has_rect and has_dot and dot_inside:
+        return "red+rect", dcx, dcy      # 优先1: 矩形中的红点 -> 瞄准红点
+    if has_rect:
+        return "rect", rcx, rcy          # 优先2: 单独矩形 -> 瞄准矩形中心
+    if has_dot:
+        return "red", dcx, dcy           # 优先3: 单独红点 -> 瞄准红点
+    return "none", 0, 0                  # 全无 -> 走丢靶/搜索分支
+
+def point_in_quad(px, py, quad):
+    """凸四边形包含判定(纯函数; 叉积同号法)。
+
+    quad = order_points 输出序的 4 点 [TL, TR, BR, BL]; 点恰在边上视为在内。
+    """
+    sign = 0
+    for i in range(4):
+        x1, y1 = quad[i]
+        x2, y2 = quad[(i + 1) % 4]
+        cross = (x2 - x1) * (py - y1) - (y2 - y1) * (px - x1)
+        if cross != 0:
+            s = 1 if cross > 0 else -1
+            if sign == 0:
+                sign = s
+            elif sign != s:
+                return False
+    return True
+
+def classify_blob(w, h, area, hollow_hits):
+    """红色块分流(纯函数): 大尺寸近方且空心 -> "ring"; 小面积 -> "dot"; 其余 -> None。
+
+    hollow_hits: 50% 外径半径处 8 点采样的红色命中数(由 find_red_targets 计算);
+    阈值取自 config [red_target] 段。
+    """
+    mx = w if w > h else h
+    mn = h if w > h else w
+    if (mn > 0 and RING_MIN_DIAM <= mx <= RING_MAX_DIAM
+            and mx <= mn * RING_MAX_ASPECT and hollow_hits <= HOLLOW_MAX_HITS):
+        return "ring"
+    if DOT_MIN_AREA <= area <= DOT_MAX_AREA and mx < RING_MIN_DIAM:
+        return "dot"
+    return None
+
+def circle_target_point(cx, cy, r, theta_deg):
+    """画圈目标点(纯函数): 环心 + 半径在 θ 处的像素坐标。
+
+    图像坐标 x 右 y 下; θ=0 指向 +x, θ 增大为视觉顺时针。
+    """
+    rad = math.radians(theta_deg)
+    return int(round(cx + r * math.cos(rad))), int(round(cy + r * math.sin(rad)))
+
+def circle_theta_step(theta_deg, deg_s, dt_ms, direction, err_px, pause_px):
+    """画圈 θ 推进(纯函数): 误差门控 + 方向 + 360° 环绕。
+
+    误差 > pause_px 或 dt<=0 时冻结不推进(等伺服追上); 返回 [0, 360) 区间。
+    """
+    if err_px > pause_px or dt_ms <= 0:
+        return theta_deg
+    return (theta_deg + direction * deg_s * dt_ms / 1000.0) % 360.0
+
+def search_step(now_ms, searching, start_ms, enabled, acquired, max_ms):
+    """上电搜索状态机(纯函数)。返回 (mode, searching, start_ms):
+      "idle"    = 未启用 或 已捕获(不再进入搜索)
+      "spin"    = 旋转中: 首次启动(记录 now_ms) / 续转(保持原 start_ms)
+      "timeout" = max_ms>0 且已到点 -> 停转(不重启由调用方置 done 保证)
+    max_ms=0 表示一直找, 不超时。
+    """
+    if not enabled or acquired:
+        return "idle", False, 0
+    if not searching:
+        return "spin", True, now_ms
+    if max_ms > 0 and time.ticks_diff(now_ms, start_ms) >= max_ms:
+        return "timeout", False, 0
+    return "spin", True, start_ms
+
+def mode_pin_step(cur_active, cur_streak, raw_active, need):
+    """模式引脚去抖(纯函数): 连续 need 次采样一致才切换; 中途弹回则计数清零。
+
+    返回 (active, streak)。raw_active 的有效电平换算在调用方完成。
+    """
+    if raw_active == cur_active:
+        return cur_active, 0
+    cur_streak += 1
+    if cur_streak >= need:
+        return raw_active, 0
+    return cur_active, cur_streak
+
+
 try:
     # ---------------- pitch 上下轴: Emm42 闭环步进(UART2, 速度模式, 与 yaw 同逻辑) ----------------
     if PITCH_ENABLED:
