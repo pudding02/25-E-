@@ -30,6 +30,10 @@ K230-CanMV (vision + gimbal control)
 
 Visual→actuator interface: `gimbal_send(dx, dy, dist, status)` inside `k230/main.py` (section 四).
 
+Camera capture: onboard GC2093 sits on **CSI2** — `Sensor(id=CSI_ID, …)` reads `camera.csi_id: 2`
+from config; probe resolution is 16:9 (1280×720). Do NOT drop the id or use a 4:3 probe — the
+old `Sensor(width=1280, height=960)` form caused a view-offset (画面偏左) regression.
+
 ## Repository structure
 
 ```
@@ -44,7 +48,8 @@ Visual→actuator interface: `gimbal_send(dx, dy, dist, status)` inside `k230/ma
     ├── calibrate_laser.py      # laser/optical offset calibration
     ├── test_emm_protocol.py    # host-side frame test (AST-extracts EmmStepper from main.py)
     ├── test_coast_logic.py     # coast state-machine test (AST-extracts coast_step)
-    └── test_circle_logic.py    # V7 pure-function tests (priority/circle/search/pin)
+    ├── test_circle_logic.py    # V7 pure-function tests (priority/circle/search/pin)
+    └── test_camera_init.py     # capture guard: CSI id=2 + 16:9 probe (view-offset regression)
 ```
 
 ## Critical performance constraints (MicroPython on K230)
@@ -95,13 +100,16 @@ fdx, fdy = kf_update(dx, dy)  # works identically whether Kalman is on or off
 
 ## Testing
 
-- **Host-side (no hardware)**: three stdlib-only scripts, all AST-extract from `k230/main.py`:
+- **Host-side (no hardware)**: four stdlib-only scripts, all static-check `k230/main.py`
+  (test_camera_init also reads `k230/config.json`):
   - `python tools/test_emm_protocol.py` — frame bytes vs manual examples (12 cases). Always run
     after touching protocol code.
   - `python tools/test_coast_logic.py` — coast (lost-target pre-judgment) state machine (10 cases).
   - `python tools/test_circle_logic.py` — V7 pure functions (29 cases): quad containment, ring
     blob classify, circle geometry, search & pin-debounce machines. Threshold constants are
     extracted from main.py itself — a missing definition is a hard error.
+  - `python tools/test_camera_init.py` — capture guard (5 cases): explicit `id=CSI_ID`, 16:9 probe
+    (1280×720), `CSI_ID` defined in main.py, `camera.csi_id=2` in config.
 - **Hardware**: `motor.test_mode` / `pitch_motor.test_mode` in config.json perform power-on
   self-checks (online probe + continuous rotation) without running vision. `main.py` also
   self-reports at boot: the `actuator:` line (both axes + online voltage).

@@ -107,7 +107,7 @@ cp model.kmodel /sdcard/model/
 | 段 | 作用 |
 |---|---|
 | `detection` | 检测模式（cv / yolo）与跳帧 |
-| `camera` / `display` / `center` | 摄像头分辨率、LCD、追踪中心点（含激光偏移 `laser_offset_x/y`）|
+| `camera` / `display` / `center` | CSI 端口（`csi_id`）与摄像头分辨率、LCD、追踪中心点（含激光偏移 `laser_offset_x/y`）|
 | `rectangle` | CV 矩形检测阈值（现场光照变化主要调这里）|
 | `yolo` | KPU 模型路径 / labels / input_size（见第四节规则）|
 | `motor` | **yaw 轴**：Emm42 速度模式（RPM 区间 / 死区 / 方向 / 使能）|
@@ -253,6 +253,7 @@ python tools/test_circle_logic.py    # V7 纯函数：红环分流/画圈几何/
 | 问题 | 排查 |
 |------|------|
 | 检测不到矩形 | 降低 `rectangle.min_area`，放宽 `white_low`（CV 模式仅支持黑底白矩形）|
+| 画面视野偏移（偏左/偏右）| 先核查 `camera.csi_id`（GC2093 在 CSI2，须为 2）；采集提示分辨率须为 16:9（1280×720），勿用 4:3 提示（旧 1280×960 曾致偏移）|
 | 误检太多 | 提高 `rectangle.min_area`，收窄 `min_aspect/max_aspect` |
 | 帧率低 | 启用 `detect_resolution.enabled: true`（如配置），降低分辨率到 320×240 |
 | 某轴电机不动 | 先看 `actuator:` 行是否 `online`；`(no resp)` → 按 `接线图.md` 第六节排障（共地/交叉/预置/回环）|

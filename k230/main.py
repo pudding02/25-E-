@@ -107,6 +107,7 @@ CFG = _load_json(["/sdcard/config.json", "config.json"])
 # ============================================================================
 
 # ---- 摄像头 ----
+CSI_ID    = _get(_get(CFG, "camera", {}), "csi_id", 2)   # CSI 端口(庐山派 GC2093=2; 画面视野偏移先查此项)
 SENSOR_W  = _get(_get(CFG, "camera", {}), "sensor_width", 640)
 SENSOR_H  = _get(_get(CFG, "camera", {}), "sensor_height", 480)
 FPS       = _get(_get(CFG, "camera", {}), "fps", 90)
@@ -990,7 +991,9 @@ def run_cv():
     try:
         print("boot")
         os.exitpoint(os.EXITPOINT_ENABLE)
-        sensor = Sensor(width=1280, height=960, fps=FPS)
+        # 采集端对齐官方例程(rgb888_find_circles_1.py): 显式 CSI 端口 + 1280x720@90(16:9) 模式提示。
+        # 旧写法(无 id + 1280x960)实测画面视野偏移, 官方例程同板对照正常 —— 勿回退。
+        sensor = Sensor(id=CSI_ID, width=1280, height=720, fps=FPS)
         sensor.reset()
         sensor.set_framesize(width=SENSOR_W, height=SENSOR_H, chn=CAM_CHN_ID_0)
         sensor.set_pixformat(Sensor.RGB888, chn=CAM_CHN_ID_0)
