@@ -9,7 +9,12 @@
          全幅最大视野）; crop=True 保留作防呆。
   V7.7f: 1:1 显示致画面观感变小（用户: "不是把屏幕缩小, 是让摄像头照出更多"）→ scale_view:
          显示前将采集帧等比放大满屏（640x360→800x450 满宽, 上下各 15px）, 视野不变、占屏最大。
-  事实: 庐山派板载 GC2093 挂在 CSI2; 支持 1280x960@90 与 1280x720@90 两种模式。
+  V7.7f~g: scale_view 显示放大（cv2.resize 与 image.draw_image 画布两条路线）实机花屏/卡死。
+  V7.7h: 显示放大整体废弃 —— 探针 v2~v8 实机结论: 软件缩放、大尺寸输出(800x450/768x432)、
+         bind_layer 直通全部花屏或卡死; config_layer 会使 sensor.run 卡死。回归唯一验证
+         可靠的组合: 640x360 输出 + 1:1 帧直显(show_image)。视野仍全幅, 画面四周黑边。
+  事实: 庐山派板载 GC2093 挂在 CSI2; 支持 1280x960@90 与 1280x720@90 两种模式;
+        显示放大的可行上限 = 硬件硬边界(勿再尝试, 见 TestNoDeadDisplayPaths 守门)。
 
 本测试（AST 静态检查 + config 读值 + 纯函数提取, stdlib only, 不需要 K230 硬件）:
   1. main.py 的 Sensor(...) 构造必须显式传 id=(不得依赖固件默认端口);
@@ -18,8 +23,9 @@
   4. main.py 顶层必须定义 CSI_ID(缺定义则 Sensor(id=CSI_ID) 生产会 NameError);
   5. config.json 的 camera.csi_id 必须存在且为 2(配置与代码一致);
   6. config 几何链: 输出宽高比 = 16:9(全幅视野) / center=输出尺寸一半 / 1:1 偏移居中;
-  7. view_geom 纯函数行为（scale 开 = 等比放大先满宽; 关 = 1:1 居中）;
-  8. config display.scale_view=true（画面填屏: 保持"照出更多"的同时显示不缩小）。
+  7. main.py 不得引入已实机验证死亡的显示路径（cv2.resize / draw_image / image.Image /
+     bind_layer / config_layer —— 花屏或 sensor.run 卡死, 见 TestNoDeadDisplayPaths）;
+  8. 显示为 1:1 帧直显: config x/y_offset 居中（画面 640x360 居中, 四周黑边）。
 若确需变更这些值: 先理解画面几何影响（实机观察方向/比例/视野/占屏）, 再同步修改本测试
 —— 不要静默改掉守门。
 
@@ -65,19 +71,6 @@ def _framesize_kwargs():
             calls.append(node)
     assert len(calls) == 1, "k230/main.py 应恰好有 1 处 set_framesize(...), 实际 %d 处" % len(calls)
     return {k.arg: k.value for k in calls[0].keywords}
-
-
-def _load_view_geom():
-    """提取并执行 main.py 的 view_geom 纯函数（无外部依赖）"""
-    with open(_MAIN_PY, encoding="utf-8") as f:
-        src = f.read()
-    tree = ast.parse(src)
-    for node in tree.body:
-        if isinstance(node, ast.FunctionDef) and node.name == "view_geom":
-            env = {}
-            exec(ast.get_source_segment(src, node), env)
-            return env["view_geom"]
-    raise AssertionError("k230/main.py 中未找到函数 view_geom")
 
 
 class TestCameraInit(unittest.TestCase):
@@ -189,29 +182,23 @@ class TestCameraConfigChain(unittest.TestCase):
             disp.get("x_offset"), want,
             "画面水平居中: x_offset 须 = (lcd_width - sensor_width)/2")
 
-    def test_scale_view_enabled(self):
-        disp = self._cfg().get("display", {})
-        self.assertIs(
-            disp.get("scale_view"), True,
-            "display.scale_view 应为 true: 采集帧等比放大填屏(照出更多的同时显示不缩小)")
 
+class TestNoDeadDisplayPaths(unittest.TestCase):
+    """防回归: 实机验证'死亡'的显示放大/直通路径 —— main.py 不得再引入。
 
-class TestViewGeom(unittest.TestCase):
-    """显示视图几何（纯函数 view_geom）:
-    scale 开 = 等比放大（先满宽, 放不下则满高）; 关 = 1:1 居中。"""
+    v2~v8 实机结论: cv2.resize / image.draw_image / image.Image 画布 /
+    bind_layer+config_layer 路线, 在板上全部花屏或卡死; 唯一可靠显示 =
+    采集帧 1:1 帧直显(Display.show_image(frame, ...))。一旦回归, 实机即故障。
+    """
 
-    def test_scale_on_16x9(self):
-        self.assertEqual(_load_view_geom()(True, 800, 480, 640, 360), (800, 450, 0, 15))
-
-    def test_scale_on_wide_frame_falls_back_to_fit_height(self):
-        # 4:3 帧满宽会超高(500>480) → 退化为满高适配
-        self.assertEqual(_load_view_geom()(True, 800, 480, 640, 400), (768, 480, 16, 0))
-
-    def test_scale_off_centers_1to1(self):
-        self.assertEqual(_load_view_geom()(False, 800, 480, 640, 360), (640, 360, 80, 60))
-
-    def test_scale_on_1280_source(self):
-        self.assertEqual(_load_view_geom()(True, 800, 480, 1280, 720), (800, 450, 0, 15))
+    def test_no_software_scale_paths(self):
+        with open(_MAIN_PY, encoding="utf-8") as f:
+            src = f.read()
+        for bad in ("cv2.resize", "draw_image", "image.Image",
+                    "bind_layer", "config_layer"):
+            self.assertNotIn(
+                bad, src,
+                "k230/main.py 含 %r —— 该显示路径实机不可用(花屏/卡死), 勿回退" % bad)
 
 
 if __name__ == "__main__":

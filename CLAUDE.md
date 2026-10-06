@@ -36,8 +36,9 @@ Visual→actuator interface: `gimbal_send(dx, dy, dist, status)` inside `k230/ma
 Camera capture: onboard GC2093 on **CSI2** — `Sensor(id=CSI_ID, …)` + `camera.csi_id: 2`. Chain:
 **1280×720 probe** (1280×960 → view offset 偏左) → **640×360 output** (same 16:9 as probe = full
 FOV; a 4:3 output crops to the central 75% and looks zoomed-in) → **`crop=True`** (stretch safety)
-→ **explicit id**. Display: `scale_view` upscales the frame to 800×450 (full width, 15px
-letterbox) so the wider FOV doesn't shrink on screen; `x/y_offset` apply only in 1:1 mode.
+→ **explicit id**. Display: 1:1 frame pass-through (`show_image(frame, x/y_offset)`; `x/y_offset`
+default to centering). Software upscaling was disproven on hardware (garble/hang) — never
+reintroduce (guarded by `TestNoDeadDisplayPaths`).
 
 ## Repository structure
 
@@ -114,9 +115,10 @@ fdx, fdy = kf_update(dx, dy)  # works identically whether Kalman is on or off
   - `python tools/test_circle_logic.py` — V7 pure functions (29 cases): quad containment, ring
     blob classify, circle geometry, search & pin-debounce machines. Threshold constants are
     extracted from main.py itself — a missing definition is a hard error.
-  - `python tools/test_camera_init.py` — capture guard (15 cases): explicit `id=CSI_ID`, 1280×720
+  - `python tools/test_camera_init.py` — capture guard: explicit `id=CSI_ID`, 1280×720
     probe + `crop=True`, `CSI_ID` defined; config chain: `csi_id=2`, 16:9 output, offsets;
-    `view_geom` pure function + `scale_view=true` (display upscale).
+    dead-display-path guard (`cv2.resize` / `draw_image` / `image.Image` / `bind_layer` /
+    `config_layer`).
   - `python tools/test_center_calib.py` — touch calibration (32 cases): button hit test, touch
     state machine (wake edge / repeat / no-bounce on hide), config text save (exactly 2 lines).
 - **Hardware**: `motor.test_mode` / `pitch_motor.test_mode` in config.json perform power-on

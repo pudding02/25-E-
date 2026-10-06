@@ -107,7 +107,7 @@ cp model.kmodel /sdcard/model/
 | 段 | 作用 |
 |---|---|
 | `detection` | 检测模式（cv / yolo）与跳帧 |
-| `camera` / `display` / `center` | CSI 端口（`csi_id`）、输出分辨率（16:9 全幅）、显示放大（`scale_view`）与偏移、追踪中心点（含激光偏移 `laser_offset_x/y`）|
+| `camera` / `display` / `center` | CSI 端口（`csi_id`）、输出分辨率（16:9 全幅）、显示偏移、追踪中心点（含激光偏移 `laser_offset_x/y`）|
 | `center_calib` | **触屏中心校准**：屏幕上触摸按钮移动绿色校准点（=追踪收敛点，即 `center.laser_offset`）；`●` 隐藏 / `S` 保存写回 |
 | `rectangle` | CV 矩形检测阈值（现场光照变化主要调这里）|
 | `yolo` | KPU 模型路径 / labels / input_size（见第四节规则）|
@@ -276,8 +276,8 @@ python tools/test_center_calib.py    # V7.7 触屏校准：按钮命中/触摸�
 | 检测不到矩形 | 降低 `rectangle.min_area`，放宽 `white_low`（CV 模式仅支持黑底白矩形）|
 | 画面视野偏移（偏左/偏右）| 核查 `camera.csi_id`（须为 2）与采集提示 1280×720；**勿用 1280×960**（实测该模式视野偏左）|
 | 画面横向被压缩（比例不对）| 输出须与 720 提示同为 16:9（640×360）；`set_framesize` 的 `crop=True` 为兜底（输出若被改成 4:3 会自动居中裁切而非拉伸）|
-| 画面放大太多（视野窄）| 输出须为 640×360（与 720 提示同 16:9）＝全幅视野；别改输出比例来调视野，显示大小交给 `scale_view` |
-| 画面显小/黑边大 | `display.scale_view` 应为 true（采集帧等比放大填屏 800×450）；false=1:1 显示(640×360 带黑边) |
+| 画面放大太多（视野窄）| 输出须为 640×360（与 720 提示同 16:9）＝全幅视野；显示大小由输出尺寸决定，改比例会改变视野 |
+| 画面显小/黑边大 | 正常现象：显示为 1:1 帧直显（640×360 居中，四周黑边）。软件放大已被实机证伪（花屏/卡死），勿再引入 |
 | 触屏校准按键无反应 | 查 6P 触摸排线；看串口 `calib: touch ...` 行（触摸异常会自动禁用，不影响追踪）；确认 `center_calib.enabled=true` |
 | 触屏绿点移动方向不对 | `center_calib.touch_rotate` 从 -1 改 0/1/2/3 逐个试（触摸坐标旋转）|
 | 误检太多 | 提高 `rectangle.min_area`，收窄 `min_aspect/max_aspect` |

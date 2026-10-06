@@ -31,11 +31,9 @@
     "lcd_height": 480,
     "show_osd": true,
     "_show_osd": "画面上叠加 dx/dy 和 FPS 文字, 调试时开, 比赛时可关省算力",
-    "scale_view": true,
-    "_scale_view": "true=采集帧等比放大填屏显示(640x360→800x450 满宽, 上下各 15px): 视野最大且占屏最大; false=1:1 原尺寸显示(仅此时用 x/y_offset)",
     "x_offset": 80,
     "y_offset": 60,
-    "_offset": "1:1 显示(scale_view=false)时画面在 LCD 上的偏移; scale_view=true 时自动居中, 此值不生效",
+    "_offset": "画面在 LCD 上的偏移(缺省自动居中); 显示为 1:1 原尺寸直显(无软件放大)",
     "to_ide": false,
     "_to_ide": "true=把画面同时推到 CanMV IDE(调试用, 会拖慢帧率)"
   },
