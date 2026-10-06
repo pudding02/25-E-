@@ -16,11 +16,11 @@
   },
 
   "camera": {
-    "_说明": "摄像头输出分辨率。改这里必须同步改 [center] 的 x/y, 否则追踪中心会偏",
+    "_说明": "摄像头输出分辨率。须与 1280x720 提示同为 16:9(640x360 = 全幅最大视野; 4:3 会触发 crop 只取中央 75%, 观感放大)。改这里必须同步改 [center] 的 x/y, 否则追踪中心会偏",
     "csi_id": 2,
     "_csi_id": "CSI 端口: 庐山派板载 GC2093 在 CSI2(官方例程一致)。缺省会依赖固件默认值, 采集视野偏移(画面偏左)时先核查此项",
     "sensor_width": 640,
-    "sensor_height": 480,
+    "sensor_height": 360,
     "fps": 90,
     "_fps": "摄像头帧率上限; 相机初始化失败时可先降到 30 试"
   },
@@ -32,8 +32,8 @@
     "show_osd": true,
     "_show_osd": "画面上叠加 dx/dy 和 FPS 文字, 调试时开, 比赛时可关省算力",
     "x_offset": 80,
-    "y_offset": 0,
-    "_offset": "画面在 LCD 上的偏移(640 宽的图居中显示到 800 宽的屏 → x_offset=80)",
+    "y_offset": 60,
+    "_offset": "画面在 LCD 上的偏移(640x360 的图居中到 800x480 的屏 → x_offset=80, y_offset=60)",
     "to_ide": false,
     "_to_ide": "true=把画面同时推到 CanMV IDE(调试用, 会拖慢帧率)"
   },
@@ -41,7 +41,7 @@
   "center": {
     "_说明": "屏幕中心像素坐标 = 追踪目标点。分辨率改变时必须同步改, 否则云台会稳定停偏",
     "x": 320,
-    "y": 240,
+    "y": 180,
     "_取值": "一般 = sensor_width/2, sensor_height/2",
     "laser_offset_x": 0,
     "laser_offset_y": 0,

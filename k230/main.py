@@ -1171,9 +1171,9 @@ def run_cv():
     try:
         print("boot")
         os.exitpoint(os.EXITPOINT_ENABLE)
-        # 采集端: 显式 CSI 端口 + 1280x720@90(16:9) 模式提示 + crop 居中裁切。
-        # (实测迭代: 1280x960 视野偏左; 1280x720 无裁切则 16:9→4:3 非等比缩放致横向压缩。
-        #  720 + crop=True 同时保证方向与比例 —— 三者勿回退)
+        # 采集端: 显式 CSI 端口 + 1280x720@90(16:9) 模式提示 + crop 居中裁切(防呆)。
+        # (实测迭代: 1280x960 视野偏左; 720 配 4:3 输出无裁切会非等比横压, 裁 4:3 又只剩中央
+        #  75% 视野。定案 = 720 + 输出 640x360(16:9, 全幅最大视野) + crop=True 兜底 —— 勿回退)
         sensor = Sensor(id=CSI_ID, width=1280, height=720, fps=FPS)
         sensor.reset()
         sensor.set_framesize(width=SENSOR_W, height=SENSOR_H, crop=True, chn=CAM_CHN_ID_0)
