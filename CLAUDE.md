@@ -16,6 +16,9 @@ Drone-competition rectangle-target tracking system (电赛E题). A K230-CanMV bo
   detection feeds circle mode only), ring-circling gated by GPIO49/Pin3 (powered = circle),
   and boot search (yaw spins single-direction until first acquisition). All params live in
   `k230/config.json` (`[red_target]` / `[search]` / `[circle]` / `[mode_pin]`).
+- **Touchscreen center calibration (V7.7)** — on-screen green dot + 6 touch buttons (▲▼◀▶ move
+  the aim offset live, ● hides the UI, S saves `center.laser_offset_x/y` back to config.json);
+  touch failure auto-disables without affecting tracking. Params in `[center_calib]`.
 
 (The original MaixCam + STM32F407 relay architecture is retired — there is no `stm32/` directory and no `fs_servo.py`; all code is single-file in `k230/main.py`.)
 
@@ -49,7 +52,8 @@ old `Sensor(width=1280, height=960)` form caused a view-offset (画面偏左) re
     ├── test_emm_protocol.py    # host-side frame test (AST-extracts EmmStepper from main.py)
     ├── test_coast_logic.py     # coast state-machine test (AST-extracts coast_step)
     ├── test_circle_logic.py    # V7 pure-function tests (priority/circle/search/pin)
-    └── test_camera_init.py     # capture guard: CSI id=2 + 16:9 probe (view-offset regression)
+    ├── test_camera_init.py     # capture guard: CSI id=2 + 16:9 probe (view-offset regression)
+    └── test_center_calib.py    # touch-calibration: hit test / touch state machine / config save
 ```
 
 ## Critical performance constraints (MicroPython on K230)
@@ -80,7 +84,7 @@ fdx, fdy = kf_update(dx, dy)  # works identically whether Kalman is on or off
 
 ## Config system
 
-- `k230/config.json` is the **only tuning surface**. Sections: detection, camera, display, center, rectangle, yolo, motor (yaw), pitch_motor (pitch), red_target, search, circle, mode_pin, debug.
+- `k230/config.json` is the **only tuning surface**. Sections: detection, camera, display, center, center_calib, rectangle, yolo, motor (yaw), pitch_motor (pitch), red_target, search, circle, mode_pin, debug.
 - The config loader strips keys starting with `_`, so comments can be embedded as `"_说明": "..."`.
 - Values are read at import time into module-level globals; restart `main.py` after edits.
 
@@ -100,8 +104,8 @@ fdx, fdy = kf_update(dx, dy)  # works identically whether Kalman is on or off
 
 ## Testing
 
-- **Host-side (no hardware)**: four stdlib-only scripts, all static-check `k230/main.py`
-  (test_camera_init also reads `k230/config.json`):
+- **Host-side (no hardware)**: five stdlib-only scripts, all static-check `k230/main.py`
+  (some also read `k230/config.json`):
   - `python tools/test_emm_protocol.py` — frame bytes vs manual examples (12 cases). Always run
     after touching protocol code.
   - `python tools/test_coast_logic.py` — coast (lost-target pre-judgment) state machine (10 cases).
@@ -110,6 +114,8 @@ fdx, fdy = kf_update(dx, dy)  # works identically whether Kalman is on or off
     extracted from main.py itself — a missing definition is a hard error.
   - `python tools/test_camera_init.py` — capture guard (5 cases): explicit `id=CSI_ID`, 16:9 probe
     (1280×720), `CSI_ID` defined in main.py, `camera.csi_id=2` in config.
+  - `python tools/test_center_calib.py` — touch calibration (32 cases): button hit test, touch
+    state machine (wake edge / repeat / no-bounce on hide), config text save (exactly 2 lines).
 - **Hardware**: `motor.test_mode` / `pitch_motor.test_mode` in config.json perform power-on
   self-checks (online probe + continuous rotation) without running vision. `main.py` also
   self-reports at boot: the `actuator:` line (both axes + online voltage).

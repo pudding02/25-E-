@@ -9,7 +9,8 @@
   3. 测量激光点相对于画面中心的像素偏移:
      - 激光在中心右侧 → offset_x 为正值
      - 激光在中心下方 → offset_y 为正值
-  4. 将测量的 (offset_x, offset_y) 填入 k230/main.py 的 LASER_OFFSET_X/Y
+  4. 将测量的 (offset_x, offset_y) 填入 k230/config.json 的 center.laser_offset_x/y
+     （或直接用运行时的「触屏中心校准」现场调整: 画面触摸按钮 + S 保存）
 
 或者运行此脚本进行自动标定:
   python calibrate_laser.py --image calibration.jpg
@@ -50,9 +51,9 @@ def manual_calibrate():
     print("  LASER_OFFSET_X = %d" % ox)
     print("  LASER_OFFSET_Y = %d" % oy)
     print()
-    print("请将以上值填入 k230/main.py 的配置区:")
-    print("  LASER_OFFSET_X = %d" % ox)
-    print("  LASER_OFFSET_Y = %d" % oy)
+    print("请将以上值填入 k230/config.json 的 [center] 段:")
+    print("  \"laser_offset_x\": %d" % ox)
+    print("  \"laser_offset_y\": %d" % oy)
     print("=" * 50)
 
     return ox, oy

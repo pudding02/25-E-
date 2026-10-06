@@ -108,6 +108,7 @@ cp model.kmodel /sdcard/model/
 |---|---|
 | `detection` | 检测模式（cv / yolo）与跳帧 |
 | `camera` / `display` / `center` | CSI 端口（`csi_id`）与摄像头分辨率、LCD、追踪中心点（含激光偏移 `laser_offset_x/y`）|
+| `center_calib` | **触屏中心校准**：屏幕上触摸按钮移动绿色校准点（=追踪收敛点，即 `center.laser_offset`）；`●` 隐藏 / `S` 保存写回 |
 | `rectangle` | CV 矩形检测阈值（现场光照变化主要调这里）|
 | `yolo` | KPU 模型路径 / labels / input_size（见第四节规则）|
 | `motor` | **yaw 轴**：Emm42 速度模式（RPM 区间 / 死区 / 方向 / 使能）|
@@ -208,17 +209,35 @@ cp model.kmodel /sdcard/model/
 
 ## 五、激光标定
 
+激光与摄像头光轴不同轴时，标定 `center.laser_offset_x/y`（激光在画面中心右/下为正）。
+含义：把"追踪收敛点"偏移到激光实际落点处——追踪时目标停在这个点，激光即可命中。
+
+### 5.1 触屏现场标定（推荐，免电脑）
+
+运行 `main.py` 后画面四缘出现触摸按钮：
+
+| 按钮 | 位置 | 作用 |
+|---|---|---|
+| `▲ ▼` | 左缘 | 绿点（校准点）上 / 下移动 |
+| `◀ ▶` | 右缘 | 绿点左 / 右移动 |
+| `●` | 顶中 | 隐藏绿点+按钮（画面干净）；再触摸屏幕任意处唤出 |
+| `S` | 顶中 | 当前偏移写回 `config.json`（自动备份 `.bak`、写后校验）|
+
+单点一步 `step_px`（默认 4px），按住不放连发（间隔 `repeat_ms`）；绿点即时生效于追踪/画圈。
+操作：把靶标与激光同处画面，用按钮把绿点拖到"激光应命中的位置"，观察云台收敛，满意后按 `S`——
+串口打印 `calib: save OK saved (x,y)`，重启后仍生效。
+
+排障：按键无反应 → 查 6P 触摸排线、看串口 `calib: touch ...` 行（触摸异常自动禁用，不影响追踪主程序）；
+按 `▲` 绿点却往反方向走 → 把 `center_calib.touch_rotate` 从 -1 改 0/1/2/3 逐个试（坐标旋转）。
+
+### 5.2 主机侧辅助（可选）
+
 ```bash
 python tools/calibrate_laser.py
 ```
 
-将测量结果填入 `config.json`：
-```json
-"center": {
-  "laser_offset_x": 5,    // 激光在摄像头右侧为正
-  "laser_offset_y": -3    // 激光在摄像头下方为正
-}
-```
+旧方式：把靶标对准画面中心，测激光点相对中心的像素偏移，手填 `config.json` 的
+`center.laser_offset_x/y`（激光在右/下为正）。
 
 ## 六、主机侧自检（不接硬件）
 
@@ -226,10 +245,12 @@ python tools/calibrate_laser.py
 python tools/test_emm_protocol.py    # 协议帧对拍（12 用例）
 python tools/test_coast_logic.py     # 丢靶预判状态机（10 用例）
 python tools/test_circle_logic.py    # V7 纯函数：红环分流/画圈几何/搜索/引脚去抖（29 用例）
+python tools/test_camera_init.py     # 采集初始化守门：CSI id / 16:9 提示 / config 对账（5 用例）
+python tools/test_center_calib.py    # V7.7 触屏校准：按钮命中/触摸状态机/config 文本替换（32 用例）
 ```
 
-三套均为 stdlib 独立脚本，从 `k230/main.py` AST 提取目标函数/常量后断言（不需要硬件、不需要 pytest）。
-改动协议层先跑第一套；改动视觉/控制逻辑先跑后两套；再上机。
+五套均为 stdlib 独立脚本，从 `k230/main.py` AST 提取目标函数/常量后断言（不需要硬件、不需要 pytest）。
+改动协议层先跑第一套；改动视觉/控制/配置面先跑其余几套；再上机。
 （`test_circle_logic.py` 的阈值常量直接取 main.py 定义，若 main.py 漏定义会直接报错。）
 
 ## 七、现场部署检查清单
@@ -242,7 +263,7 @@ python tools/test_circle_logic.py    # V7 纯函数：红环分流/画圈几何/
 - [ ] 摄像头画面正常
 - [ ] 先单轴 `test_mode` 自检（yaw 持续旋转 / pitch 往返±角度），再跑视觉追踪
 - [ ] 方向核对：发正 dx → yaw 向减小偏差方向转；正 dy → pitch 同理
-- [ ] 激光偏移量已标定（如使用激光；`center.laser_offset_x/y`）
+- [ ] 激光偏移已标定：触屏 `▲▼◀▶` 调绿点、满意后按 `S` 保存（或手填 `center.laser_offset_x/y`）
 - [ ] 画圈跳线接好：GPIO49(Pin3) 三脚跳线，拨 3.3V / GND 两态可用；上电核对 `mode pin:` 电平打印
 - [ ] 红环阈值现场核对：画圈跳线拨 3.3V 后应打印 `OK [ring]` 并绕环转圈；追踪模式应打印 `OK [rect]`
 - [ ] 不摆靶开机 → yaw 匀速搜索；放靶 1~2 秒内停转进入追踪
@@ -254,6 +275,8 @@ python tools/test_circle_logic.py    # V7 纯函数：红环分流/画圈几何/
 |------|------|
 | 检测不到矩形 | 降低 `rectangle.min_area`，放宽 `white_low`（CV 模式仅支持黑底白矩形）|
 | 画面视野偏移（偏左/偏右）| 先核查 `camera.csi_id`（GC2093 在 CSI2，须为 2）；采集提示分辨率须为 16:9（1280×720），勿用 4:3 提示（旧 1280×960 曾致偏移）|
+| 触屏校准按键无反应 | 查 6P 触摸排线；看串口 `calib: touch ...` 行（触摸异常会自动禁用，不影响追踪）；确认 `center_calib.enabled=true` |
+| 触屏绿点移动方向不对 | `center_calib.touch_rotate` 从 -1 改 0/1/2/3 逐个试（触摸坐标旋转）|
 | 误检太多 | 提高 `rectangle.min_area`，收窄 `min_aspect/max_aspect` |
 | 帧率低 | 启用 `detect_resolution.enabled: true`（如配置），降低分辨率到 320×240 |
 | 某轴电机不动 | 先看 `actuator:` 行是否 `online`；`(no resp)` → 按 `接线图.md` 第六节排障（共地/交叉/预置/回环）|

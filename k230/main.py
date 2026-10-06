@@ -49,6 +49,7 @@ K230 物体追踪 — 双轴云台 (双步进)
    四  执行器初始化      gimbal_send(dx,dy,dist,status) —— 视觉与执行器之间的唯一接口
    五  CV 矩形检测       find_paper_box() 等
    六  YOLO 支持         _yolo_ok()
+   六点五 触屏中心校准    calib_* —— 触摸按键移动绿点(追踪收敛点)/保存写回 config
    七  CV 主循环         run_cv()
    八  YOLO 主循环       run_yolo()
    九  入口              test_mode 自检 → 按 mode 进对应主循环
@@ -72,8 +73,11 @@ except Exception:
 # 一、配置加载
 # ============================================================================
 
+CFG_PATH = None    # 实际命中的 config.json 路径(触屏校准「保存」回写用)
+
 def _load_json(paths):
     """从候选路径加载JSON, 跳过_开头的注释键"""
+    global CFG_PATH
     try:
         import ujson as j
     except ImportError:
@@ -91,6 +95,7 @@ def _load_json(paths):
                 else:
                     cfg[k] = v
             print("config: %s loaded" % p)
+            CFG_PATH = p
             return cfg
         except Exception:
             pass
@@ -177,9 +182,20 @@ HOLLOW_MAX_HITS = rt.get("hollow_max_hits", 2)
 ROI_MARGIN_PX = rt.get("roi_margin_px", 12)
 RADIUS_BIAS = rt.get("radius_bias_px", 0)
 
-# ---- V7 激光偏移(激光点相对画面中心; 与光轴同轴则 0) ----
+# ---- V7 激光偏移(激光点相对画面中心; 与光轴同轴则 0; 触屏校准运行时调整它) ----
 LOX = CENTER_CFG.get("laser_offset_x", 0)
 LOY = CENTER_CFG.get("laser_offset_y", 0)
+
+# ---- V7.7 触屏中心校准(绿点=追踪收敛点=CENTER+LOX/LOY; 「保存」写回 [center] 的 laser_offset) ----
+cb = _get(CFG, "center_calib", {})
+CALIB_ENABLED   = cb.get("enabled", True)
+CALIB_STEP      = cb.get("step_px", 4)          # 每按一次/每连发一拍移动的像素
+CALIB_REPEAT    = cb.get("repeat_ms", 120)      # 按住连发间隔(ms)
+CALIB_DOT_R     = cb.get("dot_radius", 6)       # 绿点半径(px)
+CALIB_TOUCH_ROT = cb.get("touch_rotate", -1)    # 触摸坐标旋转(-1=设备默认; 方向不对时调 0-3)
+CALIB_SHOW_DOT  = cb.get("show_dot", True)      # 启动时绿点+按钮是否显示
+CALIB_XMAX = SENSOR_W // 2                      # 校准范围上限(防呆)
+CALIB_YMAX = SENSOR_H // 2
 
 # ---- V7 上电搜索 ----
 srch = _get(CFG, "search", {})
@@ -972,10 +988,169 @@ def _yolo_ok():
 
 
 # ============================================================================
+# 六点五、触屏中心校准 —— 触摸按键移动绿色校准点(追踪收敛点), 保存写回 config
+# ============================================================================
+
+def _calib_rects(ox, oy, sw, sh, bw):
+    """生成 6 个触摸按钮的命中矩形(LCD 坐标): 上/下(左缘) 左/右(右缘) dot隐藏/S保存(顶中)"""
+    m = 6
+    y1 = sh // 2 - bw - 6
+    y2 = y1 + bw + 12
+    xl = ox + m
+    xr = ox + sw - m - bw
+    xc = ox + sw // 2
+    return (
+        ("up",    xl, oy + y1, xl + bw, oy + y1 + bw),
+        ("down",  xl, oy + y2, xl + bw, oy + y2 + bw),
+        ("left",  xr, oy + y1, xr + bw, oy + y1 + bw),
+        ("right", xr, oy + y2, xr + bw, oy + y2 + bw),
+        ("dot",   xc - bw - 4, oy + m, xc - 4, oy + m + bw),
+        ("save",  xc + 4, oy + m, xc + bw + 4, oy + m + bw),
+    )
+
+def calib_hit(x, y, rects):
+    """触摸点命中的按钮名; 未命中返回 None(边界视为命中)"""
+    for name, x0, y0, x1, y1 in rects:
+        if x0 <= x <= x1 and y0 <= y <= y1:
+            return name
+    return None
+
+def calib_step(vis, btn, hold_t0, now, pressed, was_pressed, hit, repeat_ms):
+    """校准 UI 触摸状态机(每帧一次)。返回 (vis, btn, hold_t0, action)。
+
+    规则: 隐藏态仅"新触摸边沿"唤出(本次触摸被消费, 不发动作; 防点 dot 未松手即弹回);
+          可见态新按/换钮立即发一次; 方向键按住每 repeat_ms 连发; dot/save 单发。
+    action ∈ None / "up" / "down" / "left" / "right" / "dot" / "save"
+    """
+    if not vis:
+        if pressed and not was_pressed:
+            return True, None, now, None
+        return False, None, hold_t0, None
+    if not pressed:
+        return True, None, hold_t0, None
+    if hit is None or hit != btn:
+        return True, hit, now, hit
+    if (hit == "up" or hit == "down" or hit == "left" or hit == "right") \
+            and time.ticks_diff(now, hold_t0) >= repeat_ms:
+        return True, hit, now, hit
+    return True, hit, hold_t0, None
+
+def _replace_json_int(line, val):
+    """把一行 json 里第一个整数 token 换成 val(保留键/缩进/尾逗号); 无整数 token 返回 None"""
+    i = line.find(":")
+    if i < 0:
+        return None
+    j = i + 1
+    n = len(line)
+    while j < n and line[j] == " ":
+        j += 1
+    k = j
+    if k < n and line[k] == "-":
+        k += 1
+    s = k
+    while k < n and "0" <= line[k] <= "9":
+        k += 1
+    if k == s:
+        return None
+    return line[:j] + str(val) + line[k:]
+
+def calib_save_text(src, lox, loy):
+    """config.json 文本 → 替换 laser_offset_x/y 两行的整数值; 其余行逐字节保留。
+
+    成功返回新文本; 两个键未同时找到返回 None(调用方按失败处理, 不写盘)。"""
+    lines = src.split("\n")
+    hit = 0
+    for i in range(len(lines)):
+        s = lines[i].strip()
+        if s.startswith('"laser_offset_x"') or s.startswith('"laser_offset_y"'):
+            val = lox if s.startswith('"laser_offset_x"') else loy
+            nl = _replace_json_int(lines[i], val)
+            if nl is None:
+                return None
+            lines[i] = nl
+            hit += 1
+    if hit != 2:
+        return None
+    return "\n".join(lines)
+
+def calib_save_file(path, lox, loy):
+    """读 config → 文本替换 → 备份(.bak) → 覆盖写 → 读回校验。返回 (ok, msg)。
+
+    任何失败不动原文件(备份为上一版)。无 path(未从文件加载配置)时直接失败。"""
+    if not path:
+        return False, "no config path"
+    try:
+        with open(path, "r") as f:
+            src = f.read()
+        dst = calib_save_text(src, lox, loy)
+        if dst is None:
+            return False, "laser_offset keys not found"
+        try:
+            with open(path + ".bak", "w") as f:
+                f.write(src)
+        except Exception:
+            pass
+        with open(path, "w") as f:
+            f.write(dst)
+        try:
+            import ujson as _j
+        except ImportError:
+            import json as _j
+        with open(path, "r") as f:
+            _j.load(f)
+        return True, "saved (%d,%d)" % (lox, loy)
+    except Exception as e:
+        return False, str(e)
+
+def _calib_arrow(frame_np, cx, cy, name):
+    """方向按钮符号: 三角描边(上/下/左/右)"""
+    s = 13
+    if name == "up":
+        p = ((cx, cy - s), (cx - s, cy + s // 2), (cx + s, cy + s // 2))
+    elif name == "down":
+        p = ((cx, cy + s), (cx - s, cy - s // 2), (cx + s, cy - s // 2))
+    elif name == "left":
+        p = ((cx - s, cy), (cx + s // 2, cy - s), (cx + s // 2, cy + s))
+    else:
+        p = ((cx + s, cy), (cx - s // 2, cy - s), (cx - s // 2, cy + s))
+    cv2.line(frame_np, p[0], p[1], (0, 200, 0), 2)
+    cv2.line(frame_np, p[1], p[2], (0, 200, 0), 2)
+    cv2.line(frame_np, p[2], p[0], (0, 200, 0), 2)
+
+def calib_draw(frame_np, rects, lox, loy, dot_r):
+    """绘制校准 UI: 6 个按钮(框+符号) + 绿色校准点(画面坐标 CENTER+offset)"""
+    for name, x0, y0, x1, y1 in rects:
+        a0 = x0 - DISPLAY_X
+        b0 = y0 - DISPLAY_Y
+        a1 = x1 - DISPLAY_X
+        b1 = y1 - DISPLAY_Y
+        cv2.line(frame_np, (a0, b0), (a1, b0), (0, 140, 0), 2)
+        cv2.line(frame_np, (a1, b0), (a1, b1), (0, 140, 0), 2)
+        cv2.line(frame_np, (a1, b1), (a0, b1), (0, 140, 0), 2)
+        cv2.line(frame_np, (a0, b1), (a0, b0), (0, 140, 0), 2)
+        mx = (a0 + a1) // 2
+        my = (b0 + b1) // 2
+        if name == "dot":
+            cv2.circle(frame_np, (mx, my), 12, (0, 200, 0), 2)
+            cv2.circle(frame_np, (mx, my), 3, (0, 200, 0), -1)
+        elif name == "save":
+            cv2.putText(frame_np, "S", (mx - 8, my + 9),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 0), 2)
+        else:
+            _calib_arrow(frame_np, mx, my, name)
+    gx = CENTER_X + lox
+    gy = CENTER_Y + loy
+    cv2.circle(frame_np, (gx, gy), dot_r, (0, 255, 0), -1)
+    cv2.circle(frame_np, (gx, gy), dot_r + 2, (255, 255, 255), 1)
+
+CALIB_BTNS = _calib_rects(DISPLAY_X, DISPLAY_Y, SENSOR_W, SENSOR_H, 56)
+
+# ============================================================================
 # 七、CV 模式主循环
 # ============================================================================
 
 def run_cv():
+    global LOX, LOY                  # 触屏中心校准运行时更新激光偏移
     sensor = None
     frame_id = lost_count = 0
     last_box = None
@@ -985,6 +1160,11 @@ def run_cv():
     _theta = None                    # 画圈 θ(None=未起始; 见环时按当前方位角起转)
     _theta_tick = time.ticks_ms()    # θ 推进的帧间计时基准
     last_dist = 0.0                  # 上帧瞄准偏差(画圈误差门控用)
+    _calib_tp = None                 # 触摸句柄(None=不可用/未启用)
+    _calib_vis = CALIB_SHOW_DOT      # 绿点+按钮 显隐(dot按钮切换; 隐藏后触摸任意处唤出)
+    _calib_btn = None                # 按住中的按钮名
+    _calib_hold = 0                  # 按住起始时刻(连发计时)
+    _calib_pre = False               # 上帧是否有触点(唤醒边沿判定)
     fps = fps_count = 0
     fps_tick = time.ticks_ms()
 
@@ -998,6 +1178,18 @@ def run_cv():
         sensor.set_framesize(width=SENSOR_W, height=SENSOR_H, chn=CAM_CHN_ID_0)
         sensor.set_pixformat(Sensor.RGB888, chn=CAM_CHN_ID_0)
         print("sensor ok")
+        # ---- 触屏中心校准: 触摸初始化(失败自动禁用, 不影响主程序) ----
+        if CALIB_ENABLED:
+            try:
+                from machine import TOUCH
+                if CALIB_TOUCH_ROT >= 0:
+                    _calib_tp = TOUCH(0, rotate=CALIB_TOUCH_ROT)
+                else:
+                    _calib_tp = TOUCH(0)
+                print("calib: touch ok")
+            except Exception as _e:
+                print("calib: touch unavailable (%s) -- disabled" % _e)
+                _calib_tp = None
         Display.init(Display.ST7701, width=DISPLAY_W, height=DISPLAY_H, to_ide=SHOW_TO_IDE)
         MediaManager.init()
         # sensor.run() 重试: 上次异常退出后 VICAP 硬件可能残留, 需多次尝试
@@ -1017,6 +1209,44 @@ def run_cv():
             frame_id += 1
             frame = sensor.snapshot(chn=CAM_CHN_ID_0)
             frame_np = frame.to_numpy_ref()
+
+            # ---- V7.7 触屏中心校准: 触摸扫描 → 移动绿点/显隐/保存(先于本帧瞄准生效) ----
+            if _calib_tp is not None:
+                try:
+                    _pts = _calib_tp.read()
+                    if _pts is None:
+                        _pts = ()
+                except Exception as _e:
+                    print("calib: touch read fail (%s) -- disabled" % _e)
+                    _calib_tp = None
+                    _pts = ()
+                _pressed = len(_pts) > 0
+                _hit = calib_hit(_pts[0].x, _pts[0].y, CALIB_BTNS) if _pressed else None
+                _calib_vis, _calib_btn, _calib_hold, _act = calib_step(
+                    _calib_vis, _calib_btn, _calib_hold, time.ticks_ms(),
+                    _pressed, _calib_pre, _hit, CALIB_REPEAT)
+                _calib_pre = _pressed
+                if _act == "up":
+                    LOY -= CALIB_STEP
+                elif _act == "down":
+                    LOY += CALIB_STEP
+                elif _act == "left":
+                    LOX -= CALIB_STEP
+                elif _act == "right":
+                    LOX += CALIB_STEP
+                elif _act == "dot":
+                    _calib_vis = False
+                elif _act == "save":
+                    _ok, _msg = calib_save_file(CFG_PATH, LOX, LOY)
+                    print("calib: save %s %s" % ("OK" if _ok else "FAIL", _msg))
+                if LOX < -CALIB_XMAX:
+                    LOX = -CALIB_XMAX
+                elif LOX > CALIB_XMAX:
+                    LOX = CALIB_XMAX
+                if LOY < -CALIB_YMAX:
+                    LOY = -CALIB_YMAX
+                elif LOY > CALIB_YMAX:
+                    LOY = CALIB_YMAX
 
             # ---- V7 模式引脚采样 + 去抖: 被供电=画圈, 其余=仅追踪 ----------------
             if _mode_pin is not None:
@@ -1094,6 +1324,9 @@ def run_cv():
                 fps_tick = now
             cv2.putText(frame_np, "FPS:%d" % fps, (4, SENSOR_H - 8),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            # 触屏校准 UI(绿点+按钮, 可隐藏)
+            if _calib_vis:
+                calib_draw(frame_np, CALIB_BTNS, LOX, LOY, CALIB_DOT_R)
 
             Display.show_image(frame, x=DISPLAY_X, y=DISPLAY_Y)
             if frame_id % GC_EVERY == 0:
@@ -1104,6 +1337,11 @@ def run_cv():
     except BaseException as e:
         print("error:", e)
     finally:
+        if _calib_tp is not None:
+            try:
+                _calib_tp.deinit()
+            except Exception:
+                pass
         if sensor:
             try:
                 sensor.stop()
