@@ -191,7 +191,7 @@ cb = _get(CFG, "center_calib", {})
 CALIB_ENABLED   = cb.get("enabled", True)
 CALIB_STEP      = cb.get("step_px", 4)          # 每按一次/每连发一拍移动的像素
 CALIB_REPEAT    = cb.get("repeat_ms", 120)      # 按住连发间隔(ms)
-CALIB_DOT_R     = cb.get("dot_radius", 6)       # 绿点半径(px)
+CALIB_DOT_R     = cb.get("dot_radius", 2)       # 绿点半径(px; 小点口径)
 CALIB_TOUCH_ROT = cb.get("touch_rotate", -1)    # 触摸坐标旋转(-1=设备默认; 方向不对时调 0-3)
 CALIB_SHOW_DOT  = cb.get("show_dot", True)      # 启动时绿点+按钮是否显示
 CALIB_XMAX = SENSOR_W // 2                      # 校准范围上限(防呆)
@@ -1141,7 +1141,7 @@ def calib_draw(frame_np, rects, lox, loy, dot_r):
     gx = CENTER_X + lox
     gy = CENTER_Y + loy
     cv2.circle(frame_np, (gx, gy), dot_r, (0, 255, 0), -1)
-    cv2.circle(frame_np, (gx, gy), dot_r + 2, (255, 255, 255), 1)
+    cv2.circle(frame_np, (gx, gy), dot_r + 1, (255, 255, 255), 1)
 
 CALIB_BTNS = _calib_rects(DISPLAY_X, DISPLAY_Y, SENSOR_W, SENSOR_H, 56)
 
