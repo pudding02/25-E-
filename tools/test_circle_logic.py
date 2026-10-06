@@ -1,10 +1,9 @@
 """V7 视觉纯函数主机侧测试 —— 提取 main.py 的纯函数并断言其行为。
 
-背景: V7 功能扩展把「目标选择 / 画圈几何 / 上电搜索 / 模式引脚去抖」做成模块级
+背景: V7 功能扩展把「画圈几何 / 上电搜索 / 模式引脚去抖」做成模块级
 纯函数, 便于主机侧(不接 K230 硬件)测试:
-  - select_target      三档优先度: 矩形中有红点 > 矩形 > 红点 > 无
-  - point_in_quad      凸四边形包含判定(红点∈矩形 关联用)
-  - classify_blob      红色块分流: 小实心=红点 / 大空心近方=红环 / 其余=None
+  - point_in_quad      凸四边形包含判定(红环∈矩形 关联用)
+  - classify_blob      红色块分流: 大空心近方=红环 / 其余=None
   - circle_target_point   画圈目标点(环心+半径+θ -> 像素坐标)
   - circle_theta_step     画圈 θ 推进(误差门控 + 方向 + 360° 环绕)
   - search_step           上电搜索状态机(未捕获->spin, 已捕获->idle, 超时->timeout)
@@ -31,7 +30,7 @@ _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _MAIN_PY = os.path.normpath(os.path.join(_THIS_DIR, "..", "k230", "main.py"))
 
 _FUNC_NAMES = (
-    "select_target", "point_in_quad", "classify_blob",
+    "point_in_quad", "classify_blob",
     "circle_target_point", "circle_theta_step", "search_step", "mode_pin_step",
 )
 
@@ -39,7 +38,7 @@ _FUNC_NAMES = (
 # 而是从 main.py 源码里提取执行, 缺任何一个都会在此暴露(classify_blob 生产会 NameError)。
 _CONST_NAMES = (
     "RING_MIN_DIAM", "RING_MAX_DIAM", "RING_MAX_ASPECT",
-    "HOLLOW_MAX_HITS", "DOT_MIN_AREA", "DOT_MAX_AREA",
+    "HOLLOW_MAX_HITS",
 )
 # 上述常量取值依赖的模块级名字(也一律从 main.py 提取, 测试不自造值):
 #   _get = 配置取值 helper;  rt = [red_target] 配置段变量
@@ -78,7 +77,7 @@ class _FakeTime(types.ModuleType):
 
 
 def load_funcs():
-    """加载并返回 main.py 里的 7 个纯函数。
+    """加载并返回 main.py 里的 6 个纯函数。
 
     阈值常量与配置段变量一律从 main.py 源码中提取执行 —— 测试不硬注入任何取值,
     因此 main.py 若漏定义 classify_blob 引用的常量(生产会 NameError), 这里会直接
@@ -129,35 +128,11 @@ _FNS = None
 
 
 def F(name):
-    """懒加载 7 个纯函数(全部加载成功才缓存)"""
+    """懒加载 6 个纯函数(全部加载成功才缓存)"""
     global _FNS
     if _FNS is None:
         _FNS = load_funcs()
     return _FNS[name]
-
-
-class TestSelectTarget(unittest.TestCase):
-    """三档优先度: 矩形中有红点 > 矩形 > 红点 > 无"""
-
-    def test_red_in_rect_highest(self):
-        self.assertEqual(F("select_target")(True, 100, 100, True, 120, 130, True),
-                         ("red+rect", 120, 130))
-
-    def test_dot_outside_rect_falls_to_rect(self):
-        self.assertEqual(F("select_target")(True, 100, 100, True, 500, 500, False),
-                         ("rect", 100, 100))
-
-    def test_rect_only(self):
-        self.assertEqual(F("select_target")(True, 100, 100, False, 0, 0, False),
-                         ("rect", 100, 100))
-
-    def test_dot_only(self):
-        self.assertEqual(F("select_target")(False, 0, 0, True, 300, 220, False),
-                         ("red", 300, 220))
-
-    def test_none(self):
-        self.assertEqual(F("select_target")(False, 0, 0, False, 0, 0, False),
-                         ("none", 0, 0))
 
 
 class TestPointInQuad(unittest.TestCase):
@@ -182,25 +157,28 @@ class TestPointInQuad(unittest.TestCase):
 
 
 class TestClassifyBlob(unittest.TestCase):
-    """红色块分流: 大空心近方->ring; 小面积->dot; 其余->None"""
+    """红色块分流: 大空心近方->ring; 小尺寸/实心/畸形->None(红点识别已删除, 小团不再判 dot)"""
 
     def test_big_hollow_ring(self):
-        self.assertEqual(F("classify_blob")(60, 60, 3000, 0), "ring")
+        self.assertEqual(F("classify_blob")(60, 60, 0), "ring")
 
-    def test_small_solid_dot(self):
-        self.assertEqual(F("classify_blob")(30, 30, 700, 8), "dot")
+    def test_hollow_boundary_rejected(self):
+        self.assertEqual(F("classify_blob")(60, 60, 3), None)
+
+    def test_small_solid_rejected(self):
+        self.assertEqual(F("classify_blob")(30, 30, 8), None)
 
     def test_big_solid_rejected(self):
-        self.assertEqual(F("classify_blob")(60, 60, 3600, 8), None)
+        self.assertEqual(F("classify_blob")(60, 60, 8), None)
 
     def test_tiny_rejected(self):
-        self.assertEqual(F("classify_blob")(3, 3, 5, 0), None)
+        self.assertEqual(F("classify_blob")(3, 3, 0), None)
 
     def test_elongated_rejected(self):
-        self.assertEqual(F("classify_blob")(100, 50, 4000, 0), None)
+        self.assertEqual(F("classify_blob")(100, 50, 0), None)
 
     def test_over_size_limit_rejected(self):
-        self.assertEqual(F("classify_blob")(1000, 1000, 50000, 1), None)
+        self.assertEqual(F("classify_blob")(1000, 1000, 1), None)
 
 
 class TestCircleGeometry(unittest.TestCase):
@@ -288,8 +266,8 @@ class TestModePinStep(unittest.TestCase):
 class TestModuleThresholdConstants(unittest.TestCase):
     """回归守门: classify_blob 引用的阈值常量必须在 main.py 中真实定义。
 
-    原缺陷: classify_blob 引用 6 个未定义的模块级常量 → 生产调用即 NameError;
-    旧测试把这 6 个值硬注入 exec 环境, 结构性掩盖了该缺陷。本用例直接断言
+    原缺陷: classify_blob 引用未定义的模块级常量 → 生产调用即 NameError;
+    旧测试把常量取值硬注入 exec 环境, 结构性掩盖了该缺陷。本用例直接断言
     main.py 的模块级赋值里确实出现这些名字(与上面 TestClassifyBlob 的行为断言互补)。
     """
 

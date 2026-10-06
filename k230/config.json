@@ -206,15 +206,10 @@
   },
 
   "red_target": {
-    "_说明": "红色标记检测（与矩形检测同帧联合进行）: 中心红点(瞄准用) + 外围红环(画圈用)",
+    "_说明": "红色标记检测（与矩形检测同帧联合进行）: 外围红环(画圈用)",
     "red_low":  [130, 0, 0],
     "red_high": [255, 120, 120],
     "_red": "红色掩膜 RGB 范围; 激光光斑过曝偏白时会偏离此范围, 现场按实际调",
-    "dot_min_area": 9,
-    "dot_max_area": 2500,
-    "_dot_area": "红点候选面积范围(px²); 若激光光斑被误捕为红点, 将 dot_min_area 调到大于光斑面积可排除",
-    "dot_standalone": true,
-    "_dot_standalone": "无矩形时单独红点是否可作追踪目标(优先度第三档); 现场受干扰可置 false 一键降级",
     "ring_min_diam_px": 40,
     "ring_max_diam_px": 900,
     "ring_max_aspect": 1.6,

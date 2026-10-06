@@ -11,10 +11,11 @@ Drone-competition rectangle-target tracking system (电赛E题). A K230-CanMV bo
   (A position-mode path exists in `EmmStepper` — `move`/`clear_position`/`home` — but is NOT
   wired into the control flow: driver ② failed with it on hardware. Both axes are now the
   same speed-mode logic.)
-- **V7 features** — joint rect+red detection (target priority: dot-in-rect > rect > lone dot),
-  ring-circling mode gated by GPIO49/Pin3 (powered = circle), and boot search (yaw spins
-  single-direction until first acquisition). All params live in `k230/config.json`
-  (`[red_target]` / `[search]` / `[circle]` / `[mode_pin]`).
+- **V7 features** — joint rect+ring detection (tracking aims the rectangle center; the
+  earlier red-dot/bullseye aim was removed as it conflicted with rect detection — ring
+  detection feeds circle mode only), ring-circling gated by GPIO49/Pin3 (powered = circle),
+  and boot search (yaw spins single-direction until first acquisition). All params live in
+  `k230/config.json` (`[red_target]` / `[search]` / `[circle]` / `[mode_pin]`).
 
 (The original MaixCam + STM32F407 relay architecture is retired — there is no `stm32/` directory and no `fs_servo.py`; all code is single-file in `k230/main.py`.)
 
@@ -98,9 +99,9 @@ fdx, fdy = kf_update(dx, dy)  # works identically whether Kalman is on or off
   - `python tools/test_emm_protocol.py` — frame bytes vs manual examples (12 cases). Always run
     after touching protocol code.
   - `python tools/test_coast_logic.py` — coast (lost-target pre-judgment) state machine (10 cases).
-  - `python tools/test_circle_logic.py` — V7 pure functions (33 cases): `select_target` 3-tier
-    priority, quad containment, blob classify, circle geometry, search & pin-debounce machines.
-    Threshold constants are extracted from main.py itself — a missing definition is a hard error.
+  - `python tools/test_circle_logic.py` — V7 pure functions (29 cases): quad containment, ring
+    blob classify, circle geometry, search & pin-debounce machines. Threshold constants are
+    extracted from main.py itself — a missing definition is a hard error.
 - **Hardware**: `motor.test_mode` / `pitch_motor.test_mode` in config.json perform power-on
   self-checks (online probe + continuous rotation) without running vision. `main.py` also
   self-reports at boot: the `actuator:` line (both axes + online voltage).

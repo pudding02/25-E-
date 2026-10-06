@@ -164,13 +164,10 @@ MOTOR_ENABLED = mv.get("enabled", False)
 pm = _get(CFG, "pitch_motor", {})           # [pitch_motor] 段 → pitch
 PITCH_ENABLED = pm.get("enabled", False)
 
-# ---- V7 红色目标(红点/红环)检测 ----
+# ---- V7 红色目标(红环)检测 ----
 rt = _get(CFG, "red_target", {})
 RED_LOW  = tuple(rt.get("red_low", [130, 0, 0]))
 RED_HIGH = tuple(rt.get("red_high", [255, 120, 120]))
-DOT_MIN_AREA = rt.get("dot_min_area", 9)
-DOT_MAX_AREA = rt.get("dot_max_area", 2500)
-DOT_STANDALONE = rt.get("dot_standalone", True)
 RING_MIN_DIAM = rt.get("ring_min_diam_px", 40)
 RING_MAX_DIAM = rt.get("ring_max_diam_px", 900)
 RING_MAX_ASPECT = rt.get("ring_max_aspect", 1.6)
@@ -440,23 +437,9 @@ def coast_step(now_ms, active, start_ms, last_dx, edge_px, coast_ms):
 
 
 # ============================================================================
-# 四点五、V7 视觉纯函数(主机可测) —— 目标选择/画圈几何/上电搜索/引脚去抖
+# 四点五、V7 视觉纯函数(主机可测) —— 画圈几何/上电搜索/引脚去抖
 #   tools/test_circle_logic.py 抓取本节函数做主机侧测试(与 coast_step 同模式)
 # ============================================================================
-
-def select_target(has_rect, rcx, rcy, has_dot, dcx, dcy, dot_inside):
-    """目标选择三档优先度(纯函数): 矩形中有红点 > 矩形 > 红点。
-
-    返回 (kind, tx, ty); kind: "red+rect" / "rect" / "red" / "none"。
-    dot_inside 由调用方用 point_in_quad(dot, box) 计算(仅 has_rect and has_dot 时有意义)。
-    """
-    if has_rect and has_dot and dot_inside:
-        return "red+rect", dcx, dcy      # 优先1: 矩形中的红点 -> 瞄准红点
-    if has_rect:
-        return "rect", rcx, rcy          # 优先2: 单独矩形 -> 瞄准矩形中心
-    if has_dot:
-        return "red", dcx, dcy           # 优先3: 单独红点 -> 瞄准红点
-    return "none", 0, 0                  # 全无 -> 走丢靶/搜索分支
 
 def point_in_quad(px, py, quad):
     """凸四边形包含判定(纯函数; 叉积同号法)。
@@ -476,10 +459,10 @@ def point_in_quad(px, py, quad):
                 return False
     return True
 
-def classify_blob(w, h, area, hollow_hits):
-    """红色块分流(纯函数): 大尺寸近方且空心 -> "ring"; 小面积 -> "dot"; 其余 -> None。
+def classify_blob(w, h, hollow_hits):
+    """红色块分流(纯函数): 大尺寸近方且空心 -> "ring"; 其余(小尺寸/实心/畸形) -> None。
 
-    hollow_hits: 50% 外径半径处 8 点采样的红色命中数(由 find_red_targets 计算);
+    hollow_hits: 50% 外径半径处 8 点采样的红色命中数(由 find_red_ring 计算);
     阈值取自 config [red_target] 段。
     """
     mx = w if w > h else h
@@ -487,8 +470,6 @@ def classify_blob(w, h, area, hollow_hits):
     if (mn > 0 and RING_MIN_DIAM <= mx <= RING_MAX_DIAM
             and mx <= mn * RING_MAX_ASPECT and hollow_hits <= HOLLOW_MAX_HITS):
         return "ring"
-    if DOT_MIN_AREA <= area <= DOT_MAX_AREA and mx < RING_MIN_DIAM:
-        return "dot"
     return None
 
 def circle_target_point(cx, cy, r, theta_deg):
@@ -910,13 +891,12 @@ def _hollow_hits(mask, cx, cy, sr, mw, mh):
             hits += 1
     return hits
 
-def find_red_targets(frame_np, box):
-    """联合检测的红色侧: 找红点(瞄准用)与红环(画圈用), 返回 (dot, ring)。
+def find_red_ring(frame_np, box):
+    """红色侧检测: 找红环(画圈用), 返回 ring=(cx,cy,r) 或 None。
 
     box 有效 -> 红色在矩形外扩 ROI_MARGIN_PX 的区域内找(省算力);
-    box 无效 -> 全帧找(保证"单独红点/红环"可见)。无则对应为 None。
-    dot=(cx,cy) 选取: 有矩形取"离矩形中心最近", 无矩形取"离画面中心最近";
-    ring=(cx,cy,r) 选取: 有矩形优先"环心在矩形内"(point_in_quad), 否则取半径最大者。
+    box 无效 -> 全帧找(保证"单独红环"可见)。
+    ring 选取: 有矩形优先"环心在矩形内"(point_in_quad), 否则取半径最大者。
     """
     mw = SENSOR_W
     mh = SENSOR_H
@@ -939,10 +919,9 @@ def find_red_targets(frame_np, box):
     rw = ex - ox
     rh = ey - oy
     if rw < 8 or rh < 8:
-        return None, None
+        return None
     mask = cv2.inRange(frame_np[oy:ey, ox:ex], RED_LOW, RED_HIGH)
     contours = get_contours(cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE))
-    dots = []
     rings = []
     for cnt in contours:
         x, y, bw, bh = cv2.boundingRect(cnt)
@@ -953,27 +932,9 @@ def find_red_targets(frame_np, box):
         cx = x + bw // 2
         cy = y + bh // 2
         hits = _hollow_hits(mask, cx, cy, sr, rw, rh) if sr > 0 else 0
-        kind = classify_blob(bw, bh, cv2.contourArea(cnt), hits)
-        if kind == "dot":
-            dots.append((cx + ox, cy + oy))
-        elif kind == "ring":
+        if classify_blob(bw, bh, hits) == "ring":
             rx, ry, rr = _RING_GEOM(cnt, x, y, bw, bh)
             rings.append((rx + ox, ry + oy, rr))
-    # ---- 红点选取: 有矩形取离矩形中心最近; 无矩形取离画面中心最近 ----
-    dot = None
-    if dots:
-        if box:
-            ref = quad_center(box)
-        else:
-            ref = (CENTER_X, CENTER_Y)
-        best = -1
-        for cand in dots:
-            ddx = cand[0] - ref[0]
-            ddy = cand[1] - ref[1]
-            dd = ddx * ddx + ddy * ddy
-            if best < 0 or dd < best:
-                best = dd
-                dot = cand
     # ---- 红环选取: 有矩形优先环心在矩形内; 否则取半径最大者 ----
     ring = None
     if rings:
@@ -986,7 +947,7 @@ def find_red_targets(frame_np, box):
             for cand in rings:
                 if ring is None or cand[2] > ring[2]:
                     ring = cand
-    return dot, ring
+    return ring
 
 
 # ============================================================================
@@ -1017,7 +978,7 @@ def run_cv():
     sensor = None
     frame_id = lost_count = 0
     last_box = None
-    last_dot = last_ring = None      # 红色检测帧间复用
+    last_ring = None                 # 红环检测帧间复用
     _circle_on = False               # 画圈模式(模式引脚去抖后)
     _pin_streak = 0
     _theta = None                    # 画圈 θ(None=未起始; 见环时按当前方位角起转)
@@ -1068,11 +1029,11 @@ def run_cv():
             # ---- 检测(每检测帧): 矩形 + 红色 联合 ----------------
             if frame_id % DETECT_EVERY == 0 or not last_box:
                 box, contour_count, area_count = find_paper_box(frame_np, last_box)
-                dot, ring = find_red_targets(frame_np, box)
+                ring = find_red_ring(frame_np, box)
             else:
-                box, dot, ring = last_box, last_dot, last_ring
+                box, ring = last_box, last_ring
 
-            # ---- 目标选择: 画圈(环优先) > 三档级联 ----------------
+            # ---- 目标选择: 画圈(环优先) > 追踪(矩形中心) ----------------
             now2 = time.ticks_ms()
             dtm = time.ticks_diff(now2, _theta_tick)
             _theta_tick = now2
@@ -1086,34 +1047,23 @@ def run_cv():
                 _theta = circle_theta_step(_theta, CIRC_SPEED, dtm, CIRC_DIR, last_dist, CIRC_PAUSE)
                 tx, ty = circle_target_point(rcx, rcy, rr + RADIUS_BIAS, _theta)
                 kind = "ring"
-            else:
-                rcx = rcy = 0
-                if box is not None:
-                    rcx, rcy, _dcx, _dcy = draw_box(frame_np, box)   # 画框 + 矩形中心
-                inside = (box is not None and dot is not None
-                          and point_in_quad(dot[0], dot[1], box))
-                dot_eff = dot if (dot is not None and (DOT_STANDALONE or box is not None)) else None
-                kind, tx, ty = select_target(
-                    box is not None, rcx, rcy,
-                    dot_eff is not None,
-                    dot_eff[0] if dot_eff is not None else 0,
-                    dot_eff[1] if dot_eff is not None else 0,
-                    inside)
+            elif box is not None:
+                rcx, rcy, _dcx, _dcy = draw_box(frame_np, box)   # 画框 + 矩形中心
+                tx, ty = rcx, rcy
+                kind = "rect"
 
             # ---- 执行(保持既有 gimbal_send track 语义) ----------------
             if kind != "none":
                 lost_count = 0
                 if box is not None:
                     last_box = box
-                last_dot, last_ring = dot, ring
+                last_ring = ring
                 dx, dy = tx - CENTER_X - LOX, ty - CENTER_Y - LOY
                 dist = math.sqrt(dx * dx + dy * dy)
                 last_dist = dist
                 gimbal_send(int(dx), int(dy), dist, "track")
-                # OSD: 红点/红环/最终瞄准点 标记 + 目标源文字
+                # OSD: 红环/最终瞄准点 标记 + 目标源文字
                 if SHOW_OSD:
-                    if dot is not None:
-                        cv2.circle(frame_np, dot, 6, (255, 0, 255), 1)
                     if ring is not None:
                         cv2.circle(frame_np, (ring[0], ring[1]), ring[2], (255, 128, 0), 1)
                     cv2.circle(frame_np, (tx, ty), 4, (0, 255, 255), 1)
