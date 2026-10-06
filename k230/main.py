@@ -123,6 +123,8 @@ DISPLAY_H = _get(_get(CFG, "display", {}), "lcd_height", 480)
 SHOW_TO_IDE = _get(_get(CFG, "display", {}), "to_ide", False)
 DISPLAY_X = _get(_get(CFG, "display", {}), "x_offset", (DISPLAY_W - SENSOR_W) // 2)
 DISPLAY_Y = _get(_get(CFG, "display", {}), "y_offset", (DISPLAY_H - SENSOR_H) // 2)
+# scale_view: 采集帧等比放大满屏显示(兼顾"照出更多"与占屏); false=1:1 原尺寸(仅 1:1 时用 DISPLAY_X/Y)
+SCALE_VIEW = _get(_get(CFG, "display", {}), "scale_view", True)
 SHOW_OSD  = _get(_get(CFG, "display", {}), "show_osd", True)
 
 # ---- 检测模式 ----
@@ -988,8 +990,27 @@ def _yolo_ok():
 
 
 # ============================================================================
-# 六点五、触屏中心校准 —— 触摸按键移动绿色校准点(追踪收敛点), 保存写回 config
+# 六点五、显示视图 + 触屏中心校准
+#   view_geom: 显示视图几何(scale_view 开时等比放大满屏, 关闭时 1:1 居中)
+#   触屏校准: 触摸按键移动绿色校准点(追踪收敛点), 保存写回 config
 # ============================================================================
+
+def view_geom(scale_on, dw, dh, sw, sh):
+    """[纯函数] 显示视图几何: 返回 (视图宽, 视图高, x偏移, y偏移)。
+
+    scale_on=True: 采集帧等比放大(先满宽; 放不下则满高适配), 使占屏最大;
+    scale_on=False: 1:1 原尺寸居中。
+    """
+    if not scale_on:
+        return sw, sh, (dw - sw) // 2, (dh - sh) // 2
+    vh = dw * sh // sw
+    if vh <= dh:
+        return dw, vh, 0, (dh - vh) // 2
+    vw = dh * sw // sh
+    return vw, dh, (dw - vw) // 2, 0
+
+VIEW_W, VIEW_H, VIEW_X, VIEW_Y = view_geom(SCALE_VIEW, DISPLAY_W, DISPLAY_H,
+                                           SENSOR_W, SENSOR_H)
 
 def _calib_rects(ox, oy, sw, sh, bw):
     """生成 6 个触摸按钮的命中矩形(LCD 坐标): 上/下(左缘) 左/右(右缘) dot隐藏/S保存(顶中)"""
@@ -1120,10 +1141,11 @@ def _calib_arrow(frame_np, cx, cy, name):
 def calib_draw(frame_np, rects, lox, loy, dot_r):
     """绘制校准 UI: 6 个按钮(框+符号) + 绿色校准点(画面坐标 CENTER+offset)"""
     for name, x0, y0, x1, y1 in rects:
-        a0 = x0 - DISPLAY_X
-        b0 = y0 - DISPLAY_Y
-        a1 = x1 - DISPLAY_X
-        b1 = y1 - DISPLAY_Y
+        # rects 为 LCD 空间; 换算到采集帧坐标(scale_view 放大显示时除以缩放系数)
+        a0 = (x0 - VIEW_X) * SENSOR_W // VIEW_W
+        b0 = (y0 - VIEW_Y) * SENSOR_H // VIEW_H
+        a1 = (x1 - VIEW_X) * SENSOR_W // VIEW_W
+        b1 = (y1 - VIEW_Y) * SENSOR_H // VIEW_H
         cv2.line(frame_np, (a0, b0), (a1, b0), (0, 140, 0), 2)
         cv2.line(frame_np, (a1, b0), (a1, b1), (0, 140, 0), 2)
         cv2.line(frame_np, (a1, b1), (a0, b1), (0, 140, 0), 2)
@@ -1143,7 +1165,7 @@ def calib_draw(frame_np, rects, lox, loy, dot_r):
     cv2.circle(frame_np, (gx, gy), dot_r, (0, 255, 0), -1)
     cv2.circle(frame_np, (gx, gy), dot_r + 1, (255, 255, 255), 1)
 
-CALIB_BTNS = _calib_rects(DISPLAY_X, DISPLAY_Y, SENSOR_W, SENSOR_H, 56)
+CALIB_BTNS = _calib_rects(VIEW_X, VIEW_Y, VIEW_W, VIEW_H, 56)
 
 # ============================================================================
 # 七、CV 模式主循环
@@ -1180,9 +1202,10 @@ def run_cv():
         sensor.set_pixformat(Sensor.RGB888, chn=CAM_CHN_ID_0)
         print("sensor ok")
         # 启动几何摘要: 串口一眼核对 采集/显示/中心 是否与期望一致(防拷错 config)
-        print("geom: cam=%dx%d lcd=%dx%d off=(%d,%d) center=(%d,%d)"
+        print("geom: cam=%dx%d lcd=%dx%d scale=%s view=%dx%d@(%d,%d) center=(%d,%d)"
               % (SENSOR_W, SENSOR_H, DISPLAY_W, DISPLAY_H,
-                 DISPLAY_X, DISPLAY_Y, CENTER_X, CENTER_Y))
+                 "on" if SCALE_VIEW else "off",
+                 VIEW_W, VIEW_H, VIEW_X, VIEW_Y, CENTER_X, CENTER_Y))
         # ---- 触屏中心校准: 触摸初始化(失败自动禁用, 不影响主程序) ----
         if CALIB_ENABLED:
             try:
@@ -1333,7 +1356,12 @@ def run_cv():
             if _calib_vis:
                 calib_draw(frame_np, CALIB_BTNS, LOX, LOY, CALIB_DOT_R)
 
-            Display.show_image(frame, x=DISPLAY_X, y=DISPLAY_Y)
+            if SCALE_VIEW:
+                # 等比放大到视图尺寸显示: 视野(=全幅)不变, 占屏最大(见 view_geom)
+                Display.show_image(cv2.resize(frame, (VIEW_W, VIEW_H)),
+                                   x=VIEW_X, y=VIEW_Y)
+            else:
+                Display.show_image(frame, x=VIEW_X, y=VIEW_Y)
             if frame_id % GC_EVERY == 0:
                 gc.collect()
 
