@@ -17,10 +17,17 @@ Drone-competition rectangle-target tracking system (电赛E题). A K230-CanMV bo
   button** (default; optional fallback: GPIO49/Pin3 jumper when `mode_pin.enabled=true`),
   and boot search (yaw spins single-direction until first acquisition). All params live in
   `k230/config.json` (`[red_target]` / `[search]` / `[circle]` / `[mode_pin]`).
-- **Touchscreen center calibration (V7.7)** — on-screen green dot + 7 touch buttons (▲▼◀▶ move
-  the aim offset live, T/C toggles track/circle mode, ● hides the UI, S saves
-  `center.laser_offset_x/y` back to config.json); touch failure auto-disables without
-  affecting tracking. Params in `[center_calib]`.
+- **Touchscreen center calibration (V7.7) + tuning page (V7.9)** — on-screen green dot + 8
+  touch buttons on the calib page (▲▼◀▶ move the aim offset live, T/C toggles track/circle mode,
+  ● hides the UI, S saves `center.laser_offset_x/y` back to config.json, P opens the PID/param
+  tuning page); touch failure auto-disables without affecting tracking. Params in `[center_calib]`.
+- **PID speed control + touch tuning (V7.9)** — optional speed-form PID per axis
+  (`pid_enabled`; `u = Kp·e + Ki·∫e·dt + Kd·de/dt` clamped to `[min_rpm, max_rpm]`, anti-windup
+  freeze on saturation, PID state cleared on deadband/lost/search frames). Disabled = the
+  linear map exactly as before. All PID + per-axis motion params (`kp/ki/kd/max/min/dead/acc/full`)
+  are live-tunable on the touch **param page** (`P`: `Y/P` axis, item cycling, `+/-` hold-repeat,
+  `S` writes the 18 keys back to config.json text-level with `.bak` + read-back verify). Changes
+  apply on the next frame; coast/search keep the original map.
 
 (The original MaixCam + STM32F407 relay architecture is retired — there is no `stm32/` directory and no `fs_servo.py`; all code is single-file in `k230/main.py`.)
 
@@ -90,6 +97,10 @@ fdx, fdy = kf_update(dx, dy)  # works identically whether Kalman is on or off
 ## Config system
 
 - `k230/config.json` is the **only tuning surface**. Sections: detection, camera, display, center, center_calib, rectangle, yolo, motor (yaw), pitch_motor (pitch), red_target, search, circle, mode_pin, debug.
+  `[motor]`/`[pitch_motor]` also carry the V7.9 PID keys (`pid_enabled` / `pid_kp` / `pid_ki` /
+  `pid_kd`); these plus the motion params (`min_rpm` / `max_rpm` / `dx_full_px`|`dy_full_px` /
+  `deadband_px` / `acc`) are live-tunable from the touch param page (`P`) and written back by its
+  `S` button (text-level replace, all-or-nothing, `.bak` + read-back verify).
 - The config loader strips keys starting with `_`, so comments can be embedded as `"_说明": "..."`.
 - Values are read at import time into module-level globals; restart `main.py` after edits.
 
@@ -109,7 +120,7 @@ fdx, fdy = kf_update(dx, dy)  # works identically whether Kalman is on or off
 
 ## Testing
 
-- **Host-side (no hardware)**: five stdlib-only scripts, all static-check `k230/main.py`
+- **Host-side (no hardware)**: six stdlib-only scripts, all static-check `k230/main.py`
   (some also read `k230/config.json`):
   - `python tools/test_emm_protocol.py` — frame bytes vs manual examples (12 cases). Always run
     after touching protocol code.
@@ -121,8 +132,13 @@ fdx, fdy = kf_update(dx, dy)  # works identically whether Kalman is on or off
     probe + `crop=True`, `CSI_ID` defined; config chain: `csi_id=2`, 16:9 output, offsets;
     dead-display-path guard (`cv2.resize` / `draw_image` / `image.Image` / `bind_layer` /
     `config_layer`).
-  - `python tools/test_center_calib.py` — touch calibration (32 cases): button hit test, touch
-    state machine (wake edge / repeat / no-bounce on hide), config text save (exactly 2 lines).
+  - `python tools/test_center_calib.py` — touch calibration (33 cases): 8-button layout (incl. P),
+    button hit test, touch state machine (wake edge / repeat / no-bounce on hide), config text
+    save (exactly 2 lines).
+  - `python tools/test_pid_tune.py` — V7.9 PID + touch tuning (48 cases): pid_step (P/I/D,
+    clamp, anti-windup, first-frame/long-frame dt), pid_speed, param step/clamp/toggle,
+    section-scoped config text save (motor vs pitch_motor isolation, real-config roundtrip),
+    tuning state machine, static guards (tune vars defined; gimbal_send wired to pid_step).
 - **Hardware**: `motor.test_mode` / `pitch_motor.test_mode` in config.json perform power-on
   self-checks (online probe + continuous rotation) without running vision. `main.py` also
   self-reports at boot: the `actuator:` line (both axes + online voltage).

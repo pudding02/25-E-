@@ -5,7 +5,7 @@
   - calib_step   校准 UI 触摸状态机（隐藏态唤醒边沿 / 新按即发 / 方向键连发 / mode·dot·save 单发）
   - _replace_json_int  行内第一个整数 token 替换（保留键/缩进/尾逗号）
   - calib_save_text    config.json 文本级替换（只动 laser_offset_x/y 两行, 其余逐字节保留）
-  - _calib_rects  按钮命中矩形生成（7 键: 方向×4 + mode 追踪/画圈切换 + dot + save; 布局与不重叠约束）
+  - _calib_rects  按钮命中矩形生成（8 键: 方向×4 + mode 追踪/画圈切换 + dot + save + param 调参页入口; 布局与不重叠约束）
 
 原理：从 k230/main.py AST 提取上述函数源码在最小环境执行（纯函数, 无 cfg 依赖）, 逐条断言。
 运行：python tools/test_center_calib.py
@@ -259,14 +259,14 @@ class TestCalibSaveText(unittest.TestCase):
 
 
 class TestCalibRects(unittest.TestCase):
-    """按钮矩形生成: 6 键 / 全部在屏内 / 两两不重叠 / 左右组对称"""
+    """按钮矩形生成: 8 键 / 全部在屏内 / 两两不重叠 / 左右组对称"""
 
     def _rects(self):
         return F("_calib_rects")(80, 0, 640, 480, 56)
 
     def test_names_and_count(self):
         self.assertEqual([r[0] for r in self._rects()],
-                         ["up", "down", "left", "right", "mode", "dot", "save"])
+                         ["up", "down", "left", "right", "mode", "dot", "save", "param"])
 
     def test_all_inside_screen(self):
         for name, x0, y0, x1, y1 in self._rects():

@@ -15,8 +15,9 @@ K230 物体追踪 — 双轴云台 (双步进)
 
   执行器 (两轴都是 Emm42 闭环步进, 速度控制逻辑相同, 由 config.json 的 motor / pitch_motor 段配置):
     左右轴(yaw)  : 按 dx 做「速度」控制 —— |dx| 越大转速越快; 死区内停转;
+                   V7.9 可切 PID(pid_step, 参数触屏可调);
                    丢靶预判: 目标从左右两侧丢失后, 朝最后方向续追一小段时间(可关, 见 coast_step)
-    上下轴(pitch): 按 dy 做「速度」控制 —— |dy| 越大转速越快; 死区内停转; 丢靶停转
+    上下轴(pitch): 按 dy 做「速度」控制 —— |dy| 越大转速越快; 死区内停转(V7.9 同上可切 PID); 丢靶停转
 
   dx = 目标中心x - 屏幕中心x   (右偏为正)
   dy = 目标中心y - 屏幕中心y   (下偏为正)
@@ -46,15 +47,17 @@ K230 物体追踪 — 双轴云台 (双步进)
    一  配置加载          从 /sdcard/config.json 读参数(跳过 _ 开头的注释键)
    二  运行参数          把配置铺平成模块级常量
    三  Emm 步进驱动      EmmStepper (速度模式 + 位置模式)          → yaw / pitch
+   三点五 PID 速度控制   pid_step/pid_speed —— 误差→转速(可选切 PID, Kp/Ki/Kd 触屏可调)
    四  执行器初始化      gimbal_send(dx,dy,dist,status) —— 视觉与执行器之间的唯一接口
    五  CV 矩形检测       find_paper_box() 等
    六  YOLO 支持         _yolo_ok()
-   六点五 触屏中心校准    calib_* —— 触摸按键移动绿点(追踪收敛点)/保存写回 config
+   六点五 触屏交互        calib_* 校准(绿点/模式/保存) + param_* 调参页(PID/Kp/Ki/Kd/速度/死区…)
    七  CV 主循环         run_cv()
    八  YOLO 主循环       run_yolo()
    九  入口              test_mode 自检 → 按 mode 进对应主循环
 
   所有可调参数都在 config.json 内并附注释; 本文件不含硬编码阈值, 改完重启生效。
+  V7.9: PID 开关/Kp/Ki/Kd 与两轴速度/死区/加速等参数可在触屏调参页实时调整, S 键写回 config。
 """
 
 import time, os, gc, math
@@ -170,6 +173,36 @@ MOTOR_ENABLED = mv.get("enabled", False)
 pm = _get(CFG, "pitch_motor", {})           # [pitch_motor] 段 → pitch
 PITCH_ENABLED = pm.get("enabled", False)
 
+# ---- V7.9 触屏可调运行时参数(初值=config; 触屏调参页 +/- 实时改, S 写回; 见六点五节) ----
+#   这些是 gimbal_send 每帧读取的"活参数": 触屏改后下一帧即生效(不必改文件重启)。
+#   pid_* 为 V7.9 新增的 PID 速度控制参数(enabled=false 时走原线性映射, 行为不变)。
+M_MIN_RPM = mv.get("min_rpm", 1)        # yaw 最低转速
+M_MAX_RPM = mv.get("max_rpm", 30)       # yaw 最高转速(也是 PID 输出限幅)
+M_DX_FULL = mv.get("dx_full_px", 200)   # |dx| 达此值给满速(原映射)
+M_DEADBAND = mv.get("deadband_px", 5)
+M_ACC = mv.get("acc", 200)
+M_PID_EN = mv.get("pid_enabled", False)
+M_PID_KP = mv.get("pid_kp", 0.28)
+M_PID_KI = mv.get("pid_ki", 0.0)
+M_PID_KD = mv.get("pid_kd", 0.0)
+P_MIN_RPM = pm.get("min_rpm", 1)        # pitch 最低转速
+P_MAX_RPM = pm.get("max_rpm", 30)       # pitch 最高转速(也是 PID 输出限幅)
+P_DY_FULL = pm.get("dy_full_px", 200)
+P_DEADBAND = pm.get("deadband_px", 5)
+P_ACC = pm.get("acc", 200)
+P_PID_EN = pm.get("pid_enabled", False)
+P_PID_KP = pm.get("pid_kp", 0.14)
+P_PID_KI = pm.get("pid_ki", 0.0)
+P_PID_KD = pm.get("pid_kd", 0.0)
+
+# PID 运行状态(每轴一套: i=积分累计 px·s / e=上次误差 / t=上次时刻; 丢靶/死区时清零)
+_pid_yaw_i = 0.0
+_pid_yaw_e = 0.0
+_pid_yaw_t = 0
+_pid_pit_i = 0.0
+_pid_pit_e = 0.0
+_pid_pit_t = 0
+
 # ---- V7 红色目标(红环)检测 ----
 rt = _get(CFG, "red_target", {})
 RED_LOW  = tuple(rt.get("red_low", [130, 0, 0]))
@@ -212,7 +245,7 @@ CIRC_PAUSE = cc.get("pause_px", 120)
 
 # ---- V7 模式引脚(GPIO49: 被供电=画圈) ----
 mp = _get(CFG, "mode_pin", {})
-PIN_ENABLED = mp.get("enabled", True)
+PIN_ENABLED = mp.get("enabled", False)   # 缺省关(与文档一致: 默认触屏 T/C 切换, 引脚为可选备用)
 PIN_GPIO = mp.get("gpio", 49)
 PIN_ACTIVE = mp.get("active_level", 1)
 PIN_DEBOUNCE = mp.get("debounce_n", 5)
@@ -403,6 +436,65 @@ class EmmStepper:
 
 
 # ============================================================================
+# 三点五、PID 速度控制(纯函数, 供 gimbal_send 使用; 主机可测)
+#   速度式 PID: 位置误差(px) → 转速(RPM)。M_PID_EN/P_PID_EN=true 时启用,
+#   否则 gimbal_send 走原「线性映射+死区」。Kp/Ki/Kd 触屏可调, 改后下一帧即生效。
+# ============================================================================
+
+def pid_step(err, now_ms, i_acc, e_prev, t_prev, kp, ki, kd, lim):
+    """一阶 PID 步进(速度式输出, RPM)。返回 (u, i_acc, e_prev)。
+
+    err    : 位置误差(px, 带符号)
+    now_ms : 当前时刻 ticks_ms();  t_prev: 上次时刻(0=首帧)
+    i_acc  : 积分累计(px·s);       e_prev: 上次误差
+    lim    : 输出限幅(正数, RPM)
+    首帧(t_prev=0): dt 用 0.033s 兜底、微分为 0; 长帧 dt 截到 0.5s。
+    抗饱和: 输出饱和且误差仍指向饱和方向时冻结积分(不累积)。
+    """
+    dt = 0.033
+    d = 0.0
+    if t_prev:
+        dt = time.ticks_diff(now_ms, t_prev) / 1000.0
+        if dt <= 0.0:
+            dt = 0.033
+        elif dt > 0.5:
+            dt = 0.5
+        d = (err - e_prev) / dt
+    i_new = i_acc + err * dt
+    u = kp * err + ki * i_new + kd * d
+    if u > lim:
+        u = lim
+        if err > 0:
+            i_new = i_acc
+    elif u < -lim:
+        u = -lim
+        if err < 0:
+            i_new = i_acc
+    return u, i_new, err
+
+def pid_speed(u, min_rpm):
+    """PID 输出 → (方向 1/-1/0, 绝对转速); |u|<min_rpm 且非零时抬到 min_rpm(保步进低速扭矩)"""
+    if u > 0:
+        return 1, (u if u >= min_rpm else min_rpm)
+    if u < 0:
+        r = -u
+        return -1, (r if r >= min_rpm else min_rpm)
+    return 0, 0
+
+def _pid_clear(axis):
+    """清空某轴(0=yaw / 1=pitch)的 PID 运行状态(丢靶/搜索/死区停转时调用)"""
+    global _pid_yaw_i, _pid_yaw_e, _pid_yaw_t, _pid_pit_i, _pid_pit_e, _pid_pit_t
+    if axis == 0:
+        _pid_yaw_i = 0.0
+        _pid_yaw_e = 0.0
+        _pid_yaw_t = 0
+    else:
+        _pid_pit_i = 0.0
+        _pid_pit_e = 0.0
+        _pid_pit_t = 0
+
+
+# ============================================================================
 # 四、云台执行器初始化 + gimbal_send
 #    gimbal_send(dx, dy, dist, status) 是「视觉」与「执行器」之间唯一的接口:
 #      dx → 左右轴(yaw, 步进)  : 速度模式 —— |dx| 决定转速, dx 符号决定方向
@@ -542,11 +634,7 @@ try:
         P_TX = pm.get("tx_pin", 5)          # K230 TX  -> 驱动器② RXD
         P_RX = pm.get("rx_pin", 6)          # K230 RX  -> 驱动器② TXD
         P_ADDR = pm.get("addr", 1)          # 驱动器串口 ID
-        P_ACC = pm.get("acc", 200)          # 加减速档位 0~255
-        P_MIN_RPM = pm.get("min_rpm", 1)    # 最低转速: |dy| 刚越过死区时
-        P_MAX_RPM = pm.get("max_rpm", 30)   # 最高转速: |dy| >= dy_full_px 时
-        P_DY_FULL = pm.get("dy_full_px", 200)
-        P_DEADBAND = pm.get("deadband_px", 5)          # pitch 死区 px
+        # P_ACC/P_MIN_RPM/P_MAX_RPM/P_DY_FULL/P_DEADBAND = 模块级"活参数"(V7.9 触屏可调, 见第二节)
         P_REV = -1 if pm.get("reverse", False) else 1  # 方向翻转
 
         # 一个 UART 控制器只能有一组引脚, 两轴配成同一个 port 会互相覆盖
@@ -566,11 +654,7 @@ try:
         M_TX = mv.get("tx_pin", 32)         # K230 TX  -> 驱动器 RXD
         M_RX = mv.get("rx_pin", 33)         # K230 RX  -> 驱动器 TXD
         M_ADDR = mv.get("addr", 1)          # 驱动器串口 ID
-        M_ACC = mv.get("acc", 200)          # 加减速档位 0~255
-        M_MIN_RPM = mv.get("min_rpm", 1)    # 最低转速: |dx| 刚越过死区时
-        M_MAX_RPM = mv.get("max_rpm", 30)   # 最高转速: |dx| >= dx_full_px 时
-        M_DX_FULL = mv.get("dx_full_px", 200)
-        M_DEADBAND = mv.get("deadband_px", 5)
+        # M_ACC/M_MIN_RPM/M_MAX_RPM/M_DX_FULL/M_DEADBAND = 模块级"活参数"(V7.9 触屏可调, 见第二节)
         M_REV = -1 if mv.get("reverse", False) else 1
         M_COAST_EN = mv.get("coast_enabled", False)    # 丢靶预判开关(默认关, 先自检验证再启用)
         M_COAST_EDGE = mv.get("coast_edge_px", 160)    # 触发门槛: 最后 |dx| >= 此值
@@ -595,9 +679,13 @@ try:
         """
         global _last_dx, _coast_active, _coast_start
         global _acquired, _search_spin, _search_start, _search_done
+        global _pid_yaw_i, _pid_yaw_e, _pid_yaw_t
+        global _pid_pit_i, _pid_pit_e, _pid_pit_t
         try:
             if status == "search":
                 # 上电搜索(仅"启动后未捕获过目标"期间由 run_cv 调用): yaw 单方向匀速, pitch 停
+                _pid_clear(0)               # 非追踪状态: PID 状态清零(防恢复追踪时积分突跳)
+                _pid_clear(1)
                 if _yaw:
                     if _search_done:
                         _yaw.stop()                     # 超时后不再重启
@@ -620,6 +708,8 @@ try:
                     _pitch.stop()
                 return
             if status == "lost":
+                _pid_clear(0)               # 丢靶: PID 状态清零
+                _pid_clear(1)
                 if _yaw and M_COAST_EN:
                     mode, _coast_active, _coast_start, _last_dx = coast_step(
                         time.ticks_ms(), _coast_active, _coast_start, _last_dx,
@@ -647,23 +737,50 @@ try:
             _coast_active = False
             _acquired = True     # 上电搜索: 一旦追踪过目标, 永久退出搜索
 
-            # ---- yaw: |dx| 线性映射到转速, 符号定方向, 死区内停 ----
+            # ---- yaw: PID(M_PID_EN 开) 或 原 |dx| 线性映射; 符号定方向, 死区内停 ----
+            # (M_PID_EN 是热路径上的运行时判定 —— 为支持触屏实时开关, 成本=每帧一次 bool)
             if _yaw:
                 if abs(dx) > M_DEADBAND:
-                    ratio = min(1.0, abs(dx) / float(M_DX_FULL))
-                    rpm = M_MIN_RPM + (M_MAX_RPM - M_MIN_RPM) * ratio
-                    _yaw.set_speed(M_REV * (1 if dx > 0 else -1), rpm)
+                    if M_PID_EN:
+                        _nowp = time.ticks_ms()
+                        _u, _pid_yaw_i, _pid_yaw_e = pid_step(
+                            dx, _nowp, _pid_yaw_i, _pid_yaw_e, _pid_yaw_t,
+                            M_PID_KP, M_PID_KI, M_PID_KD, M_MAX_RPM)
+                        _pid_yaw_t = _nowp
+                        _dirp, rpm = pid_speed(_u, M_MIN_RPM)
+                        if _dirp:
+                            _yaw.set_speed(M_REV * _dirp, rpm)
+                        else:
+                            _yaw.stop()
+                    else:
+                        ratio = min(1.0, abs(dx) / float(M_DX_FULL))
+                        rpm = M_MIN_RPM + (M_MAX_RPM - M_MIN_RPM) * ratio
+                        _yaw.set_speed(M_REV * (1 if dx > 0 else -1), rpm)
                 else:
                     _yaw.stop()
+                    _pid_clear(0)       # 死区: PID 状态清零(防再出发时积分突跳)
 
-            # ---- pitch: |dy| 线性映射到转速, 符号定方向, 死区内停(与 yaw 相同逻辑) ----
+            # ---- pitch: 同 yaw(PID 或原映射, 死区内停) ----
             if _pitch:
                 if abs(dy) > P_DEADBAND:
-                    ratio = min(1.0, abs(dy) / float(P_DY_FULL))
-                    rpm = P_MIN_RPM + (P_MAX_RPM - P_MIN_RPM) * ratio
-                    _pitch.set_speed(P_REV * (1 if dy > 0 else -1), rpm)
+                    if P_PID_EN:
+                        _nowp = time.ticks_ms()
+                        _u, _pid_pit_i, _pid_pit_e = pid_step(
+                            dy, _nowp, _pid_pit_i, _pid_pit_e, _pid_pit_t,
+                            P_PID_KP, P_PID_KI, P_PID_KD, P_MAX_RPM)
+                        _pid_pit_t = _nowp
+                        _dirp, rpm = pid_speed(_u, P_MIN_RPM)
+                        if _dirp:
+                            _pitch.set_speed(P_REV * _dirp, rpm)
+                        else:
+                            _pitch.stop()
+                    else:
+                        ratio = min(1.0, abs(dy) / float(P_DY_FULL))
+                        rpm = P_MIN_RPM + (P_MAX_RPM - P_MIN_RPM) * ratio
+                        _pitch.set_speed(P_REV * (1 if dy > 0 else -1), rpm)
                 else:
                     _pitch.stop()
+                    _pid_clear(1)
         except Exception:
             pass
 
@@ -994,8 +1111,8 @@ def _yolo_ok():
 # ============================================================================
 
 def _calib_rects(ox, oy, sw, sh, bw):
-    """生成 7 个触摸按钮的命中矩形(LCD 坐标): 上/下(左缘) 左/右(右缘)
-    mode追踪/画圈切换 · dot隐藏 · S保存(顶中一字排开)"""
+    """生成 8 个触摸按钮的命中矩形(LCD 坐标): 上/下(左缘) 左/右(右缘)
+    mode追踪/画圈切换 · dot隐藏 · S保存 · P调参页(顶中一字排开)"""
     m = 6
     y1 = sh // 2 - bw - 6
     y2 = y1 + bw + 12
@@ -1010,6 +1127,7 @@ def _calib_rects(ox, oy, sw, sh, bw):
         ("mode",  xc - 2 * bw - 12, oy + m, xc - bw - 12, oy + m + bw),
         ("dot",   xc - bw - 4, oy + m, xc - 4, oy + m + bw),
         ("save",  xc + 4, oy + m, xc + bw + 4, oy + m + bw),
+        ("param", xc + bw + 12, oy + m, xc + 2 * bw + 12, oy + m + bw),
     )
 
 def calib_hit(x, y, rects):
@@ -1106,6 +1224,339 @@ def calib_save_file(path, lox, loy):
     except Exception as e:
         return False, str(e)
 
+# ---- V7.9 触屏调参: 数值格式化 / 参数表 / 步进逻辑(纯函数, 主机可测) ----
+
+def fmt_num(v):
+    """数值 → JSON 文本: int 原样; float 最多 4 位小数去尾零(0.2800→0.28, 1.0→1)"""
+    if isinstance(v, int):
+        return str(v)
+    s = "%.4f" % v
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s
+
+def fmt_disp(item, val):
+    """触屏显示值: pid 开关 → ON/OFF; 浮点 2 位小数; 整数原样"""
+    if item == "pid":
+        return "ON" if val else "OFF"
+    if isinstance(val, float):
+        return "%.2f" % val
+    return "%d" % val
+
+# 触屏可调的 9 项(循环顺序; "pid"=使能开关, 其余为数值)
+PARAM_ITEMS = ("pid", "kp", "ki", "kd", "max", "min", "dead", "acc", "full")
+# 按钮/显示用短名
+PARAM_NAMES = {"pid": "PID", "kp": "Kp", "ki": "Ki", "kd": "Kd",
+               "max": "Max", "min": "Min", "dead": "Dead", "acc": "Acc",
+               "full": "Full"}
+# 数值项步长/范围: (步长, 下限, 上限, 是否浮点)
+PARAM_SPEC = {
+    "kp":   (0.02, 0.0, 5.0, True),
+    "ki":   (0.01, 0.0, 2.0, True),
+    "kd":   (0.01, 0.0, 2.0, True),
+    "max":  (1, 1, 500, False),
+    "min":  (1, 0, 500, False),
+    "dead": (1, 0, 100, False),
+    "acc":  (5, 0, 255, False),
+    "full": (10, 20, 640, False),
+}
+
+def param_next(item):
+    """参数项循环: 返回 item 的下一项(表尾回卷); 未知项回到第一项"""
+    for i in range(len(PARAM_ITEMS)):
+        if PARAM_ITEMS[i] == item:
+            return PARAM_ITEMS[(i + 1) % len(PARAM_ITEMS)]
+    return PARAM_ITEMS[0]
+
+def param_calc(item, val, direction):
+    """调参步进(纯函数): item 当前值 val 按 direction(+1/-1) 走一格。
+
+    - 数值项: ±步长, clamp 到 [下限,上限], 浮点四舍五入到 4 位小数(防尾数漂移)
+    - "pid" : +1 → 1(开), -1 → 0(关)
+    """
+    if item == "pid":
+        return 1 if direction > 0 else 0
+    step, lo, hi, isf = PARAM_SPEC[item]
+    v = val + (step if direction > 0 else -step)
+    if v < lo:
+        v = lo
+    elif v > hi:
+        v = hi
+    if isf:
+        return round(v, 4)
+    return int(v)
+
+def param_value(axis, item):
+    """读触屏调参当前值(axis: 0=yaw / 1=pitch)"""
+    if axis == 0:
+        if item == "kp":   return M_PID_KP
+        if item == "ki":   return M_PID_KI
+        if item == "kd":   return M_PID_KD
+        if item == "max":  return M_MAX_RPM
+        if item == "min":  return M_MIN_RPM
+        if item == "dead": return M_DEADBAND
+        if item == "acc":  return M_ACC
+        if item == "full": return M_DX_FULL
+        if item == "pid":  return 1 if M_PID_EN else 0
+        return 0
+    if item == "kp":   return P_PID_KP
+    if item == "ki":   return P_PID_KI
+    if item == "kd":   return P_PID_KD
+    if item == "max":  return P_MAX_RPM
+    if item == "min":  return P_MIN_RPM
+    if item == "dead": return P_DEADBAND
+    if item == "acc":  return P_ACC
+    if item == "full": return P_DY_FULL
+    if item == "pid":  return 1 if P_PID_EN else 0
+    return 0
+
+def param_apply(axis, item, direction):
+    """调参步进并写回运行时全局(gimbal_send 下一帧即生效); "acc" 同步进电机实例。返回新值。"""
+    global M_PID_EN, M_PID_KP, M_PID_KI, M_PID_KD
+    global M_MAX_RPM, M_MIN_RPM, M_DEADBAND, M_ACC, M_DX_FULL
+    global P_PID_EN, P_PID_KP, P_PID_KI, P_PID_KD
+    global P_MAX_RPM, P_MIN_RPM, P_DEADBAND, P_ACC, P_DY_FULL
+    if axis == 0:
+        if item == "kp":
+            M_PID_KP = param_calc(item, M_PID_KP, direction); return M_PID_KP
+        if item == "ki":
+            M_PID_KI = param_calc(item, M_PID_KI, direction); return M_PID_KI
+        if item == "kd":
+            M_PID_KD = param_calc(item, M_PID_KD, direction); return M_PID_KD
+        if item == "max":
+            M_MAX_RPM = param_calc(item, M_MAX_RPM, direction); return M_MAX_RPM
+        if item == "min":
+            M_MIN_RPM = param_calc(item, M_MIN_RPM, direction); return M_MIN_RPM
+        if item == "dead":
+            M_DEADBAND = param_calc(item, M_DEADBAND, direction); return M_DEADBAND
+        if item == "acc":
+            M_ACC = param_calc(item, M_ACC, direction)
+            if _yaw:
+                _yaw.acc = M_ACC        # 已构造实例持有副本, 同步后新值才生效
+            return M_ACC
+        if item == "full":
+            M_DX_FULL = param_calc(item, M_DX_FULL, direction); return M_DX_FULL
+        if item == "pid":
+            M_PID_EN = (param_calc(item, 0, direction) == 1)
+            return 1 if M_PID_EN else 0
+        return 0
+    if item == "kp":
+        P_PID_KP = param_calc(item, P_PID_KP, direction); return P_PID_KP
+    if item == "ki":
+        P_PID_KI = param_calc(item, P_PID_KI, direction); return P_PID_KI
+    if item == "kd":
+        P_PID_KD = param_calc(item, P_PID_KD, direction); return P_PID_KD
+    if item == "max":
+        P_MAX_RPM = param_calc(item, P_MAX_RPM, direction); return P_MAX_RPM
+    if item == "min":
+        P_MIN_RPM = param_calc(item, P_MIN_RPM, direction); return P_MIN_RPM
+    if item == "dead":
+        P_DEADBAND = param_calc(item, P_DEADBAND, direction); return P_DEADBAND
+    if item == "acc":
+        P_ACC = param_calc(item, P_ACC, direction)
+        if _pitch:
+            _pitch.acc = P_ACC
+        return P_ACC
+    if item == "full":
+        P_DY_FULL = param_calc(item, P_DY_FULL, direction); return P_DY_FULL
+    if item == "pid":
+        P_PID_EN = (param_calc(item, 0, direction) == 1)
+        return 1 if P_PID_EN else 0
+    return 0
+
+def param_save_items():
+    """收集写回 config 的全部触屏调参项: [(段名, 键名, 文本值), ...] (调参页 S 键用)"""
+    return (
+        ("motor", "pid_enabled", "true" if M_PID_EN else "false"),
+        ("motor", "pid_kp", fmt_num(M_PID_KP)),
+        ("motor", "pid_ki", fmt_num(M_PID_KI)),
+        ("motor", "pid_kd", fmt_num(M_PID_KD)),
+        ("motor", "min_rpm", fmt_num(M_MIN_RPM)),
+        ("motor", "max_rpm", fmt_num(M_MAX_RPM)),
+        ("motor", "dx_full_px", fmt_num(M_DX_FULL)),
+        ("motor", "deadband_px", fmt_num(M_DEADBAND)),
+        ("motor", "acc", fmt_num(M_ACC)),
+        ("pitch_motor", "pid_enabled", "true" if P_PID_EN else "false"),
+        ("pitch_motor", "pid_kp", fmt_num(P_PID_KP)),
+        ("pitch_motor", "pid_ki", fmt_num(P_PID_KI)),
+        ("pitch_motor", "pid_kd", fmt_num(P_PID_KD)),
+        ("pitch_motor", "min_rpm", fmt_num(P_MIN_RPM)),
+        ("pitch_motor", "max_rpm", fmt_num(P_MAX_RPM)),
+        ("pitch_motor", "dy_full_px", fmt_num(P_DY_FULL)),
+        ("pitch_motor", "deadband_px", fmt_num(P_DEADBAND)),
+        ("pitch_motor", "acc", fmt_num(P_ACC)),
+    )
+
+def _replace_json_token(line, text):
+    """把一行 json 里冒号后第一个 token 换成 text(保留键/缩进/逗号等其余文本);
+    无 token(空值)返回 None。可替换数字 / true / false 等任意标量 token。"""
+    i = line.find(":")
+    if i < 0:
+        return None
+    j = i + 1
+    n = len(line)
+    while j < n and line[j] == " ":
+        j += 1
+    k = j
+    while k < n and line[k] != "," and line[k] != "}" and line[k] != "]" and line[k] != " ":
+        k += 1
+    if k == j:
+        return None
+    return line[:j] + text + line[k:]
+
+def param_save_text(src, items):
+    """config.json 文本 → 逐项替换 [(段, 键, 文本), ...]; 其余行逐字节保留。
+
+    段跟踪: 顶层段行 = 2 空格缩进的 "name": {; 2 空格缩进的 } / }, 关段。
+    仅替换"位于对应段内"的键行; 任一项未命中 → 返回 None(调用方按失败处理, 不写盘)。
+    """
+    lines = src.split("\n")
+    todo = list(items)
+    cur = None
+    for i in range(len(lines)):
+        s = lines[i].strip()
+        ind = len(lines[i]) - len(lines[i].lstrip(" "))
+        if ind == 2 and s.startswith('"') and s.rstrip().endswith("{"):
+            q = s.find('"', 1)
+            cur = s[1:q] if q > 0 else None
+            continue
+        if ind == 2 and (s == "}" or s == "},"):
+            cur = None
+            continue
+        if cur is None or not s.startswith('"') or ":" not in s:
+            continue
+        q = s.find('"', 1)
+        if q < 0:
+            continue
+        key = s[1:q]
+        for t in range(len(todo)):
+            sec, k, text = todo[t]
+            if sec == cur and k == key:
+                nl = _replace_json_token(lines[i], text)
+                if nl is None:
+                    return None
+                lines[i] = nl
+                del todo[t]
+                break
+    if todo:
+        return None
+    return "\n".join(lines)
+
+def param_save_file(path, items):
+    """读 config → 逐项文本替换 → 备份(.bak) → 覆盖写 → 读回校验(合法 JSON + 逐项值吻合)。
+    返回 (ok, msg); 任何失败不动原文件。无 path(未从文件加载配置)时直接失败。"""
+    if not path:
+        return False, "no config path"
+    try:
+        with open(path, "r") as f:
+            src = f.read()
+        dst = param_save_text(src, items)
+        if dst is None:
+            return False, "keys not found (config 缺新键?)"
+        try:
+            with open(path + ".bak", "w") as f:
+                f.write(src)
+        except Exception:
+            pass
+        with open(path, "w") as f:
+            f.write(dst)
+        try:
+            import ujson as _j
+        except ImportError:
+            import json as _j
+        with open(path, "r") as f:
+            cfg = _j.load(f)
+        for sec, key, text in items:
+            try:
+                got = cfg[sec][key]
+            except Exception:
+                return False, "verify fail: %s.%s" % (sec, key)
+            if text == "true" or text == "false":
+                okv = (bool(got) == (text == "true"))
+            else:
+                try:
+                    okv = abs(float(got) - float(text)) < 1e-6
+                except Exception:
+                    okv = False
+            if not okv:
+                return False, "verify fail: %s.%s" % (sec, key)
+        return True, "saved %d keys" % len(items)
+    except Exception as e:
+        return False, str(e)
+
+def param_step(vis, btn, hold_t0, now, pressed, was_pressed, hit, repeat_ms):
+    """调参页触摸状态机(规则与 calib_step 相同; 连发按钮 = plus/minus)。
+    返回 (vis, btn, hold_t0, action);
+    action ∈ None / "plus" / "minus" / "item" / "axis" / "save" / "back"
+    """
+    if not vis:
+        if pressed and not was_pressed:
+            return True, None, now, None
+        return False, None, hold_t0, None
+    if not pressed:
+        return True, None, hold_t0, None
+    if hit is None or hit != btn:
+        return True, hit, now, hit
+    if (hit == "plus" or hit == "minus") \
+            and time.ticks_diff(now, hold_t0) >= repeat_ms:
+        return True, hit, now, hit
+    return True, hit, hold_t0, None
+
+def _param_rects(ox, oy, sw, sh, bw):
+    """生成调参页 6 个按钮的命中矩形(LCD 坐标): +/− (左缘上下)
+    项(PID/Kp/...) · 轴(Y/P) (右缘上下) · S保存 · X返回(顶中)"""
+    m = 6
+    y1 = sh // 2 - bw - 6
+    y2 = y1 + bw + 12
+    xl = ox + m
+    xr = ox + sw - m - bw
+    xc = ox + sw // 2
+    return (
+        ("plus",  xl, oy + y1, xl + bw, oy + y1 + bw),
+        ("minus", xl, oy + y2, xl + bw, oy + y2 + bw),
+        ("item",  xr, oy + y1, xr + bw, oy + y1 + bw),
+        ("axis",  xr, oy + y2, xr + bw, oy + y2 + bw),
+        ("save",  xc - bw - 4, oy + m, xc - 4, oy + m + bw),
+        ("back",  xc + 4, oy + m, xc + bw + 4, oy + m + bw),
+    )
+
+def param_draw(frame_np, rects, axis, item, val, pid_on):
+    """绘制调参页: 6 按钮 + 底部当前值行("<Yaw/Pitch> <项> = <值>  PID:<ON/OFF>")。
+    rects 为 LCD 空间; 1:1 直显时换算到采集帧坐标 = 平移 (-DISPLAY_X, -DISPLAY_Y)。"""
+    for name, x0, y0, x1, y1 in rects:
+        a0 = x0 - DISPLAY_X
+        b0 = y0 - DISPLAY_Y
+        a1 = x1 - DISPLAY_X
+        b1 = y1 - DISPLAY_Y
+        cv2.line(frame_np, (a0, b0), (a1, b0), (0, 200, 200), 2)
+        cv2.line(frame_np, (a1, b0), (a1, b1), (0, 200, 200), 2)
+        cv2.line(frame_np, (a1, b1), (a0, b1), (0, 200, 200), 2)
+        cv2.line(frame_np, (a0, b1), (a0, b0), (0, 200, 200), 2)
+        mx = (a0 + a1) // 2
+        my = (b0 + b1) // 2
+        if name == "plus":
+            cv2.line(frame_np, (mx - 12, my), (mx + 12, my), (0, 200, 200), 3)
+            cv2.line(frame_np, (mx, my - 12), (mx, my + 12), (0, 200, 200), 3)
+        elif name == "minus":
+            cv2.line(frame_np, (mx - 12, my), (mx + 12, my), (0, 200, 200), 3)
+        elif name == "item":
+            cv2.putText(frame_np, PARAM_NAMES.get(item, item), (mx - 14, my + 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 200), 2)
+        elif name == "axis":
+            cv2.putText(frame_np, "P" if axis else "Y", (mx - 8, my + 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 200), 2)
+        elif name == "save":
+            cv2.putText(frame_np, "S", (mx - 8, my + 9),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 200), 2)
+        else:
+            cv2.putText(frame_np, "X", (mx - 8, my + 9),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 200), 2)
+    vt = "%s %s = %s   PID:%s" % (
+        "Pitch" if axis else "Yaw", PARAM_NAMES.get(item, item),
+        fmt_disp(item, val), "ON" if pid_on else "OFF")
+    cv2.putText(frame_np, vt, ((SENSOR_W - 8 * len(vt)) // 2, SENSOR_H - 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
 def _calib_arrow(frame_np, cx, cy, name):
     """方向按钮符号: 三角描边(上/下/左/右)"""
     s = 13
@@ -1146,6 +1597,10 @@ def calib_draw(frame_np, rects, lox, loy, dot_r, mode_on=False):
             col = (0, 165, 255) if mode_on else (0, 200, 0)
             cv2.putText(frame_np, "C" if mode_on else "T", (mx - 9, my + 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, col, 2)
+        elif name == "param":
+            # 进入调参页(PID 与云台参数)
+            cv2.putText(frame_np, "P", (mx - 8, my + 9),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 0), 2)
         else:
             _calib_arrow(frame_np, mx, my, name)
     gx = CENTER_X + lox
@@ -1154,6 +1609,7 @@ def calib_draw(frame_np, rects, lox, loy, dot_r, mode_on=False):
     cv2.circle(frame_np, (gx, gy), dot_r + 1, (255, 255, 255), 1)
 
 CALIB_BTNS = _calib_rects(DISPLAY_X, DISPLAY_Y, SENSOR_W, SENSOR_H, 56)
+PARAM_BTNS = _param_rects(DISPLAY_X, DISPLAY_Y, SENSOR_W, SENSOR_H, 56)
 
 # ============================================================================
 # 七、CV 模式主循环
@@ -1175,6 +1631,10 @@ def run_cv():
     _calib_btn = None                # 按住中的按钮名
     _calib_hold = 0                  # 按住起始时刻(连发计时)
     _calib_pre = False               # 上帧是否有触点(唤醒边沿判定)
+    _page = 0                        # 触屏页: 0=校准 / 1=调参(P 键进入, X 键返回)
+    _paxis = 0                       # 调参页当前轴(0=yaw / 1=pitch; 轴键切换)
+    _pitem = "pid"                   # 调参页当前项(项键循环; 见 PARAM_ITEMS)
+    _calib_skip = False              # 切页后吞掉同一次按压的残留动作(防跨页串按)
     fps = fps_count = 0
     fps_tick = time.ticks_ms()
 
@@ -1225,7 +1685,7 @@ def run_cv():
             frame = sensor.snapshot(chn=CAM_CHN_ID_0)
             frame_np = frame.to_numpy_ref()
 
-            # ---- V7.7 触屏中心校准: 触摸扫描 → 移动绿点/显隐/保存(先于本帧瞄准生效) ----
+            # ---- V7.7/7.9 触屏: 校准页(移动绿点/显隐/保存) + 调参页(PID 与云台参数) ----
             if _calib_tp is not None:
                 try:
                     _pts = _calib_tp.read()
@@ -1236,37 +1696,78 @@ def run_cv():
                     _calib_tp = None
                     _pts = ()
                 _pressed = len(_pts) > 0
-                _hit = calib_hit(_pts[0].x, _pts[0].y, CALIB_BTNS) if _pressed else None
-                _calib_vis, _calib_btn, _calib_hold, _act = calib_step(
-                    _calib_vis, _calib_btn, _calib_hold, time.ticks_ms(),
-                    _pressed, _calib_pre, _hit, CALIB_REPEAT)
+                if _page == 0:
+                    _hit = calib_hit(_pts[0].x, _pts[0].y, CALIB_BTNS) if _pressed else None
+                    _calib_vis, _calib_btn, _calib_hold, _act = calib_step(
+                        _calib_vis, _calib_btn, _calib_hold, time.ticks_ms(),
+                        _pressed, _calib_pre, _hit, CALIB_REPEAT)
+                else:
+                    _hit = calib_hit(_pts[0].x, _pts[0].y, PARAM_BTNS) if _pressed else None
+                    _calib_vis, _calib_btn, _calib_hold, _act = param_step(
+                        _calib_vis, _calib_btn, _calib_hold, time.ticks_ms(),
+                        _pressed, _calib_pre, _hit, CALIB_REPEAT)
                 _calib_pre = _pressed
-                if _act == "up":
-                    LOY -= CALIB_STEP
-                elif _act == "down":
-                    LOY += CALIB_STEP
-                elif _act == "left":
-                    LOX -= CALIB_STEP
-                elif _act == "right":
-                    LOX += CALIB_STEP
-                elif _act == "dot":
-                    _calib_vis = False
-                elif _act == "mode":
-                    if _mode_pin is None:            # 引脚启用时以引脚为准(避免双源打架)
-                        _circle_on = not _circle_on
-                        _theta = None                # 进出画圈沿重置起始角
-                        print("MODE->%s (touch)" % ("circle" if _circle_on else "track"))
-                elif _act == "save":
-                    _ok, _msg = calib_save_file(CFG_PATH, LOX, LOY)
-                    print("calib: save %s %s" % ("OK" if _ok else "FAIL", _msg))
-                if LOX < -CALIB_XMAX:
-                    LOX = -CALIB_XMAX
-                elif LOX > CALIB_XMAX:
-                    LOX = CALIB_XMAX
-                if LOY < -CALIB_YMAX:
-                    LOY = -CALIB_YMAX
-                elif LOY > CALIB_YMAX:
-                    LOY = CALIB_YMAX
+                if _calib_skip:              # 切页后的同一次按压: 吞掉动作(松开后恢复)
+                    _act = None
+                    if not _pressed:
+                        _calib_skip = False
+                if _page == 0:
+                    if _act == "up":
+                        LOY -= CALIB_STEP
+                    elif _act == "down":
+                        LOY += CALIB_STEP
+                    elif _act == "left":
+                        LOX -= CALIB_STEP
+                    elif _act == "right":
+                        LOX += CALIB_STEP
+                    elif _act == "dot":
+                        _calib_vis = False
+                    elif _act == "mode":
+                        if _mode_pin is None:        # 引脚启用时以引脚为准(避免双源打架)
+                            _circle_on = not _circle_on
+                            _theta = None            # 进出画圈沿重置起始角
+                            print("MODE->%s (touch)" % ("circle" if _circle_on else "track"))
+                    elif _act == "save":
+                        _ok, _msg = calib_save_file(CFG_PATH, LOX, LOY)
+                        print("calib: save %s %s" % ("OK" if _ok else "FAIL", _msg))
+                    elif _act == "param":
+                        _page = 1
+                        _calib_btn = None
+                        _calib_hold = 0
+                        _calib_skip = True           # 防按 P 未松手时误触调参页按钮
+                        print("UI->param page")
+                    if LOX < -CALIB_XMAX:
+                        LOX = -CALIB_XMAX
+                    elif LOX > CALIB_XMAX:
+                        LOX = CALIB_XMAX
+                    if LOY < -CALIB_YMAX:
+                        LOY = -CALIB_YMAX
+                    elif LOY > CALIB_YMAX:
+                        LOY = CALIB_YMAX
+                else:
+                    if _act == "plus":
+                        _v = param_apply(_paxis, _pitem, 1)
+                        print("tune: %s %s=%s" % ("pitch" if _paxis else "yaw",
+                                                  _pitem, fmt_num(_v)))
+                    elif _act == "minus":
+                        _v = param_apply(_paxis, _pitem, -1)
+                        print("tune: %s %s=%s" % ("pitch" if _paxis else "yaw",
+                                                  _pitem, fmt_num(_v)))
+                    elif _act == "item":
+                        _pitem = param_next(_pitem)
+                        print("tune: item -> %s" % _pitem)
+                    elif _act == "axis":
+                        _paxis = 1 - _paxis
+                        print("tune: axis -> %s" % ("pitch" if _paxis else "yaw"))
+                    elif _act == "save":
+                        _ok, _msg = param_save_file(CFG_PATH, param_save_items())
+                        print("param: save %s %s" % ("OK" if _ok else "FAIL", _msg))
+                    elif _act == "back":
+                        _page = 0
+                        _calib_btn = None
+                        _calib_hold = 0
+                        _calib_skip = True
+                        print("UI->calib page")
 
             # ---- V7 模式引脚采样 + 去抖: 被供电=画圈, 其余=仅追踪 ----------------
             if _mode_pin is not None:
@@ -1344,9 +1845,14 @@ def run_cv():
                 fps_tick = now
             cv2.putText(frame_np, "FPS:%d" % fps, (4, SENSOR_H - 8),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-            # 触屏校准 UI(绿点+按钮, 可隐藏)
+            # 触屏 UI(校准页绿点+按钮 / 调参页, 可隐藏)
             if _calib_vis:
-                calib_draw(frame_np, CALIB_BTNS, LOX, LOY, CALIB_DOT_R, _circle_on)
+                if _page == 0:
+                    calib_draw(frame_np, CALIB_BTNS, LOX, LOY, CALIB_DOT_R, _circle_on)
+                else:
+                    param_draw(frame_np, PARAM_BTNS, _paxis, _pitem,
+                               param_value(_paxis, _pitem),
+                               M_PID_EN if _paxis == 0 else P_PID_EN)
 
             Display.show_image(frame, x=DISPLAY_X, y=DISPLAY_Y)
             if frame_id % GC_EVERY == 0:

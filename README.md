@@ -108,11 +108,11 @@ cp model.kmodel /sdcard/model/
 |---|---|
 | `detection` | 检测模式（cv / yolo）与跳帧 |
 | `camera` / `display` / `center` | CSI 端口（`csi_id`）、输出分辨率（16:9 全幅）、显示偏移、追踪中心点（含激光偏移 `laser_offset_x/y`）|
-| `center_calib` | **触屏中心校准 + 模式切换**：触摸按钮移动绿色校准点（=追踪收敛点，即 `center.laser_offset`）；`T/C` 追踪/画圈切换；`●` 隐藏 / `S` 保存写回 |
+| `center_calib` | **触屏校准 + 调参页**：校准页按钮移动绿色校准点（=追踪收敛点，即 `center.laser_offset`）、`T/C` 追踪/画圈切换、`●` 隐藏、`S` 保存写回；`P` 进调参页（`Y/P` 切轴、`项` 选参数、`+`/`-` 实时调、`S` 写回，见 4.3）|
 | `rectangle` | CV 矩形检测阈值（现场光照变化主要调这里）|
 | `yolo` | KPU 模型路径 / labels / input_size（见第四节规则）|
-| `motor` | **yaw 轴**：Emm42 速度模式（RPM 区间 / 死区 / 方向 / 使能）|
-| `pitch_motor` | **pitch 轴**：Emm42 速度模式（与 yaw 同构：min_rpm/max_rpm/dy_full_px/死区/方向）|
+| `motor` | **yaw 轴**：Emm42 速度模式（RPM 区间 / 死区 / 方向 / 使能）；V7.9 PID 参数 `pid_enabled` / `pid_kp` / `pid_ki` / `pid_kd`（见 4.3）|
+| `pitch_motor` | **pitch 轴**：Emm42 速度模式（与 yaw 同构：min_rpm/max_rpm/dy_full_px/死区/方向）；同含 `pid_*` 键 |
 | `red_target` | **红环检测**（与矩形检测同帧联合进行，画圈模式用）：红色掩膜/环直径/空心验证阈值、ROI 外扩、半径修正 |
 | `search` | **上电搜索**：未捕获目标时 yaw 单方向匀速旋转找靶（enabled/rpm/direction/max_ms）|
 | `circle` | **画圈运动**：沿红环匀速转圈的角速度/方向/误差门控（speed_deg_s/direction/pause_px）|
@@ -171,7 +171,18 @@ cp model.kmodel /sdcard/model/
 
 > 历史：曾试行位置模式（角度记账 + 绝对位置目标，需上电摆中位校准 0 点），实测驱动器②不工作，已改为速度模式。
 
-### 4.3 调参速查
+### 4.3 PID 控制（V7.9，可选）与触屏调参
+
+两轴默认仍走 4.1/4.2 的线性映射；把对应轴 `pid_enabled` 置 `true`（或在触屏调参页把该项调到 ON）后切换为**速度式 PID**：
+
+- `u = Kp·e + Ki·∫e·dt + Kd·de/dt`（e = 像素误差，u = RPM；输出限幅到 `max_rpm`；|u| 小于 `min_rpm` 时抬到 `min_rpm` 保步进起步扭矩）。
+- 死区内停转并清 PID 状态；丢靶 / 上电搜索 / 丢靶预判期间同样清零——不跨状态积累积分（防恢复追踪时突跳）。
+- **抗饱和**：输出饱和且误差仍指向饱和方向时冻结积分；首帧 dt 按 33ms 兜底、异常长帧截到 0.5s（防微分放大）。
+- 参数：`pid_kp` 比例（RPM/px，默认 0.28=yaw / 0.14=pitch，≈原映射斜率）、`pid_ki` 积分（消恒差，现场试 0.01~0.1 起）、`pid_kd` 微分（抑过冲，试 0.01~0.05 起）。
+- **触屏调参页（实时生效，免重启）**：校准页按 `P` 进入；`Y/P` 切轴；`项` 按钮循环选项（PID 开关 / Kp / Ki / Kd / Max / Min / Dead / Acc / Full）；`+` / `-` 步进（按住连发），改动**下一帧即生效**；`S` 写回 config.json（`.bak` 备份 + 写后读回校验）；`X` 返回校准页。
+- 丢靶预判（coast）与上电搜索不受 PID 开关影响，仍按原映射转速执行。
+
+### 4.4 调参速查
 
 | 现象 | 调整 |
 |------|------|
@@ -184,25 +195,25 @@ cp model.kmodel /sdcard/model/
 | 丢靶后乱转/干扰追踪 | `coast_enabled` 保持/置 false（回「丢靶即停」）；或调小 `coast_ms` |
 | 跟踪不平滑 | 增大检测端滤波/跳帧参数 |
 
-### 4.4 目标识别：矩形追踪 / 红环画圈（V7）
+### 4.5 目标识别：矩形追踪 / 红环画圈（V7）
 
 矩形检测与红色（红环）检测**每检测帧联合进行**；早期版本的红点（靶心）瞄准已删除（与矩形识别冲突），追踪以**矩形中心**为准：
 
 | 模式 | 目标 | 串口目标源 |
 |---|---|---|
 | 追踪（默认） | **矩形中心** | `OK [rect]` |
-| 画圈（触屏 `T/C` 切换，见 4.5） | **红环**（环上 θ 点） | `OK [ring]` |
+| 画圈（触屏 `T/C` 切换，见 4.6） | **红环**（环上 θ 点） | `OK [ring]` |
 
-无有效目标 → 丢靶逻辑（coast/停）；上电未捕获期 → 自动搜索（见 4.6）。
+无有效目标 → 丢靶逻辑（coast/停）；上电未捕获期 → 自动搜索（见 4.7）。
 
-### 4.5 画圈模式（触屏 T/C 切换；引脚可选）
+### 4.6 画圈模式（触屏 T/C 切换；引脚可选）
 
 - 画圈模式下红环可见 → 光斑沿红环**连续匀速画圆**（`circle.speed_deg_s` 角速度、`direction` 方向；光斑离目标点超过 `pause_px` 时暂停 θ 推进等伺服追上）。
 - 红环暂不可见 → 保持矩形追踪瞄准、**θ 冻结**（不乱转不丢靶），环恢复即续圈。
 - **切换方式（默认）**：触屏顶中 `T/C` 按钮点击切换（追踪⇄画圈），串口打印 `MODE->.. (touch)`。
 - **切换方式（可选备用）**：`config.json` 的 `mode_pin.enabled=true` 时改用 GPIO49 跳线：**三脚跳线**（中间=GPIO49/Pin3，两侧=3.3V/Pin1 与 GND）：拨 3.3V=画圈、拨 GND=仅追踪；**悬空不可信**（I2C0 引脚板载上拉情况以实测为准）。此时触屏 `T/C` **故意失效**（以引脚为准），上电串口打印 `mode pin: GPIO49 level=..` 供核对。
 
-### 4.6 上电搜索
+### 4.7 上电搜索
 
 - 开机后**未捕获过任何目标**时，yaw 按 `search.rpm` 单方向匀速旋转找靶；捕获目标（矩形或红环）即停并转入追踪。
 - 一旦捕获过目标（发出过 track），搜索**永久退出**——后续丢靶行为与原来一致（coast/停），不会被搜索干扰。
@@ -224,10 +235,23 @@ cp model.kmodel /sdcard/model/
 | `T / C` | 顶中 | 追踪 / 画圈模式切换（显示当前模式：T=追踪绿 / C=画圈橙；串口打印 `MODE->.. (touch)`）|
 | `●` | 顶中 | 隐藏绿点+按钮（画面干净）；再触摸屏幕任意处唤出 |
 | `S` | 顶中 | 当前偏移写回 `config.json`（自动备份 `.bak`、写后校验）|
+| `P` | 顶中 | 进入**调参页**（PID / 云台参数，见下表）|
 
 单点一步 `step_px`（默认 4px），按住不放连发（间隔 `repeat_ms`）；绿点即时生效于追踪/画圈。
 操作：把靶标与激光同处画面，用按钮把绿点拖到"激光应命中的位置"，观察云台收敛，满意后按 `S`——
 串口打印 `calib: save OK saved (x,y)`，重启后仍生效。
+
+**调参页（`P` 进入 / `X` 返回）**：调 PID 与云台参数，实时生效（现场调完按 `S` 写回）：
+
+| 按钮 | 位置 | 作用 |
+|---|---|---|
+| `+` / `-` | 左缘 | 当前参数值 +/- 一步（按住连发；步长按项：Kp±0.02、Ki/Kd±0.01、Max/Min/Dead±1、Acc±5、Full±10）|
+| `项` | 右缘上 | 循环切换参数项：PID 开关 → Kp → Ki → Kd → Max → Min → Dead → Acc → Full |
+| `Y / P` | 右缘下 | 切换调节的轴（Yaw / Pitch）|
+| `S` | 顶中 | 全部 18 项写回 `config.json`（`.bak` 备份 + 读回校验）|
+| `X` | 顶中 | 返回校准页 |
+
+页面底部实时显示 `轴 项 = 值  PID:ON/OFF`；改动**下一帧即生效**（不用重启；丢靶预判/搜索不受影响）。
 
 排障：按键无反应 → 查 6P 触摸排线、看串口 `calib: touch ...` 行（触摸异常自动禁用，不影响追踪主程序）；
 按 `▲` 绿点却往反方向走 → 把 `center_calib.touch_rotate` 从 -1 改 0/1/2/3 逐个试（坐标旋转）。
@@ -248,10 +272,11 @@ python tools/test_emm_protocol.py    # 协议帧对拍（12 用例）
 python tools/test_coast_logic.py     # 丢靶预判状态机（10 用例）
 python tools/test_circle_logic.py    # V7 纯函数：红环分流/画圈几何/搜索/引脚去抖（29 用例）
 python tools/test_camera_init.py     # 采集初始化守门：CSI id / 720 提示 / crop 兜底 / config 几何链 / 死显示路径（11 用例）
-python tools/test_center_calib.py    # V7.7 触屏校准：按钮命中/触摸状态机/config 文本替换/7 键布局（33 用例）
+python tools/test_center_calib.py    # V7.7 触屏校准：按钮命中/触摸状态机/config 文本替换/8 键布局（33 用例）
+python tools/test_pid_tune.py        # V7.9 PID+触屏调参：pid_step/参数步进/段内键保存/调参状态机（48 用例）
 ```
 
-五套均为 stdlib 独立脚本，从 `k230/main.py` AST 提取目标函数/常量后断言（不需要硬件、不需要 pytest）。
+六套均为 stdlib 独立脚本，从 `k230/main.py` AST 提取目标函数/常量后断言（不需要硬件、不需要 pytest）。
 改动协议层先跑第一套；改动视觉/控制/配置面先跑其余几套；再上机。
 （`test_circle_logic.py` 的阈值常量直接取 main.py 定义，若 main.py 漏定义会直接报错。）
 
@@ -267,6 +292,7 @@ python tools/test_center_calib.py    # V7.7 触屏校准：按钮命中/触摸�
 - [ ] 方向核对：发正 dx → yaw 向减小偏差方向转；正 dy → pitch 同理
 - [ ] 激光偏移已标定：触屏 `▲▼◀▶` 调绿点、满意后按 `S` 保存（或手填 `center.laser_offset_x/y`）
 - [ ] 模式切换核对：触屏 `T/C` 按钮切换追踪/画圈（串口打印 `MODE->circle (touch)`）；若用跳线：`mode_pin.enabled=true` 且上电核对 `mode pin:` 电平打印
+- [ ] 触屏调参核对：`P` 进调参页 → `项`/`+`/`-` 调整（串口打印 `tune: ...`、下一帧生效）；`S` 保存打印 `param: save OK saved 18 keys`，重启后参数保持
 - [ ] 红环阈值现场核对：切到画圈模式后应打印 `OK [ring]` 并绕环转圈；追踪模式应打印 `OK [rect]`
 - [ ] 不摆靶开机 → yaw 匀速搜索；放靶 1~2 秒内停转进入追踪
 - [ ] 准备备用 SD 卡（预烧录系统+代码）
@@ -296,6 +322,9 @@ python tools/test_center_calib.py    # V7.7 触屏校准：按钮命中/触摸�
 | 开机不搜索 | 确认 `search.enabled=true` 且开机后从未捕获过目标；已捕获过则永不搜索（设计如此）|
 | 引脚切换不生效（用跳线时）| 核对 `mode_pin.gpio/active_level`；看启动 `mode pin:` 打印与实际跳线电平；悬空电平不可信，务必接 3.3V 或 GND |
 | 触屏 `T/C` 不切换 | 若 `mode_pin.enabled=true`（跳线模式），`T/C` 会故意失效（以引脚为准）；默认模式由触屏切换（`mode_pin.enabled=false`）|
+| PID 振荡/过冲 | 调小该轴 `pid_kp`（触屏调参页 `Kp`）；检查 `pid_ki` 是否过大；必要时 `PID` 项调 OFF 回原映射对比 |
+| 开了 PID 但感觉没变 | 默认 `pid_kp`≈原映射斜率（0.28/0.14），行为接近属正常；用 Ki/Kd 或加大 Kp 拉开差异；确认轴别选错（调参页 `Y/P`）|
+| 调参页 `S` 保存 FAIL | 看串口后缀：`keys not found` → config.json 缺 `pid_*` 新键（用仓库内最新 config.json）；`verify fail` → 写回后读回校验不过，检查文件是否被外部改坏 |
 | UART报 tx not configured | 检查 config 中 `tx_pin`/`rx_pin` 与 FPIOA 映射 |
 
 > 串口类问题的完整排障顺序（OLED 状态 → 共地 → 回环测试 → 引脚实测）见 `接线图.md` 第六节。
