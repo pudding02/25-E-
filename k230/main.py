@@ -994,7 +994,8 @@ def _yolo_ok():
 # ============================================================================
 
 def _calib_rects(ox, oy, sw, sh, bw):
-    """生成 6 个触摸按钮的命中矩形(LCD 坐标): 上/下(左缘) 左/右(右缘) dot隐藏/S保存(顶中)"""
+    """生成 7 个触摸按钮的命中矩形(LCD 坐标): 上/下(左缘) 左/右(右缘)
+    mode追踪/画圈切换 · dot隐藏 · S保存(顶中一字排开)"""
     m = 6
     y1 = sh // 2 - bw - 6
     y2 = y1 + bw + 12
@@ -1006,6 +1007,7 @@ def _calib_rects(ox, oy, sw, sh, bw):
         ("down",  xl, oy + y2, xl + bw, oy + y2 + bw),
         ("left",  xr, oy + y1, xr + bw, oy + y1 + bw),
         ("right", xr, oy + y2, xr + bw, oy + y2 + bw),
+        ("mode",  xc - 2 * bw - 12, oy + m, xc - bw - 12, oy + m + bw),
         ("dot",   xc - bw - 4, oy + m, xc - 4, oy + m + bw),
         ("save",  xc + 4, oy + m, xc + bw + 4, oy + m + bw),
     )
@@ -1119,8 +1121,8 @@ def _calib_arrow(frame_np, cx, cy, name):
     cv2.line(frame_np, p[1], p[2], (0, 200, 0), 2)
     cv2.line(frame_np, p[2], p[0], (0, 200, 0), 2)
 
-def calib_draw(frame_np, rects, lox, loy, dot_r):
-    """绘制校准 UI: 6 个按钮(框+符号) + 绿色校准点(画面坐标 CENTER+offset)"""
+def calib_draw(frame_np, rects, lox, loy, dot_r, mode_on=False):
+    """绘制校准 UI: 按钮(框+符号, 含追踪/画圈切换) + 绿色校准点(画面坐标 CENTER+offset)"""
     for name, x0, y0, x1, y1 in rects:
         # rects 为 LCD 空间; 1:1 直显时换算到采集帧坐标 = 平移 (-DISPLAY_X, -DISPLAY_Y)
         a0 = x0 - DISPLAY_X
@@ -1139,6 +1141,11 @@ def calib_draw(frame_np, rects, lox, loy, dot_r):
         elif name == "save":
             cv2.putText(frame_np, "S", (mx - 8, my + 9),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 0), 2)
+        elif name == "mode":
+            # 追踪/画圈切换: 当前模式 C=画圈(橙) / T=追踪(绿)
+            col = (0, 165, 255) if mode_on else (0, 200, 0)
+            cv2.putText(frame_np, "C" if mode_on else "T", (mx - 9, my + 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, col, 2)
         else:
             _calib_arrow(frame_np, mx, my, name)
     gx = CENTER_X + lox
@@ -1244,6 +1251,11 @@ def run_cv():
                     LOX += CALIB_STEP
                 elif _act == "dot":
                     _calib_vis = False
+                elif _act == "mode":
+                    if _mode_pin is None:            # 引脚启用时以引脚为准(避免双源打架)
+                        _circle_on = not _circle_on
+                        _theta = None                # 进出画圈沿重置起始角
+                        print("MODE->%s (touch)" % ("circle" if _circle_on else "track"))
                 elif _act == "save":
                     _ok, _msg = calib_save_file(CFG_PATH, LOX, LOY)
                     print("calib: save %s %s" % ("OK" if _ok else "FAIL", _msg))
@@ -1334,7 +1346,7 @@ def run_cv():
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
             # 触屏校准 UI(绿点+按钮, 可隐藏)
             if _calib_vis:
-                calib_draw(frame_np, CALIB_BTNS, LOX, LOY, CALIB_DOT_R)
+                calib_draw(frame_np, CALIB_BTNS, LOX, LOY, CALIB_DOT_R, _circle_on)
 
             Display.show_image(frame, x=DISPLAY_X, y=DISPLAY_Y)
             if frame_id % GC_EVERY == 0:

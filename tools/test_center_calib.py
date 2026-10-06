@@ -2,10 +2,10 @@
 
 覆盖：
   - calib_hit    触摸点 → 按钮命中判定（边界含）
-  - calib_step   校准 UI 触摸状态机（隐藏态唤醒边沿 / 新按即发 / 方向键连发 / dot·save 单发）
+  - calib_step   校准 UI 触摸状态机（隐藏态唤醒边沿 / 新按即发 / 方向键连发 / mode·dot·save 单发）
   - _replace_json_int  行内第一个整数 token 替换（保留键/缩进/尾逗号）
   - calib_save_text    config.json 文本级替换（只动 laser_offset_x/y 两行, 其余逐字节保留）
-  - _calib_rects  按钮命中矩形生成（布局与不重叠约束）
+  - _calib_rects  按钮命中矩形生成（7 键: 方向×4 + mode 追踪/画圈切换 + dot + save; 布局与不重叠约束）
 
 原理：从 k230/main.py AST 提取上述函数源码在最小环境执行（纯函数, 无 cfg 依赖）, 逐条断言。
 运行：python tools/test_center_calib.py
@@ -144,6 +144,13 @@ class TestCalibStep(unittest.TestCase):
         self.assertEqual(F("calib_step")(True, "save", 1000, 1500, True, True, "save", 120),
                          (True, "save", 1000, None))
 
+    def test_mode_single_fire_no_repeat(self):
+        # T/C 模式切换: 新按发一次, 按住不连发(防误切)
+        self.assertEqual(F("calib_step")(True, None, 0, 1000, True, False, "mode", 120),
+                         (True, "mode", 1000, "mode"))
+        self.assertEqual(F("calib_step")(True, "mode", 1000, 1500, True, True, "mode", 120),
+                         (True, "mode", 1000, None))
+
     def test_switch_button_immediate(self):
         self.assertEqual(F("calib_step")(True, "up", 1000, 1050, True, True, "down", 120),
                          (True, "down", 1050, "down"))
@@ -259,7 +266,7 @@ class TestCalibRects(unittest.TestCase):
 
     def test_names_and_count(self):
         self.assertEqual([r[0] for r in self._rects()],
-                         ["up", "down", "left", "right", "dot", "save"])
+                         ["up", "down", "left", "right", "mode", "dot", "save"])
 
     def test_all_inside_screen(self):
         for name, x0, y0, x1, y1 in self._rects():

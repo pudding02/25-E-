@@ -108,7 +108,7 @@ cp model.kmodel /sdcard/model/
 |---|---|
 | `detection` | 检测模式（cv / yolo）与跳帧 |
 | `camera` / `display` / `center` | CSI 端口（`csi_id`）、输出分辨率（16:9 全幅）、显示偏移、追踪中心点（含激光偏移 `laser_offset_x/y`）|
-| `center_calib` | **触屏中心校准**：屏幕上触摸按钮移动绿色校准点（=追踪收敛点，即 `center.laser_offset`）；`●` 隐藏 / `S` 保存写回 |
+| `center_calib` | **触屏中心校准 + 模式切换**：触摸按钮移动绿色校准点（=追踪收敛点，即 `center.laser_offset`）；`T/C` 追踪/画圈切换；`●` 隐藏 / `S` 保存写回 |
 | `rectangle` | CV 矩形检测阈值（现场光照变化主要调这里）|
 | `yolo` | KPU 模型路径 / labels / input_size（见第四节规则）|
 | `motor` | **yaw 轴**：Emm42 速度模式（RPM 区间 / 死区 / 方向 / 使能）|
@@ -116,7 +116,7 @@ cp model.kmodel /sdcard/model/
 | `red_target` | **红环检测**（与矩形检测同帧联合进行，画圈模式用）：红色掩膜/环直径/空心验证阈值、ROI 外扩、半径修正 |
 | `search` | **上电搜索**：未捕获目标时 yaw 单方向匀速旋转找靶（enabled/rpm/direction/max_ms）|
 | `circle` | **画圈运动**：沿红环匀速转圈的角速度/方向/误差门控（speed_deg_s/direction/pause_px）|
-| `mode_pin` | **画圈模式引脚**（GPIO49/Pin3）：被供电=画圈、其余=仅追踪（enabled/gpio/active_level/debounce_n）|
+| `mode_pin` | **画圈模式引脚**（GPIO49/Pin3，可选备用，默认关闭）：被供电=画圈；默认由触屏 `T/C` 切换（引脚开启时以引脚为准）|
 | `debug` | 打印与 GC 节奏 |
 
 ## 三、检测模式（CV / YOLO）
@@ -191,15 +191,16 @@ cp model.kmodel /sdcard/model/
 | 模式 | 目标 | 串口目标源 |
 |---|---|---|
 | 追踪（默认） | **矩形中心** | `OK [rect]` |
-| 画圈（GPIO49 被供电，见 4.5） | **红环**（环上 θ 点） | `OK [ring]` |
+| 画圈（触屏 `T/C` 切换，见 4.5） | **红环**（环上 θ 点） | `OK [ring]` |
 
 无有效目标 → 丢靶逻辑（coast/停）；上电未捕获期 → 自动搜索（见 4.6）。
 
-### 4.5 画圈模式（GPIO49 被供电）
+### 4.5 画圈模式（触屏 T/C 切换；引脚可选）
 
 - 画圈模式下红环可见 → 光斑沿红环**连续匀速画圆**（`circle.speed_deg_s` 角速度、`direction` 方向；光斑离目标点超过 `pause_px` 时暂停 θ 推进等伺服追上）。
 - 红环暂不可见 → 保持矩形追踪瞄准、**θ 冻结**（不乱转不丢靶），环恢复即续圈。
-- 引脚接法：**三脚跳线**（中间=GPIO49/Pin3，两侧=3.3V/Pin1 与 GND）：拨 3.3V=画圈、拨 GND=仅追踪；**悬空不可信**（I2C0 引脚板载上拉情况以实测为准）。上电串口打印 `mode pin: GPIO49 level=..` 供核对。
+- **切换方式（默认）**：触屏顶中 `T/C` 按钮点击切换（追踪⇄画圈），串口打印 `MODE->.. (touch)`。
+- **切换方式（可选备用）**：`config.json` 的 `mode_pin.enabled=true` 时改用 GPIO49 跳线：**三脚跳线**（中间=GPIO49/Pin3，两侧=3.3V/Pin1 与 GND）：拨 3.3V=画圈、拨 GND=仅追踪；**悬空不可信**（I2C0 引脚板载上拉情况以实测为准）。此时触屏 `T/C` **故意失效**（以引脚为准），上电串口打印 `mode pin: GPIO49 level=..` 供核对。
 
 ### 4.6 上电搜索
 
@@ -220,6 +221,7 @@ cp model.kmodel /sdcard/model/
 |---|---|---|
 | `▲ ▼` | 左缘 | 绿点（校准点）上 / 下移动 |
 | `◀ ▶` | 右缘 | 绿点左 / 右移动 |
+| `T / C` | 顶中 | 追踪 / 画圈模式切换（显示当前模式：T=追踪绿 / C=画圈橙；串口打印 `MODE->.. (touch)`）|
 | `●` | 顶中 | 隐藏绿点+按钮（画面干净）；再触摸屏幕任意处唤出 |
 | `S` | 顶中 | 当前偏移写回 `config.json`（自动备份 `.bak`、写后校验）|
 
@@ -245,8 +247,8 @@ python tools/calibrate_laser.py
 python tools/test_emm_protocol.py    # 协议帧对拍（12 用例）
 python tools/test_coast_logic.py     # 丢靶预判状态机（10 用例）
 python tools/test_circle_logic.py    # V7 纯函数：红环分流/画圈几何/搜索/引脚去抖（29 用例）
-python tools/test_camera_init.py     # 采集初始化守门：CSI id / 720 提示 / crop 兜底 / config 几何链 / 视图放大（15 用例）
-python tools/test_center_calib.py    # V7.7 触屏校准：按钮命中/触摸状态机/config 文本替换（32 用例）
+python tools/test_camera_init.py     # 采集初始化守门：CSI id / 720 提示 / crop 兜底 / config 几何链 / 死显示路径（11 用例）
+python tools/test_center_calib.py    # V7.7 触屏校准：按钮命中/触摸状态机/config 文本替换/7 键布局（33 用例）
 ```
 
 五套均为 stdlib 独立脚本，从 `k230/main.py` AST 提取目标函数/常量后断言（不需要硬件、不需要 pytest）。
@@ -264,8 +266,8 @@ python tools/test_center_calib.py    # V7.7 触屏校准：按钮命中/触摸�
 - [ ] 先单轴 `test_mode` 自检（yaw 持续旋转 / pitch 往返±角度），再跑视觉追踪
 - [ ] 方向核对：发正 dx → yaw 向减小偏差方向转；正 dy → pitch 同理
 - [ ] 激光偏移已标定：触屏 `▲▼◀▶` 调绿点、满意后按 `S` 保存（或手填 `center.laser_offset_x/y`）
-- [ ] 画圈跳线接好：GPIO49(Pin3) 三脚跳线，拨 3.3V / GND 两态可用；上电核对 `mode pin:` 电平打印
-- [ ] 红环阈值现场核对：画圈跳线拨 3.3V 后应打印 `OK [ring]` 并绕环转圈；追踪模式应打印 `OK [rect]`
+- [ ] 模式切换核对：触屏 `T/C` 按钮切换追踪/画圈（串口打印 `MODE->circle (touch)`）；若用跳线：`mode_pin.enabled=true` 且上电核对 `mode pin:` 电平打印
+- [ ] 红环阈值现场核对：切到画圈模式后应打印 `OK [ring]` 并绕环转圈；追踪模式应打印 `OK [rect]`
 - [ ] 不摆靶开机 → yaw 匀速搜索；放靶 1~2 秒内停转进入追踪
 - [ ] 准备备用 SD 卡（预烧录系统+代码）
 
@@ -292,7 +294,8 @@ python tools/test_center_calib.py    # V7.7 触屏校准：按钮命中/触摸�
 | 画圈不转圈（环不见了） | 属预期退化：θ 冻结保持矩形追踪瞄准；查 `ring_min_diam_px/ring_max_diam_px` 与环的实际像素尺寸、红色阈值 |
 | 画圈方向反了 | `circle.direction` 取反（1/-1）|
 | 开机不搜索 | 确认 `search.enabled=true` 且开机后从未捕获过目标；已捕获过则永不搜索（设计如此）|
-| 引脚切换不生效 | 核对 `mode_pin.gpio/active_level`；看启动 `mode pin:` 打印与实际跳线电平；悬空电平不可信，务必接 3.3V 或 GND |
+| 引脚切换不生效（用跳线时）| 核对 `mode_pin.gpio/active_level`；看启动 `mode pin:` 打印与实际跳线电平；悬空电平不可信，务必接 3.3V 或 GND |
+| 触屏 `T/C` 不切换 | 若 `mode_pin.enabled=true`（跳线模式），`T/C` 会故意失效（以引脚为准）；默认模式由触屏切换（`mode_pin.enabled=false`）|
 | UART报 tx not configured | 检查 config 中 `tx_pin`/`rx_pin` 与 FPIOA 映射 |
 
 > 串口类问题的完整排障顺序（OLED 状态 → 共地 → 回环测试 → 引脚实测）见 `接线图.md` 第六节。

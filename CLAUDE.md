@@ -13,12 +13,14 @@ Drone-competition rectangle-target tracking system (电赛E题). A K230-CanMV bo
   same speed-mode logic.)
 - **V7 features** — joint rect+ring detection (tracking aims the rectangle center; the
   earlier red-dot/bullseye aim was removed as it conflicted with rect detection — ring
-  detection feeds circle mode only), ring-circling gated by GPIO49/Pin3 (powered = circle),
+  detection feeds circle mode only), ring-circling toggled by the **touchscreen `T/C`
+  button** (default; optional fallback: GPIO49/Pin3 jumper when `mode_pin.enabled=true`),
   and boot search (yaw spins single-direction until first acquisition). All params live in
   `k230/config.json` (`[red_target]` / `[search]` / `[circle]` / `[mode_pin]`).
-- **Touchscreen center calibration (V7.7)** — on-screen green dot + 6 touch buttons (▲▼◀▶ move
-  the aim offset live, ● hides the UI, S saves `center.laser_offset_x/y` back to config.json);
-  touch failure auto-disables without affecting tracking. Params in `[center_calib]`.
+- **Touchscreen center calibration (V7.7)** — on-screen green dot + 7 touch buttons (▲▼◀▶ move
+  the aim offset live, T/C toggles track/circle mode, ● hides the UI, S saves
+  `center.laser_offset_x/y` back to config.json); touch failure auto-disables without
+  affecting tracking. Params in `[center_calib]`.
 
 (The original MaixCam + STM32F407 relay architecture is retired — there is no `stm32/` directory and no `fs_servo.py`; all code is single-file in `k230/main.py`.)
 
@@ -28,7 +30,7 @@ Drone-competition rectangle-target tracking system (电赛E题). A K230-CanMV bo
 K230-CanMV (vision + gimbal control)
     MIPI CSI camera (GC2093)     UART3 → Emm42 driver ① → 42 stepper   [yaw · speed mode]
     LCD ST7701 800×480           UART2 → Emm42 driver ② → 42 stepper   [pitch · speed mode]
-    Optional laser GPIO          GPIO49 (Pin3) mode jumper: 3.3V = circle mode, GND = track-only
+    Mode switch (GPIO49/Pin3)     touchscreen T/C (default) / jumper: 3.3V = circle (optional)
 ```
 
 Visual→actuator interface: `gimbal_send(dx, dy, dist, status)` inside `k230/main.py` (section 四).
