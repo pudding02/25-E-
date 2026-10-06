@@ -1187,6 +1187,10 @@ def run_cv():
     _calib_btn = None                # 按住中的按钮名
     _calib_hold = 0                  # 按住起始时刻(连发计时)
     _calib_pre = False               # 上帧是否有触点(唤醒边沿判定)
+    _scale_on = SCALE_VIEW           # 显示放大(运行时状态; 画布/绘制失败自动降级 1:1)
+    _view_buf = None                 # 放大画布(复用, 无每帧分配; None=未就绪)
+    _view_sx = 1.0                   # 缩放系数(预检时按视图几何计算)
+    _view_sy = 1.0
     fps = fps_count = 0
     fps_tick = time.ticks_ms()
 
@@ -1206,6 +1210,18 @@ def run_cv():
               % (SENSOR_W, SENSOR_H, DISPLAY_W, DISPLAY_H,
                  "on" if SCALE_VIEW else "off",
                  VIEW_W, VIEW_H, VIEW_X, VIEW_Y, CENTER_X, CENTER_Y))
+        # ---- 显示放大(scale_view): 预建复用画布; 任何失败自动降级 1:1(不影响主程序) ----
+        if _scale_on:
+            try:
+                import image
+                _view_buf = image.Image(VIEW_W, VIEW_H, image.RGB888)
+                _view_sx = VIEW_W / SENSOR_W
+                _view_sy = VIEW_H / SENSOR_H
+                print("scale_view: buf %dx%d ok" % (VIEW_W, VIEW_H))
+            except Exception as _e:
+                print("scale_view init fail (%s) -- fallback 1:1" % _e)
+                _scale_on = False
+                _view_buf = None
         # ---- 触屏中心校准: 触摸初始化(失败自动禁用, 不影响主程序) ----
         if CALIB_ENABLED:
             try:
@@ -1356,12 +1372,17 @@ def run_cv():
             if _calib_vis:
                 calib_draw(frame_np, CALIB_BTNS, LOX, LOY, CALIB_DOT_R)
 
-            if SCALE_VIEW:
-                # 等比放大到视图尺寸显示: 视野(=全幅)不变, 占屏最大(见 view_geom)
-                Display.show_image(cv2.resize(frame, (VIEW_W, VIEW_H)),
-                                   x=VIEW_X, y=VIEW_Y)
+            if _scale_on and _view_buf is not None:
+                try:
+                    # 等比放大到复用画布(image 原生 draw_image 缩放, 无每帧分配)
+                    _view_buf.draw_image(frame, 0, 0, _view_sx, _view_sy)
+                    Display.show_image(_view_buf, x=VIEW_X, y=VIEW_Y)
+                except Exception as _e:
+                    print("scale_view draw fail (%s) -- fallback 1:1" % _e)
+                    _scale_on = False
+                    Display.show_image(frame, x=DISPLAY_X, y=DISPLAY_Y)
             else:
-                Display.show_image(frame, x=VIEW_X, y=VIEW_Y)
+                Display.show_image(frame, x=DISPLAY_X, y=DISPLAY_Y)
             if frame_id % GC_EVERY == 0:
                 gc.collect()
 
