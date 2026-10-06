@@ -33,10 +33,9 @@ K230-CanMV (vision + gimbal control)
 
 Visual→actuator interface: `gimbal_send(dx, dy, dist, status)` inside `k230/main.py` (section 四).
 
-Camera capture: onboard GC2093 sits on **CSI2** — `Sensor(id=CSI_ID, …)` reads `camera.csi_id: 2`
-from config. Probe resolution **1280×960 (4:3) must match the 640×480 output** — a 1280×720
-(16:9) probe stretched the image horizontally (V7.7b). Do NOT drop the id — missing id once
-caused a view-offset (画面偏左) regression.
+Camera capture: onboard GC2093 on **CSI2** — `Sensor(id=CSI_ID, …)` + `camera.csi_id: 2`. Keep
+all three: **1280×720 probe** (1280×960 → view-offset 偏左) + **`crop=True` on set_framesize**
+(missing → 16:9→4:3 stretch) + **explicit id** (missing → offset).
 
 ## Repository structure
 
@@ -53,7 +52,7 @@ caused a view-offset (画面偏左) regression.
     ├── test_emm_protocol.py    # host-side frame test (AST-extracts EmmStepper from main.py)
     ├── test_coast_logic.py     # coast state-machine test (AST-extracts coast_step)
     ├── test_circle_logic.py    # V7 pure-function tests (priority/circle/search/pin)
-    ├── test_camera_init.py     # capture guard: CSI id + 1280×960 probe (geometry regression)
+    ├── test_camera_init.py     # capture guard: CSI id + 720 probe + crop=True (geometry regression)
     └── test_center_calib.py    # touch-calibration: hit test / touch state machine / config save
 ```
 
@@ -113,8 +112,8 @@ fdx, fdy = kf_update(dx, dy)  # works identically whether Kalman is on or off
   - `python tools/test_circle_logic.py` — V7 pure functions (29 cases): quad containment, ring
     blob classify, circle geometry, search & pin-debounce machines. Threshold constants are
     extracted from main.py itself — a missing definition is a hard error.
-  - `python tools/test_camera_init.py` — capture guard (5 cases): explicit `id=CSI_ID`, 1280×960
-    probe (4:3, matches output), `CSI_ID` defined in main.py, `camera.csi_id=2` in config.
+  - `python tools/test_camera_init.py` — capture guard (6 cases): explicit `id=CSI_ID`, 1280×720
+    probe + `crop=True` on set_framesize, `CSI_ID` defined in main.py, `camera.csi_id=2` in config.
   - `python tools/test_center_calib.py` — touch calibration (32 cases): button hit test, touch
     state machine (wake edge / repeat / no-bounce on hide), config text save (exactly 2 lines).
 - **Hardware**: `motor.test_mode` / `pitch_motor.test_mode` in config.json perform power-on

@@ -1,18 +1,19 @@
 """采集端守门测试 —— 防止「采集初始化」被重构改回旧写法（画面几何回归）。
 
-背景（实机两次修复, 勿回退）:
-  V7.6: 画面视野偏移(偏左) —— 根因 = 缺 CSI 端口 id（原始代码 Sensor(id=2), v5 重构丢失）;
-        修复 = 显式 id=CSI_ID（config.camera.csi_id=2）。
-  V7.7b: 画面横向被压缩 —— 根因 = 1280x720(16:9) 模式提示与 640x480(4:3) 输出宽高比不符,
-        K230 非等比缩放致横向压缩; 修复 = 恢复 1280x960(4:3) 提示（与输出宽高比一致）。
+背景（实机三次迭代, 方向与比例须同时满足, 勿回退）:
+  V7.6: 「画面偏左」→ 显式 CSI id=CSI_ID（config.camera.csi_id=2, 勿再丢）+ 提示改 1280x720。
+  V7.7b: 1280x720 提示缺裁切 → 16:9 源配 4:3 输出被非等比缩放「横向压缩」→ 曾改回 1280x960。
+  V7.7c: 1280x960 实机「偏左」复发（该模式本身视野偏左）→ 定案:
+         1280x720（16:9, 方向正）+ set_framesize(crop=True)（居中裁 4:3 再缩, 比例正）。
   事实: 庐山派板载 GC2093 挂在 CSI2; 支持 1280x960@90 与 1280x720@90 两种模式。
 
 本测试（AST 静态检查, stdlib only, 不需要 K230 硬件）:
   1. main.py 的 Sensor(...) 构造必须显式传 id=(不得依赖固件默认端口);
-  2. 该构造的探测提示分辨率必须是 1280x960(4:3, 与 640x480 输出一致, 防横向压缩);
-  3. main.py 顶层必须定义 CSI_ID(缺定义则 Sensor(id=CSI_ID) 生产会 NameError);
-  4. config.json 的 camera.csi_id 必须存在且为 2(配置与代码一致)。
-若确需变更这些值: 先理解画面几何影响（实机观察缩放比例与视野位置）, 再同步修改本测试
+  2. 该构造的探测提示分辨率必须是 1280x720(16:9, 实测方向正);
+  3. set_framesize 必须带 crop=True（16:9→4:3 居中裁切, 防非等比压缩）;
+  4. main.py 顶层必须定义 CSI_ID(缺定义则 Sensor(id=CSI_ID) 生产会 NameError);
+  5. config.json 的 camera.csi_id 必须存在且为 2(配置与代码一致)。
+若确需变更这些值: 先理解画面几何影响（实机观察方向与比例）, 再同步修改本测试
 —— 不要静默改掉守门。
 
 运行: python tools/test_camera_init.py
@@ -48,8 +49,19 @@ def _sensor_kwargs():
     return {k.arg: k.value for k in calls[0].keywords}
 
 
+def _framesize_kwargs():
+    tree = _load_main_tree()
+    calls = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "set_framesize"):
+            calls.append(node)
+    assert len(calls) == 1, "k230/main.py 应恰好有 1 处 set_framesize(...), 实际 %d 处" % len(calls)
+    return {k.arg: k.value for k in calls[0].keywords}
+
+
 class TestCameraInit(unittest.TestCase):
-    """采集初始化守门（防回归: 缺 id 曾致视野偏移 / 16:9 提示曾致横向压缩）"""
+    """采集初始化守门（防回归: 缺 id / 960 模式偏左 / 16:9 无裁切压缩）"""
 
     def test_sensor_call_exists_once(self):
         calls = _find_sensor_calls(_load_main_tree())
@@ -68,17 +80,28 @@ class TestCameraInit(unittest.TestCase):
             isinstance(v, ast.Constant) and v.value is None,
             "Sensor(id=None) 等于没传 —— 必须指定 CSI 端口")
 
-    def test_sensor_probe_resolution_matches_4x3_output(self):
+    def test_sensor_probe_resolution_is_1280x720(self):
         kw = _sensor_kwargs()
-        for name, want in (("width", 1280), ("height", 960)):
+        for name, want in (("width", 1280), ("height", 720)):
             self.assertIn(name, kw, "Sensor(...) 缺少 %s= 参数" % name)
             self.assertIsInstance(
                 kw[name], ast.Constant,
                 "Sensor(%s=...) 应为字面量常量" % name)
             self.assertEqual(
                 kw[name].value, want,
-                "采集提示分辨率应为 1280x960(4:3, 与 640x480 输出一致); "
-                "1280x720(16:9) 曾致画面横向压缩")
+                "采集提示分辨率应为 1280x720(16:9, 实测方向正); 1280x960(4:3) 实测视野偏左, "
+                "比例问题由 set_framesize(crop=True) 解决")
+
+    def test_framesize_uses_center_crop(self):
+        """16:9 提示→4:3 输出必须 crop=True 居中裁切, 否则非等比缩放横向压缩"""
+        kw = _framesize_kwargs()
+        self.assertIn(
+            "crop", kw,
+            "set_framesize 必须带 crop=True: 16:9 源配 4:3 输出时居中裁切再缩放, 缺则横向压缩")
+        self.assertIsInstance(kw["crop"], ast.Constant,
+                              "set_framesize(crop=...) 应为字面量 True")
+        self.assertIs(kw["crop"].value, True,
+                      "set_framesize(crop=...) 必须为 True")
 
     def test_csi_id_defined_in_main(self):
         tree = _load_main_tree()

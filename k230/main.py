@@ -1171,11 +1171,12 @@ def run_cv():
     try:
         print("boot")
         os.exitpoint(os.EXITPOINT_ENABLE)
-        # 采集端: 显式 CSI 端口 + 1280x960@90(4:3) 模式提示 —— 与 640x480 输出宽高比一致。
-        # (V7.6: 缺 id 曾致视野偏移; V7.7b: 1280x720(16:9) 提示实测画面横向压缩 —— 勿回退)
-        sensor = Sensor(id=CSI_ID, width=1280, height=960, fps=FPS)
+        # 采集端: 显式 CSI 端口 + 1280x720@90(16:9) 模式提示 + crop 居中裁切。
+        # (实测迭代: 1280x960 视野偏左; 1280x720 无裁切则 16:9→4:3 非等比缩放致横向压缩。
+        #  720 + crop=True 同时保证方向与比例 —— 三者勿回退)
+        sensor = Sensor(id=CSI_ID, width=1280, height=720, fps=FPS)
         sensor.reset()
-        sensor.set_framesize(width=SENSOR_W, height=SENSOR_H, chn=CAM_CHN_ID_0)
+        sensor.set_framesize(width=SENSOR_W, height=SENSOR_H, crop=True, chn=CAM_CHN_ID_0)
         sensor.set_pixformat(Sensor.RGB888, chn=CAM_CHN_ID_0)
         print("sensor ok")
         # ---- 触屏中心校准: 触摸初始化(失败自动禁用, 不影响主程序) ----
