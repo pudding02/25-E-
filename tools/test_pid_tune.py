@@ -481,43 +481,89 @@ class TestParamRects(unittest.TestCase):
 
 
 class TestParamStep(unittest.TestCase):
-    """签名: param_step(vis, btn, hold_t0, now, pressed, was_pressed, hit, repeat_ms)
+    """签名: param_step(vis, btn, hold_t0, last_btn, now, pressed, was_pressed, hit, repeat_ms, guard_ms)
 
-    规则同 calib_step; 连发按钮 = plus/minus; item/axis/save/back 单发。
+    规则同 calib_step; 连发按钮 = plus/minus; item/axis/save/back 单发;
+    防抖(guard_ms): 与最近一次发出动作的同一按钮、间隔 < guard_ms 的再次按沿被吞
+    (防触摸抖动"一下跳两项"); 换钮不受限。
     """
 
     def test_plus_repeat(self):
         f = F("param_step")
-        self.assertEqual(f(True, None, 0, 1000, True, False, "plus", 120),
-                         (True, "plus", 1000, "plus"))
-        self.assertEqual(f(True, "plus", 1000, 1090, True, True, "plus", 120),
-                         (True, "plus", 1000, None))
-        self.assertEqual(f(True, "plus", 1000, 1120, True, True, "plus", 120),
-                         (True, "plus", 1120, "plus"))
+        self.assertEqual(f(True, None, 0, None, 1000, True, False, "plus", 120, 300),
+                         (True, "plus", 1000, "plus", "plus"))
+        self.assertEqual(f(True, "plus", 1000, "plus", 1090, True, True, "plus", 120, 300),
+                         (True, "plus", 1000, "plus", None))
+        self.assertEqual(f(True, "plus", 1000, "plus", 1120, True, True, "plus", 120, 300),
+                         (True, "plus", 1120, "plus", "plus"))
 
     def test_minus_repeat(self):
         f = F("param_step")
-        self.assertEqual(f(True, "minus", 1000, 1120, True, True, "minus", 120),
-                         (True, "minus", 1120, "minus"))
+        self.assertEqual(f(True, "minus", 1000, "minus", 1120, True, True, "minus", 120, 300),
+                         (True, "minus", 1120, "minus", "minus"))
 
     def test_single_fire_buttons(self):
         f = F("param_step")
         for name in ("item", "axis", "save", "back"):
-            self.assertEqual(f(True, None, 0, 1000, True, False, name, 120),
-                             (True, name, 1000, name), name)
-            self.assertEqual(f(True, name, 1000, 1500, True, True, name, 120),
-                             (True, name, 1000, None), name)
+            self.assertEqual(f(True, None, 0, None, 1000, True, False, name, 120, 300),
+                             (True, name, 1000, name, name), name)
+            self.assertEqual(f(True, name, 1000, name, 1500, True, True, name, 120, 300),
+                             (True, name, 1000, name, None), name)
 
     def test_hidden_wake_edge(self):
         f = F("param_step")
-        self.assertEqual(f(False, None, 0, 1000, True, False, None, 120),
-                         (True, None, 1000, None))
-        self.assertEqual(f(False, "back", 900, 1000, True, True, "back", 120),
-                         (False, None, 900, None))
+        self.assertEqual(f(False, None, 0, None, 1000, True, False, None, 120, 300),
+                         (True, None, 1000, None, None))
+        self.assertEqual(f(False, "back", 900, "back", 1000, True, True, "back", 120, 300),
+                         (False, None, 900, "back", None))
 
     def test_release_clears(self):
-        self.assertEqual(F("param_step")(True, "plus", 900, 1000, False, True, None, 120),
-                         (True, None, 900, None))
+        self.assertEqual(F("param_step")(True, "plus", 900, "plus", 1000, False, True, None, 120, 300),
+                         (True, None, 900, "plus", None))
+
+
+class TestParamDebounce(unittest.TestCase):
+    """防抖(guard_ms): 同钮 < guard_ms 重复按沿被吞(防"一下跳两项"); 换钮/超窗放行; guard=0 禁用"""
+
+    GD = 300
+
+    def test_same_button_within_guard_swallowed(self):
+        f = F("param_step")
+        # 真点击 item(动作) → 松开 → 160ms 后同钮伪按沿(触摸抖动) → 吞
+        _, btn, hold, last, act = f(True, None, 0, None, 1000, True, False, "item", 120, self.GD)
+        self.assertEqual((btn, act), ("item", "item"))
+        _, btn, hold, last, _ = f(True, btn, hold, last, 1060, False, True, None, 120, self.GD)
+        _, btn, hold, last, act = f(True, btn, hold, last, 1160, True, False, "item", 120, self.GD)
+        self.assertIsNone(act)                       # 距上次动作 160ms < 300 → 吞
+        self.assertEqual((btn, last), ("item", "item"))
+        # 距上次动作 310ms 的同钮按下 → 放行(用户真点击第二下)
+        _, _, _, _, act = f(True, None, hold, last, 1310, True, False, "item", 120, self.GD)
+        self.assertEqual(act, "item")
+
+    def test_swallowed_then_hold_repeats(self):
+        f = F("param_step")
+        _, btn, hold, last, act = f(True, None, 0, None, 1000, True, False, "plus", 120, self.GD)
+        self.assertEqual(act, "plus")
+        _, btn, hold, last, _ = f(True, btn, hold, last, 1060, False, True, None, 120, self.GD)
+        _, btn, hold, last, act = f(True, btn, hold, last, 1160, True, False, "plus", 120, self.GD)
+        self.assertIsNone(act)                       # 伪按沿被吞
+        _, _, _, _, act = f(True, btn, hold, last, 1180, True, True, "plus", 120, self.GD)
+        self.assertEqual(act, "plus")                # 被吞后按住: 连发通道不受防抖影响
+
+    def test_switch_button_not_blocked(self):
+        f = F("param_step")
+        _, btn, hold, last, act = f(True, None, 0, None, 1000, True, False, "item", 120, self.GD)
+        self.assertEqual(act, "item")
+        _, btn, hold, last, _ = f(True, btn, hold, last, 1030, False, True, None, 120, self.GD)
+        _, _, _, _, act = f(True, btn, hold, last, 1080, True, False, "plus", 120, self.GD)
+        self.assertEqual(act, "plus")                # 换钮 80ms 内立即放行(不误伤)
+
+    def test_guard_zero_disables(self):
+        f = F("param_step")
+        _, _, _, _, act = f(True, None, 0, None, 1000, True, False, "item", 120, 0)
+        self.assertEqual(act, "item")
+        _, _, _, _, act = f(True, None, 1060, "item", 1160, True, False, "item", 120, 0)
+        self.assertEqual(act, "item")                # guard=0 → 旧行为(同钮快速重复也放行)
 
 
 class TestMainStaticGuards(unittest.TestCase):

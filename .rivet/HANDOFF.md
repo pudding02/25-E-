@@ -309,3 +309,20 @@
   - 顺带修复 V7.8 审查遗留两条：`PIN_ENABLED` 缺省 True→False（缺键回退与文档/config 一致）；
     config `[circle]._说明` 去除过时 GPIO49 单一归属描述。
 - HEAD `79aa045` → 本次提交；本地领先 origin **24 个提交**，均未推送。
+
+### 2026-10-06 第十二轮更新：触屏点击防抖（V7.9a）
+
+- **用户反馈（实机）**：「将触屏延迟拉长到 0.3s，现在容易一下过两个选项」——触摸抖动被
+  当成两次点击（调参页 `项` 一下跳两格）。
+- **修复**：`calib_step` / `param_step` 增加**同钮防抖窗**：
+  - 新签名 `(vis, btn, hold_t0, last_btn, now, pressed, was_pressed, hit, repeat_ms, guard_ms)`，
+    返回 5 元组（新增 `last_btn` = 最近一次发出动作的按钮）。
+  - 规则：`hit == last_btn` 且距上次动作 `< guard_ms` 的再次按沿视为抖动**吞掉**；
+    换按钮不受限；`guard_ms=0` 禁用；被吞后按住不放仍走连发通道（不损失长按体验）。
+  - 配置：`[center_calib].debounce_ms` 默认 **300**（即用户要求的 0.3s）；
+    run_cv 集成 `_calib_last` 状态（切页时重置，跨页不沿用防抖基准）。
+- **测试**：`test_center_calib` +4 / `test_pid_tune` +4 防抖用例（先红——17/9 errors——后绿）；
+  全量 **151 用例**全绿（12/10/29/11/37/52）+ py_compile + JSON 合法。
+- **实机验证待用户**：① 点 `项` 一下应只跳一项（不再跳两格）② <300ms 内快速换到别的按钮
+  应立即响应 ③ 按住 `+`/`-` 连发手感不变。
+- 调参页全参数解释已随本次交付写给用户（Kp/Ki/Kd/Max/Min/Dead/Acc/Full/PID 开关 + 现场建议）。

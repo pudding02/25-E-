@@ -224,6 +224,7 @@ cb = _get(CFG, "center_calib", {})
 CALIB_ENABLED   = cb.get("enabled", True)
 CALIB_STEP      = cb.get("step_px", 4)          # 每按一次/每连发一拍移动的像素
 CALIB_REPEAT    = cb.get("repeat_ms", 120)      # 按住连发间隔(ms)
+CALIB_DEBOUNCE  = cb.get("debounce_ms", 300)    # 两次点击最小间隔(防触摸抖动"一下跳两项"; 0=禁用)
 CALIB_DOT_R     = cb.get("dot_radius", 2)       # 绿点半径(px; 小点口径)
 CALIB_TOUCH_ROT = cb.get("touch_rotate", -1)    # 触摸坐标旋转(-1=设备默认; 方向不对时调 0-3)
 CALIB_SHOW_DOT  = cb.get("show_dot", True)      # 启动时绿点+按钮是否显示
@@ -1137,25 +1138,32 @@ def calib_hit(x, y, rects):
             return name
     return None
 
-def calib_step(vis, btn, hold_t0, now, pressed, was_pressed, hit, repeat_ms):
-    """校准 UI 触摸状态机(每帧一次)。返回 (vis, btn, hold_t0, action)。
+def calib_step(vis, btn, hold_t0, last_btn, now, pressed, was_pressed, hit, repeat_ms, guard_ms):
+    """校准 UI 触摸状态机(每帧一次)。返回 (vis, btn, hold_t0, last_btn, action)。
 
     规则: 隐藏态仅"新触摸边沿"唤出(本次触摸被消费, 不发动作; 防点 dot 未松手即弹回);
           可见态新按/换钮立即发一次; 方向键按住每 repeat_ms 连发; dot/save 单发。
-    action ∈ None / "up" / "down" / "left" / "right" / "dot" / "save"
+    防抖(guard_ms): 与"最近一次发出动作的同一按钮"、间隔 < guard_ms 的再次按沿
+          视为触摸抖动吞掉(防一次点击跳两项); 换钮不受限; guard_ms=0 禁用。
+    action ∈ None / "up" / "down" / "left" / "right" / "dot" / "save" / "mode" / "param"
     """
     if not vis:
         if pressed and not was_pressed:
-            return True, None, now, None
-        return False, None, hold_t0, None
+            return True, None, now, last_btn, None
+        return False, None, hold_t0, last_btn, None
     if not pressed:
-        return True, None, hold_t0, None
-    if hit is None or hit != btn:
-        return True, hit, now, hit
+        return True, None, hold_t0, last_btn, None
+    if hit is None:
+        return True, None, now, last_btn, None
+    if hit != btn:
+        if guard_ms > 0 and hit == last_btn \
+                and time.ticks_diff(now, hold_t0) < guard_ms:
+            return True, hit, hold_t0, last_btn, None
+        return True, hit, now, hit, hit
     if (hit == "up" or hit == "down" or hit == "left" or hit == "right") \
             and time.ticks_diff(now, hold_t0) >= repeat_ms:
-        return True, hit, now, hit
-    return True, hit, hold_t0, None
+        return True, hit, now, hit, hit
+    return True, hit, hold_t0, last_btn, None
 
 def _replace_json_int(line, val):
     """把一行 json 里第一个整数 token 换成 val(保留键/缩进/尾逗号); 无整数 token 返回 None"""
@@ -1484,23 +1492,29 @@ def param_save_file(path, items):
     except Exception as e:
         return False, str(e)
 
-def param_step(vis, btn, hold_t0, now, pressed, was_pressed, hit, repeat_ms):
+def param_step(vis, btn, hold_t0, last_btn, now, pressed, was_pressed, hit, repeat_ms, guard_ms):
     """调参页触摸状态机(规则与 calib_step 相同; 连发按钮 = plus/minus)。
-    返回 (vis, btn, hold_t0, action);
+    返回 (vis, btn, hold_t0, last_btn, action);
+    防抖(guard_ms): 同钮 < guard_ms 的再次按沿被吞(防"一下跳两项"); 换钮不受限; 0=禁用。
     action ∈ None / "plus" / "minus" / "item" / "axis" / "save" / "back"
     """
     if not vis:
         if pressed and not was_pressed:
-            return True, None, now, None
-        return False, None, hold_t0, None
+            return True, None, now, last_btn, None
+        return False, None, hold_t0, last_btn, None
     if not pressed:
-        return True, None, hold_t0, None
-    if hit is None or hit != btn:
-        return True, hit, now, hit
+        return True, None, hold_t0, last_btn, None
+    if hit is None:
+        return True, None, now, last_btn, None
+    if hit != btn:
+        if guard_ms > 0 and hit == last_btn \
+                and time.ticks_diff(now, hold_t0) < guard_ms:
+            return True, hit, hold_t0, last_btn, None
+        return True, hit, now, hit, hit
     if (hit == "plus" or hit == "minus") \
             and time.ticks_diff(now, hold_t0) >= repeat_ms:
-        return True, hit, now, hit
-    return True, hit, hold_t0, None
+        return True, hit, now, hit, hit
+    return True, hit, hold_t0, last_btn, None
 
 def _param_rects(ox, oy, sw, sh, bw):
     """生成调参页 6 个按钮的命中矩形(LCD 坐标): +/− (左缘上下)
@@ -1631,6 +1645,7 @@ def run_cv():
     _calib_btn = None                # 按住中的按钮名
     _calib_hold = 0                  # 按住起始时刻(连发计时)
     _calib_pre = False               # 上帧是否有触点(唤醒边沿判定)
+    _calib_last = None               # 最近一次发出动作的按钮(防抖基准; 防"一下跳两项")
     _page = 0                        # 触屏页: 0=校准 / 1=调参(P 键进入, X 键返回)
     _paxis = 0                       # 调参页当前轴(0=yaw / 1=pitch; 轴键切换)
     _pitem = "pid"                   # 调参页当前项(项键循环; 见 PARAM_ITEMS)
@@ -1698,14 +1713,14 @@ def run_cv():
                 _pressed = len(_pts) > 0
                 if _page == 0:
                     _hit = calib_hit(_pts[0].x, _pts[0].y, CALIB_BTNS) if _pressed else None
-                    _calib_vis, _calib_btn, _calib_hold, _act = calib_step(
-                        _calib_vis, _calib_btn, _calib_hold, time.ticks_ms(),
-                        _pressed, _calib_pre, _hit, CALIB_REPEAT)
+                    _calib_vis, _calib_btn, _calib_hold, _calib_last, _act = calib_step(
+                        _calib_vis, _calib_btn, _calib_hold, _calib_last, time.ticks_ms(),
+                        _pressed, _calib_pre, _hit, CALIB_REPEAT, CALIB_DEBOUNCE)
                 else:
                     _hit = calib_hit(_pts[0].x, _pts[0].y, PARAM_BTNS) if _pressed else None
-                    _calib_vis, _calib_btn, _calib_hold, _act = param_step(
-                        _calib_vis, _calib_btn, _calib_hold, time.ticks_ms(),
-                        _pressed, _calib_pre, _hit, CALIB_REPEAT)
+                    _calib_vis, _calib_btn, _calib_hold, _calib_last, _act = param_step(
+                        _calib_vis, _calib_btn, _calib_hold, _calib_last, time.ticks_ms(),
+                        _pressed, _calib_pre, _hit, CALIB_REPEAT, CALIB_DEBOUNCE)
                 _calib_pre = _pressed
                 if _calib_skip:              # 切页后的同一次按压: 吞掉动作(松开后恢复)
                     _act = None
@@ -1734,6 +1749,7 @@ def run_cv():
                         _page = 1
                         _calib_btn = None
                         _calib_hold = 0
+                        _calib_last = None           # 跨页不沿用防抖基准
                         _calib_skip = True           # 防按 P 未松手时误触调参页按钮
                         print("UI->param page")
                     if LOX < -CALIB_XMAX:
@@ -1766,6 +1782,7 @@ def run_cv():
                         _page = 0
                         _calib_btn = None
                         _calib_hold = 0
+                        _calib_last = None           # 跨页不沿用防抖基准
                         _calib_skip = True
                         print("UI->calib page")
 

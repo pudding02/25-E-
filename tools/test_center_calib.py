@@ -101,63 +101,113 @@ class TestCalibHit(unittest.TestCase):
 
 
 class TestCalibStep(unittest.TestCase):
-    """签名: calib_step(vis, btn, hold_t0, now, pressed, was_pressed, hit, repeat_ms)
+    """签名: calib_step(vis, btn, hold_t0, last_btn, now, pressed, was_pressed, hit, repeat_ms, guard_ms)
 
     规则: 隐藏态仅在"新触摸边沿"唤出(本次消费, 不发动作); 可见态新按/换钮立即发一次;
           方向键按住每 repeat_ms 连发; dot/save 不连发; 松开清空 btn。
+    防抖(guard_ms): 与"最近一次发出动作的同一按钮"、间隔 < guard_ms 的再次按下沿被吞
+          (防触摸抖动"一下跳两项"); 换钮不受限。本类用例按默认 300ms 守卫跑。
     """
 
     def test_hidden_edge_press_shows_only(self):
-        self.assertEqual(F("calib_step")(False, None, 0, 1000, True, False, "up", 120),
-                         (True, None, 1000, None))
+        self.assertEqual(F("calib_step")(False, None, 0, None, 1000, True, False, "up", 120, 300),
+                         (True, None, 1000, None, None))
 
     def test_hidden_held_press_stays_hidden(self):
         # 点 ● 隐藏后同一触摸尚未松开 → 不重新唤醒
-        self.assertEqual(F("calib_step")(False, "dot", 900, 1000, True, True, "dot", 120),
-                         (False, None, 900, None))
+        self.assertEqual(F("calib_step")(False, "dot", 900, "dot", 1000, True, True, "dot", 120, 300),
+                         (False, None, 900, "dot", None))
 
     def test_hidden_no_press_stays_hidden(self):
-        self.assertEqual(F("calib_step")(False, None, 0, 1000, False, False, None, 120),
-                         (False, None, 0, None))
+        self.assertEqual(F("calib_step")(False, None, 0, None, 1000, False, False, None, 120, 300),
+                         (False, None, 0, None, None))
 
     def test_visible_release_clears_btn(self):
-        self.assertEqual(F("calib_step")(True, "up", 900, 1000, False, True, None, 120),
-                         (True, None, 900, None))
+        self.assertEqual(F("calib_step")(True, "up", 900, "up", 1000, False, True, None, 120, 300),
+                         (True, None, 900, "up", None))
 
     def test_new_press_fires_once(self):
-        self.assertEqual(F("calib_step")(True, None, 0, 1000, True, False, "up", 120),
-                         (True, "up", 1000, "up"))
+        self.assertEqual(F("calib_step")(True, None, 0, None, 1000, True, False, "up", 120, 300),
+                         (True, "up", 1000, "up", "up"))
 
     def test_hold_before_repeat_no_act(self):
-        self.assertEqual(F("calib_step")(True, "up", 1000, 1090, True, True, "up", 120),
-                         (True, "up", 1000, None))
+        self.assertEqual(F("calib_step")(True, "up", 1000, "up", 1090, True, True, "up", 120, 300),
+                         (True, "up", 1000, "up", None))
 
     def test_hold_repeat_fires(self):
-        self.assertEqual(F("calib_step")(True, "up", 1000, 1120, True, True, "up", 120),
-                         (True, "up", 1120, "up"))
+        self.assertEqual(F("calib_step")(True, "up", 1000, "up", 1120, True, True, "up", 120, 300),
+                         (True, "up", 1120, "up", "up"))
 
     def test_dot_no_repeat(self):
-        self.assertEqual(F("calib_step")(True, "dot", 1000, 1500, True, True, "dot", 120),
-                         (True, "dot", 1000, None))
+        self.assertEqual(F("calib_step")(True, "dot", 1000, "dot", 1500, True, True, "dot", 120, 300),
+                         (True, "dot", 1000, "dot", None))
 
     def test_save_no_repeat(self):
-        self.assertEqual(F("calib_step")(True, "save", 1000, 1500, True, True, "save", 120),
-                         (True, "save", 1000, None))
+        self.assertEqual(F("calib_step")(True, "save", 1000, "save", 1500, True, True, "save", 120, 300),
+                         (True, "save", 1000, "save", None))
 
     def test_mode_single_fire_no_repeat(self):
         # T/C 模式切换: 新按发一次, 按住不连发(防误切)
-        self.assertEqual(F("calib_step")(True, None, 0, 1000, True, False, "mode", 120),
-                         (True, "mode", 1000, "mode"))
-        self.assertEqual(F("calib_step")(True, "mode", 1000, 1500, True, True, "mode", 120),
-                         (True, "mode", 1000, None))
+        self.assertEqual(F("calib_step")(True, None, 0, None, 1000, True, False, "mode", 120, 300),
+                         (True, "mode", 1000, "mode", "mode"))
+        self.assertEqual(F("calib_step")(True, "mode", 1000, "mode", 1500, True, True, "mode", 120, 300),
+                         (True, "mode", 1000, "mode", None))
 
     def test_switch_button_immediate(self):
-        self.assertEqual(F("calib_step")(True, "up", 1000, 1050, True, True, "down", 120),
-                         (True, "down", 1050, "down"))
+        # 换钮立即响应: 上一次动作按钮是 up, 80ms 后按 down 不受防抖限制
+        self.assertEqual(F("calib_step")(True, "up", 1000, "up", 1050, True, True, "down", 120, 300),
+                         (True, "down", 1050, "down", "down"))
 
     def test_press_off_buttons_no_act(self):
-        self.assertEqual(F("calib_step")(True, None, 0, 1000, True, False, None, 120),
-                         (True, None, 1000, None))
+        self.assertEqual(F("calib_step")(True, None, 0, None, 1000, True, False, None, 120, 300),
+                         (True, None, 1000, None, None))
+
+
+class TestCalibDebounce(unittest.TestCase):
+    """防抖(guard_ms): 同一按钮 < guard_ms 的重复按沿被吞; 换钮/超窗放行; guard=0 禁用"""
+
+    GD = 300
+
+    def test_same_button_within_guard_swallowed(self):
+        f = F("calib_step")
+        # 真点击 up(动作) → 松开 → 160ms 后同钮伪按沿(触摸抖动) → 吞
+        _, btn, hold, last, act = f(True, None, 0, None, 1000, True, False, "up", 120, self.GD)
+        self.assertEqual((btn, act), ("up", "up"))
+        _, btn, hold, last, act = f(True, btn, hold, last, 1060, False, True, None, 120, self.GD)
+        self.assertIsNone(act)
+        _, btn, hold, last, act = f(True, btn, hold, last, 1160, True, False, "up", 120, self.GD)
+        self.assertIsNone(act)                    # 距上次动作 160ms < 300 → 吞
+        self.assertEqual((btn, last), ("up", "up"))
+        # 距上次动作 > guard_ms 的同钮按下 → 放行(用户真点击第二下)
+        _, _, _, _, act = f(True, None, hold, last, 1310, True, False, "up", 120, self.GD)
+        self.assertEqual(act, "up")
+
+    def test_swallowed_then_hold_repeats(self):
+        # 被吞后按住不放: 连发通道不受防抖影响(仍以最近一次动作为计时基准)
+        f = F("calib_step")
+        _, btn, hold, last, act = f(True, None, 0, None, 1000, True, False, "up", 120, self.GD)
+        self.assertEqual(act, "up")
+        _, btn, hold, last, _ = f(True, btn, hold, last, 1060, False, True, None, 120, self.GD)
+        _, btn, hold, last, act = f(True, btn, hold, last, 1160, True, False, "up", 120, self.GD)
+        self.assertIsNone(act)                    # 伪按沿被吞
+        _, _, _, _, act = f(True, btn, hold, last, 1180, True, True, "up", 120, self.GD)
+        self.assertEqual(act, "up")               # 按住延续 → 连发起步(1160-1000=160 ≥ 120)
+
+    def test_different_button_not_blocked(self):
+        # 换钮不受防抖限制: up 动作后 80ms 按 down → 立即响应
+        f = F("calib_step")
+        _, _, _, last, act = f(True, None, 0, None, 1000, True, False, "up", 120, self.GD)
+        self.assertEqual(act, "up")
+        _, _, _, _, act = f(True, None, 0, last, 1080, True, False, "down", 120, self.GD)
+        self.assertEqual(act, "down")
+
+    def test_guard_zero_disables(self):
+        # guard=0: 冷却禁用, 同钮快速重复按沿也放行(旧行为)
+        f = F("calib_step")
+        _, _, _, last, act = f(True, None, 0, None, 1000, True, False, "up", 120, 0)
+        self.assertEqual(act, "up")
+        _, _, _, _, act = f(True, None, 0, last, 1160, True, False, "up", 120, 0)
+        self.assertEqual(act, "up")
 
 
 class TestCalibFlow(unittest.TestCase):
@@ -166,35 +216,36 @@ class TestCalibFlow(unittest.TestCase):
     def test_full_interaction_sequence(self):
         f = F("calib_step")
         REP = 120
-        vis, btn, hold = True, None, 0
+        GD = 300
+        vis, btn, hold, last = True, None, 0, None
         # 帧1: 按下 up(新触摸) → 立即一步
-        vis, btn, hold, act = f(vis, btn, hold, 1000, True, False, "up", REP)
+        vis, btn, hold, last, act = f(vis, btn, hold, last, 1000, True, False, "up", REP, GD)
         self.assertEqual((vis, btn, act), (True, "up", "up"))
         # 帧2: 按住 50ms(未到连发间隔) → 无动作
-        vis, btn, hold, act = f(vis, btn, hold, 1050, True, True, "up", REP)
+        vis, btn, hold, last, act = f(vis, btn, hold, last, 1050, True, True, "up", REP, GD)
         self.assertIsNone(act)
         # 帧3: 按住 130ms → 连发一步
-        vis, btn, hold, act = f(vis, btn, hold, 1130, True, True, "up", REP)
+        vis, btn, hold, last, act = f(vis, btn, hold, last, 1130, True, True, "up", REP, GD)
         self.assertEqual((vis, btn, act), (True, "up", "up"))
         # 帧4: 松开 → 清按钮
-        vis, btn, hold, act = f(vis, btn, hold, 1200, False, True, None, REP)
+        vis, btn, hold, last, act = f(vis, btn, hold, last, 1200, False, True, None, REP, GD)
         self.assertEqual((vis, btn, act), (True, None, None))
         # 帧5: 按 dot → 动作 dot; 外部执行隐藏(模拟主循环: vis=False)
-        vis, btn, hold, act = f(vis, btn, hold, 1300, True, False, "dot", REP)
+        vis, btn, hold, last, act = f(vis, btn, hold, last, 1300, True, False, "dot", REP, GD)
         self.assertEqual(act, "dot")
         vis = False
         # 帧6: dot 未松手 → 保持隐藏(不弹回)
-        vis, btn, hold, act = f(vis, btn, hold, 1350, True, True, "dot", REP)
+        vis, btn, hold, last, act = f(vis, btn, hold, last, 1350, True, True, "dot", REP, GD)
         self.assertEqual((vis, act), (False, None))
         # 帧7: 松开 → 保持隐藏
-        vis, btn, hold, act = f(vis, btn, hold, 1400, False, True, None, REP)
+        vis, btn, hold, last, act = f(vis, btn, hold, last, 1400, False, True, None, REP, GD)
         self.assertEqual((vis, act), (False, None))
         # 帧8: 新触摸(任意位置) → 仅唤醒, 本次触摸不发动作
-        vis, btn, hold, act = f(vis, btn, hold, 1500, True, False, None, REP)
+        vis, btn, hold, last, act = f(vis, btn, hold, last, 1500, True, False, None, REP, GD)
         self.assertEqual((vis, act), (True, None))
-        # 帧9: 点击 save → 动作 save
-        vis, btn, hold, act = f(vis, btn, hold, 1550, False, True, None, REP)
-        vis, btn, hold, act = f(vis, btn, hold, 1600, True, False, "save", REP)
+        # 帧9: 点击 save → 动作 save(距上次动作 300ms 且换钮, 防抖放行)
+        vis, btn, hold, last, act = f(vis, btn, hold, last, 1550, False, True, None, REP, GD)
+        vis, btn, hold, last, act = f(vis, btn, hold, last, 1600, True, False, "save", REP, GD)
         self.assertEqual(act, "save")
 
 
