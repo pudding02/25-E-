@@ -1171,9 +1171,9 @@ def run_cv():
     try:
         print("boot")
         os.exitpoint(os.EXITPOINT_ENABLE)
-        # 采集端对齐官方例程(rgb888_find_circles_1.py): 显式 CSI 端口 + 1280x720@90(16:9) 模式提示。
-        # 旧写法(无 id + 1280x960)实测画面视野偏移, 官方例程同板对照正常 —— 勿回退。
-        sensor = Sensor(id=CSI_ID, width=1280, height=720, fps=FPS)
+        # 采集端: 显式 CSI 端口 + 1280x960@90(4:3) 模式提示 —— 与 640x480 输出宽高比一致。
+        # (V7.6: 缺 id 曾致视野偏移; V7.7b: 1280x720(16:9) 提示实测画面横向压缩 —— 勿回退)
+        sensor = Sensor(id=CSI_ID, width=1280, height=960, fps=FPS)
         sensor.reset()
         sensor.set_framesize(width=SENSOR_W, height=SENSOR_H, chn=CAM_CHN_ID_0)
         sensor.set_pixformat(Sensor.RGB888, chn=CAM_CHN_ID_0)

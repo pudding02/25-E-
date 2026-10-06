@@ -145,7 +145,7 @@ cp model.kmodel /sdcard/model/
 | **model_path 和 task 必须配对** | `_seg_` 模型 → `"task": "segment"`；`_det_` 模型 → `"task": "detect"` |
 | **labels 必须与训练时完全一致** | 顺序、数量、名称都不能错 |
 | **rgb888p_size 随 task 变化** | segment → `[320, 320]`；detect → `[640, 360]` |
-| **GC2093 是 16:9 传感器** | 不建议设 4:3 分辨率（如 640×480），否则传感器初始化可能失败 |
+| **GC2093 是 16:9 传感器** | 本条针对 YOLO 输入参数（`rgb888p_size` 等）：不建议设 4:3，否则初始化可能失败。CV 模式采集提示分辨率另见「故障排查」（须与 640×480 输出宽高比一致）|
 
 ## 四、云台控制（双步进）
 
@@ -245,7 +245,7 @@ python tools/calibrate_laser.py
 python tools/test_emm_protocol.py    # 协议帧对拍（12 用例）
 python tools/test_coast_logic.py     # 丢靶预判状态机（10 用例）
 python tools/test_circle_logic.py    # V7 纯函数：红环分流/画圈几何/搜索/引脚去抖（29 用例）
-python tools/test_camera_init.py     # 采集初始化守门：CSI id / 16:9 提示 / config 对账（5 用例）
+python tools/test_camera_init.py     # 采集初始化守门：CSI id / 4:3 提示(与输出一致) / config 对账（5 用例）
 python tools/test_center_calib.py    # V7.7 触屏校准：按钮命中/触摸状态机/config 文本替换（32 用例）
 ```
 
@@ -274,7 +274,8 @@ python tools/test_center_calib.py    # V7.7 触屏校准：按钮命中/触摸�
 | 问题 | 排查 |
 |------|------|
 | 检测不到矩形 | 降低 `rectangle.min_area`，放宽 `white_low`（CV 模式仅支持黑底白矩形）|
-| 画面视野偏移（偏左/偏右）| 先核查 `camera.csi_id`（GC2093 在 CSI2，须为 2）；采集提示分辨率须为 16:9（1280×720），勿用 4:3 提示（旧 1280×960 曾致偏移）|
+| 画面视野偏移（偏左/偏右）| 核查 `camera.csi_id`（GC2093 在 CSI2，须为 2）——缺 id 曾致偏移 |
+| 画面横向被压缩（比例不对）| 采集提示分辨率须与输出宽高比一致：1280×960(4:3) 配 640×480；1280×720(16:9) 提示曾致横压 |
 | 触屏校准按键无反应 | 查 6P 触摸排线；看串口 `calib: touch ...` 行（触摸异常会自动禁用，不影响追踪）；确认 `center_calib.enabled=true` |
 | 触屏绿点移动方向不对 | `center_calib.touch_rotate` 从 -1 改 0/1/2/3 逐个试（触摸坐标旋转）|
 | 误检太多 | 提高 `rectangle.min_area`，收窄 `min_aspect/max_aspect` |

@@ -1,20 +1,19 @@
-"""采集端守门测试 —— 防止「采集初始化」被重构改回旧写法（画面视野偏移回归）。
+"""采集端守门测试 —— 防止「采集初始化」被重构改回旧写法（画面几何回归）。
 
-背景（V7.6 修复 · 实机对照官方例程）:
-  现象: 画面视野偏移(偏左)。与官方例程 官方代码/rgb888_find_circles_1.py 同板对照,
-        官方例程画面正常、本程序画面偏 —— 差异在采集端:
-  官方: Sensor(id=2, width=1280, height=720, fps=90)   <- 显式 CSI 端口 + 16:9 模式提示
-  旧版: Sensor(width=1280, height=960, fps=FPS)        <- v5(36b9e38) 重构丢 id, 且提示 4:3 模式
-  事实: 庐山派板载 GC2093 挂在 CSI2; GC2093 为 16:9 传感器, 应用 16:9 模式提示
-        (README 第三节 YOLO 规则同款约束: 不建议对 GC2093 设 4:3 分辨率)。
+背景（实机两次修复, 勿回退）:
+  V7.6: 画面视野偏移(偏左) —— 根因 = 缺 CSI 端口 id（原始代码 Sensor(id=2), v5 重构丢失）;
+        修复 = 显式 id=CSI_ID（config.camera.csi_id=2）。
+  V7.7b: 画面横向被压缩 —— 根因 = 1280x720(16:9) 模式提示与 640x480(4:3) 输出宽高比不符,
+        K230 非等比缩放致横向压缩; 修复 = 恢复 1280x960(4:3) 提示（与输出宽高比一致）。
+  事实: 庐山派板载 GC2093 挂在 CSI2; 支持 1280x960@90 与 1280x720@90 两种模式。
 
 本测试（AST 静态检查, stdlib only, 不需要 K230 硬件）:
   1. main.py 的 Sensor(...) 构造必须显式传 id=(不得依赖固件默认端口);
-  2. 该构造的探测提示分辨率必须是 1280x720(16:9);
+  2. 该构造的探测提示分辨率必须是 1280x960(4:3, 与 640x480 输出一致, 防横向压缩);
   3. main.py 顶层必须定义 CSI_ID(缺定义则 Sensor(id=CSI_ID) 生产会 NameError);
   4. config.json 的 camera.csi_id 必须存在且为 2(配置与代码一致)。
-若确需变更这些值: 先理解画面几何影响(对照 官方代码/rgb888_find_circles_1.py 实机验证),
-再同步修改本测试 —— 不要静默改掉守门。
+若确需变更这些值: 先理解画面几何影响（实机观察缩放比例与视野位置）, 再同步修改本测试
+—— 不要静默改掉守门。
 
 运行: python tools/test_camera_init.py
 """
@@ -50,7 +49,7 @@ def _sensor_kwargs():
 
 
 class TestCameraInit(unittest.TestCase):
-    """采集初始化守门（防回归: 缺 id / 4:3 提示 曾导致画面视野偏移）"""
+    """采集初始化守门（防回归: 缺 id 曾致视野偏移 / 16:9 提示曾致横向压缩）"""
 
     def test_sensor_call_exists_once(self):
         calls = _find_sensor_calls(_load_main_tree())
@@ -69,16 +68,17 @@ class TestCameraInit(unittest.TestCase):
             isinstance(v, ast.Constant) and v.value is None,
             "Sensor(id=None) 等于没传 —— 必须指定 CSI 端口")
 
-    def test_sensor_probe_resolution_is_16x9(self):
+    def test_sensor_probe_resolution_matches_4x3_output(self):
         kw = _sensor_kwargs()
-        for name, want in (("width", 1280), ("height", 720)):
+        for name, want in (("width", 1280), ("height", 960)):
             self.assertIn(name, kw, "Sensor(...) 缺少 %s= 参数" % name)
             self.assertIsInstance(
                 kw[name], ast.Constant,
-                "Sensor(%s=...) 应为字面量常量(与官方例程一致)" % name)
+                "Sensor(%s=...) 应为字面量常量" % name)
             self.assertEqual(
                 kw[name].value, want,
-                "采集探测提示分辨率应为 1280x720(16:9); 旧 1280x960(4:3) 曾致画面视野偏移")
+                "采集提示分辨率应为 1280x960(4:3, 与 640x480 输出一致); "
+                "1280x720(16:9) 曾致画面横向压缩")
 
     def test_csi_id_defined_in_main(self):
         tree = _load_main_tree()
