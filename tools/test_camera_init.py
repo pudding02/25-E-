@@ -164,6 +164,14 @@ class TestCameraConfigChain(unittest.TestCase):
             disp.get("y_offset"), want,
             "画面垂直居中: y_offset 须 = (lcd_height - sensor_height)/2")
 
+    def test_display_x_offset_centers_frame(self):
+        cfg = self._cfg()
+        cam, disp = cfg.get("camera", {}), cfg.get("display", {})
+        want = (disp.get("lcd_width") - cam.get("sensor_width")) // 2
+        self.assertEqual(
+            disp.get("x_offset"), want,
+            "画面水平居中: x_offset 须 = (lcd_width - sensor_width)/2")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -275,12 +275,12 @@ python tools/test_center_calib.py    # V7.7 触屏校准：按钮命中/触摸�
 |------|------|
 | 检测不到矩形 | 降低 `rectangle.min_area`，放宽 `white_low`（CV 模式仅支持黑底白矩形）|
 | 画面视野偏移（偏左/偏右）| 核查 `camera.csi_id`（须为 2）与采集提示 1280×720；**勿用 1280×960**（实测该模式视野偏左）|
-| 画面横向被压缩（比例不对）| `set_framesize` 必须带 `crop=True`（16:9 提示→4:3 输出居中裁切再缩放）；漏掉即非等比压缩 |
+| 画面横向被压缩（比例不对）| 输出须与 720 提示同为 16:9（640×360）；`set_framesize` 的 `crop=True` 为兜底（输出若被改成 4:3 会自动居中裁切而非拉伸）|
 | 画面放大太多（视野窄）| 输出须为 640×360（与 720 提示同 16:9）＝全幅最大视野；4:3 输出(640×480)会触发 crop 只取中央 75% |
 | 触屏校准按键无反应 | 查 6P 触摸排线；看串口 `calib: touch ...` 行（触摸异常会自动禁用，不影响追踪）；确认 `center_calib.enabled=true` |
 | 触屏绿点移动方向不对 | `center_calib.touch_rotate` 从 -1 改 0/1/2/3 逐个试（触摸坐标旋转）|
 | 误检太多 | 提高 `rectangle.min_area`，收窄 `min_aspect/max_aspect` |
-| 帧率低 | 启用 `detect_resolution.enabled: true`（如配置），降低分辨率到 320×240 |
+| 帧率低 | 调大 `debug.gc_every`、关 `display.show_osd`，或将 `detection.detect_every` 设 2（隔帧检测）|
 | 某轴电机不动 | 先看 `actuator:` 行是否 `online`；`(no resp)` → 按 `接线图.md` 第六节排障（共地/交叉/预置/回环）|
 | 云台乱转/抖动 | 调死区 / 降低 K 参数 / 检查方向位（`reverse`）|
 | pitch 电机不动/动作不对 | 与 yaw 同排查路径（接线图第六节）；确认 `[pitch_motor]` 参数与 `[motor]` 同构 |

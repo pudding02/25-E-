@@ -121,8 +121,8 @@ FPS       = _get(_get(CFG, "camera", {}), "fps", 90)
 DISPLAY_W = _get(_get(CFG, "display", {}), "lcd_width", 800)
 DISPLAY_H = _get(_get(CFG, "display", {}), "lcd_height", 480)
 SHOW_TO_IDE = _get(_get(CFG, "display", {}), "to_ide", False)
-DISPLAY_X = _get(_get(CFG, "display", {}), "x_offset", 80)
-DISPLAY_Y = _get(_get(CFG, "display", {}), "y_offset", 0)
+DISPLAY_X = _get(_get(CFG, "display", {}), "x_offset", (DISPLAY_W - SENSOR_W) // 2)
+DISPLAY_Y = _get(_get(CFG, "display", {}), "y_offset", (DISPLAY_H - SENSOR_H) // 2)
 SHOW_OSD  = _get(_get(CFG, "display", {}), "show_osd", True)
 
 # ---- 检测模式 ----
@@ -1179,6 +1179,10 @@ def run_cv():
         sensor.set_framesize(width=SENSOR_W, height=SENSOR_H, crop=True, chn=CAM_CHN_ID_0)
         sensor.set_pixformat(Sensor.RGB888, chn=CAM_CHN_ID_0)
         print("sensor ok")
+        # 启动几何摘要: 串口一眼核对 采集/显示/中心 是否与期望一致(防拷错 config)
+        print("geom: cam=%dx%d lcd=%dx%d off=(%d,%d) center=(%d,%d)"
+              % (SENSOR_W, SENSOR_H, DISPLAY_W, DISPLAY_H,
+                 DISPLAY_X, DISPLAY_Y, CENTER_X, CENTER_Y))
         # ---- 触屏中心校准: 触摸初始化(失败自动禁用, 不影响主程序) ----
         if CALIB_ENABLED:
             try:
