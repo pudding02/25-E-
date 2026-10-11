@@ -195,6 +195,27 @@ P_PID_KP = pm.get("pid_kp", 0.14)
 P_PID_KI = pm.get("pid_ki", 0.0)
 P_PID_KD = pm.get("pid_kd", 0.0)
 
+# ---- V8 KF 误差滤波(初值=config; kf_enabled=false 时 gimbal_send 对误差原样直通, 行为不变) ----
+#   2 状态卡尔曼(位置+速度)滤波视觉误差: 平滑检测抖动; kf_lead_s>0 时用速度估计做提前量(补帧延迟)。
+#   移植自参考云台 robot_cmd.c:84-135 的 VisionKalmanFilterInit(2 维 KF, 观测位置)。
+KF_Y_EN = mv.get("kf_enabled", False)      # yaw: KF 开关
+KF_Y_QPOS = mv.get("kf_q_pos", 0.5)        # 过程噪声(位置)
+KF_Y_QVEL = mv.get("kf_q_vel", 5.0)        # 过程噪声(速度)
+KF_Y_R = mv.get("kf_r", 2.0)               # 观测噪声
+KF_Y_LEAD = mv.get("kf_lead_s", 0.0)       # 速度前馈提前量(s); 0=关
+KF_Y_LIM = mv.get("kf_err_limit", 150)     # 输出限幅(px)
+KF_P_EN = pm.get("kf_enabled", False)      # pitch: 同上
+KF_P_QPOS = pm.get("kf_q_pos", 0.5)
+KF_P_QVEL = pm.get("kf_q_vel", 5.0)
+KF_P_R = pm.get("kf_r", 2.0)
+KF_P_LEAD = pm.get("kf_lead_s", 0.0)
+KF_P_LIM = pm.get("kf_err_limit", 150)
+
+# KF 运行状态(每轴一个 7 元素列表 [x, v, p00, p01, p10, p11, t]; t=0 表首帧;
+# 丢靶/搜索/死区时与 _pid_clear 同点调用 _kf_clear)
+_kf_yaw = [0.0, 0.0, 5.0, 0.0, 0.0, 5.0, 0]
+_kf_pit = [0.0, 0.0, 5.0, 0.0, 0.0, 5.0, 0]
+
 # PID 运行状态(每轴一套: i=积分累计 px·s / e=上次误差 / t=上次时刻; 丢靶/死区时清零)
 _pid_yaw_i = 0.0
 _pid_yaw_e = 0.0
@@ -496,6 +517,73 @@ def _pid_clear(axis):
 
 
 # ============================================================================
+# 三点五·五、V8 KF 误差滤波(纯函数, 供 gimbal_send 使用; 主机可测)
+#   2 状态卡尔曼(位置+速度, 观测位置): 平滑视觉误差抖动; kf_lead_s>0 时把速度
+#   估计当「提前量」前馈出去(补偿检测/显示帧延迟)。移植自参考云台 robot_cmd.c
+#   的 VisionKalmanFilterInit(2 维 KF), 并把它算了没用的速度分量用上。
+#   kf_enabled=false(默认)时 gimbal_send 不调用本函数, 行为与旧版完全一致。
+# ============================================================================
+
+def kf_step(z, now_ms, st, q_pos, q_vel, r, lead_s, lim):
+    """2 状态 KF 单步(观测位置)。st=[x, v, p00, p01, p10, p11, t] 就地更新; 返回输出(px)。
+
+    z           : 观测(像素误差, 带符号)
+    now_ms      : 当前时刻 time.ticks_ms();  st: 状态/协方差/上次时刻
+    q_pos/q_vel : 过程噪声(位置/速度);  r: 观测噪声;  lim: 输出限幅(正数)
+    lead_s      : 速度前馈提前量(s), 0=纯滤波输出(lead 不写入状态)
+
+    首帧(t=0): 用观测初始化(x=z, v=0, P=diag(5,5) —— 对齐参考 P_init);
+    dt<=0 兜底 0.033s、dt>0.5s 截断(与 pid_step 同约定)。
+    """
+    if st[6] == 0:                       # 首帧: 观测初始化
+        st[0] = float(z)
+        st[1] = 0.0
+        st[2] = 5.0
+        st[3] = 0.0
+        st[4] = 0.0
+        st[5] = 5.0
+        st[6] = now_ms
+    else:
+        dt = time.ticks_diff(now_ms, st[6]) / 1000.0
+        st[6] = now_ms
+        if dt <= 0.0:
+            dt = 0.033
+        elif dt > 0.5:
+            dt = 0.5
+        # 预测: x' = x + v*dt;  P' = F·P·Fᵀ + Q·dt
+        x = st[0] + st[1] * dt
+        p00 = st[2] + dt * (st[3] + st[4]) + q_pos * dt
+        p01 = st[3] + dt * st[5]
+        p10 = st[4] + dt * st[5]
+        p11 = st[5] + q_vel * dt
+        # 更新: S = P00' + r;  K = P'·Hᵀ/S;  x += K·(z - x')
+        s = p00 + r
+        k0 = p00 / s
+        k1 = p10 / s
+        y = z - x
+        st[0] = x + k0 * y
+        st[1] = st[1] + k1 * y
+        st[2] = (1.0 - k0) * p00
+        st[3] = (1.0 - k0) * p01
+        st[4] = p10 - k1 * p00
+        st[5] = p11 - k1 * p01
+    xo = st[0] + st[1] * lead_s          # 速度前馈(提前量)
+    if xo > lim:
+        xo = lim
+    elif xo < -lim:
+        xo = -lim
+    return xo
+
+def _kf_clear(axis):
+    """清空某轴(0=yaw / 1=pitch)的 KF 状态(丢靶/搜索/死区停转时调用, 与 _pid_clear 同点)"""
+    global _kf_yaw, _kf_pit
+    if axis == 0:
+        _kf_yaw = [0.0, 0.0, 5.0, 0.0, 0.0, 5.0, 0]
+    else:
+        _kf_pit = [0.0, 0.0, 5.0, 0.0, 0.0, 5.0, 0]
+
+
+# ============================================================================
 # 四、云台执行器初始化 + gimbal_send
 #    gimbal_send(dx, dy, dist, status) 是「视觉」与「执行器」之间唯一的接口:
 #      dx → 左右轴(yaw, 步进)  : 速度模式 —— |dx| 决定转速, dx 符号决定方向
@@ -687,6 +775,8 @@ try:
                 # 上电搜索(仅"启动后未捕获过目标"期间由 run_cv 调用): yaw 单方向匀速, pitch 停
                 _pid_clear(0)               # 非追踪状态: PID 状态清零(防恢复追踪时积分突跳)
                 _pid_clear(1)
+                _kf_clear(0)                # V8: KF 状态同步清零(防恢复时速度状态突跳)
+                _kf_clear(1)
                 if _yaw:
                     if _search_done:
                         _yaw.stop()                     # 超时后不再重启
@@ -711,6 +801,8 @@ try:
             if status == "lost":
                 _pid_clear(0)               # 丢靶: PID 状态清零
                 _pid_clear(1)
+                _kf_clear(0)                # V8: KF 状态同步清零
+                _kf_clear(1)
                 if _yaw and M_COAST_EN:
                     mode, _coast_active, _coast_start, _last_dx = coast_step(
                         time.ticks_ms(), _coast_active, _coast_start, _last_dx,
@@ -734,6 +826,15 @@ try:
                 return
 
             # ---- 追踪中: 记录最后偏差(供丢靶预判), 复位预判状态, 标记已捕获 ----
+            # ---- (V8) KF 误差滤波: kf_enabled=true 时平滑误差 + 速度前馈; 默认关=原样直通 ----
+            if KF_Y_EN or KF_P_EN:
+                _nowk = time.ticks_ms()
+                if KF_Y_EN:
+                    dx = int(kf_step(dx, _nowk, _kf_yaw, KF_Y_QPOS, KF_Y_QVEL,
+                                     KF_Y_R, KF_Y_LEAD, KF_Y_LIM))
+                if KF_P_EN:
+                    dy = int(kf_step(dy, _nowk, _kf_pit, KF_P_QPOS, KF_P_QVEL,
+                                     KF_P_R, KF_P_LEAD, KF_P_LIM))
             _last_dx = dx
             _coast_active = False
             _acquired = True     # 上电搜索: 一旦追踪过目标, 永久退出搜索
@@ -760,6 +861,7 @@ try:
                 else:
                     _yaw.stop()
                     _pid_clear(0)       # 死区: PID 状态清零(防再出发时积分突跳)
+                    _kf_clear(0)        # V8: KF 状态同步清零
 
             # ---- pitch: 同 yaw(PID 或原映射, 死区内停) ----
             if _pitch:
@@ -782,6 +884,7 @@ try:
                 else:
                     _pitch.stop()
                     _pid_clear(1)
+                    _kf_clear(1)        # V8: KF 状态同步清零
         except Exception:
             pass
 
