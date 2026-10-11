@@ -32,7 +32,7 @@ _MAIN_PY = os.path.normpath(os.path.join(_THIS_DIR, "..", "k230", "main.py"))
 _FUNC_NAMES = (
     "point_in_quad", "classify_blob",
     "circle_target_point", "circle_theta_step", "search_step", "mode_pin_step",
-    "ring_memory_step", "quad_area", "median_of",
+    "ring_memory_step", "quad_area", "median_of", "calib_feed",
 )
 
 # classify_blob 引用的模块级阈值常量 —— 必须由 main.py 定义; 本测试**不注入**其取值,
@@ -354,6 +354,75 @@ class TestMedianOf(unittest.TestCase):
         self.assertEqual(F("median_of")([0.4, 0.41, 0.39, 0.40, 9.9]), 0.40)
 
 
+class TestCalibFeed(unittest.TestCase):
+    """V8.6 渐进标定: ≥ready_n(6) 样本实时可用 / 集满 pool_max 收敛 / ready 前不采纳 k。
+
+    calib_feed(samples, k_now, st, sample, pool_max, ready_n) → (samples, k_now, st, ev)
+    st: 0=未就绪 / 1=ready / 2=final;  ev: 0=无事件 / 1=ready / 2=final
+    """
+
+    def _f(self):
+        return F("calib_feed")
+
+    def test_not_ready_before_six(self):
+        f = self._f()
+        samples, k, st = [], 0.0, 0
+        for i in range(5):
+            samples, k, st, ev = f(samples, k, st, 0.2 + 0.01 * i, 30, 6)
+            self.assertEqual(ev, 0, "第 %d 个样本不应触发事件" % (i + 1))
+        self.assertEqual(st, 0)
+        self.assertEqual(k, 0.0, "ready 前不得采纳 k(防单样本/离群污染)")
+
+    def test_ready_on_sixth_adopts_median(self):
+        f = self._f()
+        samples, k, st = [], 0.0, 0
+        evs = []
+        for i in range(6):
+            samples, k, st, ev = f(samples, k, st, 0.10 + 0.10 * i, 30, 6)
+            evs.append(ev)
+        self.assertEqual(evs[:5], [0, 0, 0, 0, 0])
+        self.assertEqual(evs[5], 1, "第 6 个样本应触发 ready")
+        self.assertEqual(st, 1)
+        # 6 个样本 0.10..0.60 的中位数 = (0.30+0.40)/2 = 0.35
+        self.assertAlmostEqual(k, 0.35)
+
+    def test_k_frozen_between_ready_and_final(self):
+        f = self._f()
+        samples, k, st = [], 0.0, 0
+        for i in range(6):
+            samples, k, st, ev = f(samples, k, st, 0.10 + 0.10 * i, 30, 6)
+        for i in range(23):                       # 第 7..29 个样本
+            samples, k, st, ev = f(samples, k, st, 0.60, 30, 6)
+            self.assertEqual(ev, 0)
+        self.assertAlmostEqual(k, 0.35, msg="ready→final 间不得重算 k")
+        samples, k, st, ev = f(samples, k, st, 0.60, 30, 6)   # 第 30 个
+        self.assertEqual(ev, 2, "集满 pool_max 应触发 final")
+        self.assertEqual(st, 2)
+        self.assertAlmostEqual(k, 0.60, msg="final 应重算中位数(25×0.6 主导)")
+
+    def test_stopped_after_final(self):
+        f = self._f()
+        samples = [0.5] * 30
+        s2, k2, st2, ev = f(samples, 0.5, 2, 0.9, 30, 6)
+        self.assertEqual(ev, 0)
+        self.assertEqual(st2, 2)
+        self.assertEqual(len(s2), 30, "final 后不得再收样本")
+        self.assertAlmostEqual(k2, 0.5)
+
+    def test_ready_n_clamped_to_pool_max(self):
+        f = self._f()
+        samples, k, st = [], 0.0, 0
+        for i in range(4):
+            samples, k, st, ev = f(samples, k, st, 0.2, 4, 6)   # pool_max=4 < ready_n=6
+        self.assertEqual(ev, 1, "ready_n>pool_max 时应按 pool_max 截断")
+        self.assertEqual(st, 1)
+
+    def test_pool_max_zero_no_op(self):
+        f = self._f()
+        s2, k2, st2, ev = f([], 0.0, 0, 0.5, 0, 6)
+        self.assertEqual((s2, k2, st2, ev), ([], 0.0, 0, 0))
+
+
 class TestGeoMainGuards(unittest.TestCase):
     """V8.5 静态守门: main.py 定义几何主轨参数/接线; config 默认关断(行为不变锚点)"""
 
@@ -364,7 +433,7 @@ class TestGeoMainGuards(unittest.TestCase):
     def test_geo_wired_in_main(self):
         src = self._src()
         for name in ("CIRC_RATIO", "CIRC_CALIB_FRAMES", "RED_EN",
-                     "quad_area(", "median_of("):
+                     "quad_area(", "median_of(", "calib_feed(", "_circle_view"):
             self.assertIn(name, src, "main.py 缺少 V8.5 接线: %s" % name)
 
     def test_default_off_in_config(self):
@@ -374,8 +443,8 @@ class TestGeoMainGuards(unittest.TestCase):
             cfg = json.load(f)
         self.assertEqual(cfg["circle"].get("radius_ratio", -1), 0,
                          "circle.radius_ratio 默认必须为 0(现状行为)")
-        self.assertEqual(cfg["circle"].get("calib_frames", -1), 0,
-                         "circle.calib_frames 默认必须为 0(不打扰运行)")
+        self.assertEqual(cfg["circle"].get("calib_frames", -1), 30,
+                         "V8.6: calib_frames 默认 30 —— 渐进标定默认开启(用户批准; ≥6 样本实时可用)")
         self.assertTrue(cfg["red_target"].get("enabled", False),
                         "red_target.enabled 默认必须为 true(红环检测保持原行为)")
 

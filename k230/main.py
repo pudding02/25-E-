@@ -280,7 +280,8 @@ CIRC_DIR = cc.get("direction", 1)
 CIRC_PAUSE = cc.get("pause_px", 120)
 CIRC_FALLBACK_MS = cc.get("fallback_ms", 0)   # V8: 环丢失后继续画圆的记忆窗口(ms); 0=关(原行为)
 CIRC_RATIO = cc.get("radius_ratio", 0)        # V8.5: 环半径/√框面积 比例; >0=几何主轨(免检测干扰)
-CIRC_CALIB_FRAMES = cc.get("calib_frames", 0) # V8.5: 自动标定采集帧数(取中位数); 0=关
+CIRC_CALIB_FRAMES = cc.get("calib_frames", 0) # V8.5/V8.6: 渐进标定采集上限(池满即收敛); 0=关(原行为)
+CIRC_CALIB_READY_N = 6                        # V8.6: 渐进标定达标线(≥6 样本实时可用, 防单样本污染)
 
 # ---- V7 模式引脚(GPIO49: 被供电=画圈) ----
 mp = _get(CFG, "mode_pin", {})
@@ -796,6 +797,31 @@ def median_of(samples):
     if n & 1:
         return float(s[n // 2])
     return (s[n // 2 - 1] + s[n // 2]) / 2.0
+
+def calib_feed(samples, k_now, st, sample, pool_max, ready_n):
+    """渐进标定单步(纯函数, V8.6): 环帧样本 r/√框面积 渐进累积。返回 (samples, k_now, st, ev)。
+
+    st: 0=未就绪 / 1=ready(可用) / 2=final(收敛停止)。
+    集满 ready_n → st=1, ev=1, 采纳中位数(画圈几何主轨即刻可用);
+    已 ready 再集满 pool_max → st=2, ev=2, 重算并采纳最终中位数; 此后不再收集。
+    ready 前不采纳 k(防单样本/离群污染); k 只在事件(ev 非 0)时重算。
+    ready_n>pool_max 按 pool_max 截断(至少 1); pool_max<1 原样返回(调用方已门控, 此处防误用)。
+    """
+    if st >= 2 or pool_max < 1:
+        return samples, k_now, st, 0
+    if ready_n > pool_max:
+        ready_n = pool_max
+    samples = samples + [sample]
+    ev = 0
+    if st == 0 and len(samples) >= ready_n:
+        st = 1
+        ev = 1
+    elif st == 1 and len(samples) >= pool_max:
+        st = 2
+        ev = 2
+    if ev:
+        k_now = median_of(samples)
+    return samples, k_now, st, ev
 
 def search_step(now_ms, searching, start_ms, enabled, acquired, max_ms):
     """上电搜索状态机(纯函数)。返回 (mode, searching, start_ms):
@@ -1758,8 +1784,9 @@ def _param_rects(ox, oy, sw, sh, bw):
         ("back",  xc + 4, oy + m, xc + bw + 4, oy + m + bw),
     )
 
-def param_draw(frame_np, rects, axis, item, val, pid_on):
-    """绘制调参页: 6 按钮 + 底部当前值行("<Yaw/Pitch> <项> = <值>  PID:<ON/OFF>")。
+def param_draw(frame_np, rects, axis, item, val, pid_on, circle_on=False):
+    """绘制调参页: 6 按钮 + 底部当前值行("<Yaw/Pitch> <项> = <值>  PID:<ON/OFF>  C:<ON/OFF>")。
+    circle_on: 当前画圈模式状态(屏上显示, 便于在任何页知道画圈开没开)。
     rects 为 LCD 空间; 1:1 直显时换算到采集帧坐标 = 平移 (-DISPLAY_X, -DISPLAY_Y)。"""
     for name, x0, y0, x1, y1 in rects:
         a0 = x0 - DISPLAY_X
@@ -1789,9 +1816,10 @@ def param_draw(frame_np, rects, axis, item, val, pid_on):
         else:
             cv2.putText(frame_np, "X", (mx - 8, my + 9),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 200), 2)
-    vt = "%s %s = %s   PID:%s" % (
+    vt = "%s %s = %s   PID:%s  C:%s" % (
         "Pitch" if axis else "Yaw", PARAM_NAMES.get(item, item),
-        fmt_disp(item, val), "ON" if pid_on else "OFF")
+        fmt_disp(item, val), "ON" if pid_on else "OFF",
+        "ON" if circle_on else "OFF")
     cv2.putText(frame_np, vt, ((SENSOR_W - 8 * len(vt)) // 2, SENSOR_H - 20),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
@@ -1879,7 +1907,7 @@ def run_cv():
     _mon_tick_p = time.ticks_ms()    # V8: pitch 堵转监控计时
     _calib_buf = []                  # V8.5: 标定样本(环半径/√框面积)
     _calib_k = 0.0                   # V8.5: 标定出的几何比例(本次运行生效)
-    _calib_done = False              # V8.5: 标定是否已完成
+    _calib_st = 0                    # V8.6: 渐进标定状态(0=未就绪/1=ready/2=final)
     fps = fps_count = 0
     fps_tick = time.ticks_ms()
 
@@ -1972,6 +2000,12 @@ def run_cv():
                             _circle_on = not _circle_on
                             _theta = None            # 进出画圈沿重置起始角
                             print("MODE->%s (touch)" % ("circle" if _circle_on else "track"))
+                            if _circle_on and CIRC_RATIO <= 0 and _calib_st < 1:
+                                if CIRC_CALIB_FRAMES > 0:   # V8.6: 渐进标定过渡期提示
+                                    print("  CIRCLE: 渐进标定中(n=%d), 过渡走红环检测; k 就绪后自动切几何主轨"
+                                          % len(_calib_buf))
+                                else:
+                                    print("  CIRCLE: 无 k 且未开启标定, 仅红环检测(受激光干扰); 建议设 [circle].calib_frames=30")
                     elif _act == "save":
                         _ok, _msg = calib_save_file(CFG_PATH, LOX, LOY)
                         print("calib: save %s %s" % ("OK" if _ok else "FAIL", _msg))
@@ -2031,16 +2065,21 @@ def run_cv():
             if frame_id % DETECT_EVERY == 0 or not last_box:
                 box, contour_count, area_count = find_paper_box(frame_np, last_box)
                 ring = find_red_ring(frame_np, box) if RED_EN else None   # V8.5: 可整体关断
-                # ---- V8.5 标定采集: 有效环帧的 k=r/√框面积, 满 N 取中位数(抗激光干扰离群) ----
-                if CIRC_CALIB_FRAMES > 0 and not _calib_done and ring is not None and box is not None:
+                # ---- V8.5/V8.6 渐进标定: 有效环帧的 k=r/√框面积, ≥6 样本实时可用, 集满 N 收敛 ----
+                if CIRC_CALIB_FRAMES > 0 and _calib_st < 2 and ring is not None and box is not None:
                     _fa = quad_area(box)
                     if _fa > 0:
-                        _calib_buf.append(ring[2] / math.sqrt(_fa))
-                        if len(_calib_buf) >= CIRC_CALIB_FRAMES:
-                            _calib_done = True
-                            _calib_k = median_of(_calib_buf)
-                            print("CIRCLE calib: ratio=%.4f (n=%d) 已实时生效 — 建议写入 config [circle].radius_ratio"
-                                  % (_calib_k, CIRC_CALIB_FRAMES))
+                        _ks = ring[2] / math.sqrt(_fa)
+                        if 0.02 < _ks < 1.5:       # 物理合理性过滤(防误检离群污染池)
+                            _calib_buf, _calib_k, _calib_st, _cev = calib_feed(
+                                _calib_buf, _calib_k, _calib_st, _ks,
+                                CIRC_CALIB_FRAMES, CIRC_CALIB_READY_N)
+                            if _cev == 1:
+                                print("CIRCLE autocalib ready: k=%.4f (n=%d) 已实时生效"
+                                      % (_calib_k, len(_calib_buf)))
+                            elif _cev == 2:
+                                print("CIRCLE autocalib: k=%.4f (n=%d) 收敛 — 建议写入 config [circle].radius_ratio"
+                                      % (_calib_k, CIRC_CALIB_FRAMES))
             else:
                 box, ring = last_box, last_ring
 
@@ -2049,6 +2088,7 @@ def run_cv():
             dtm = time.ticks_diff(now2, _theta_tick)
             _theta_tick = now2
             kind, tx, ty = "none", 0, 0
+            _circle_view = None              # V8.6: 画圈圆可视化[(cx,cy,r,tag) tag:1=geo合成/2=记忆兜底]
             if _circle_on:
                 _bctr = quad_center(box) if box is not None else None
                 _kuse = CIRC_RATIO if CIRC_RATIO > 0 else _calib_k   # 配置优先, 标定值次之
@@ -2062,6 +2102,10 @@ def run_cv():
                     _geo_on = False
                 if _ring_use is not None:
                     rcx, rcy, rr = _ring_use
+                    if _geo_on:
+                        _circle_view = (rcx, rcy, rr, 1)   # 合成圆(橙) — 屏上可见"要画的圆"
+                    elif ring is None:
+                        _circle_view = (rcx, rcy, rr, 2)   # 记忆兜底圆(青); 本帧检测环仍由原蓝圆绘制
                     if box is not None:
                         draw_box(frame_np, box)          # 仅绘制(目标=环上点)
                     if _theta is None:
@@ -2086,15 +2130,26 @@ def run_cv():
                 dist = math.sqrt(dx * dx + dy * dy)
                 last_dist = dist
                 gimbal_send(int(dx), int(dy), dist, "track")
-                # OSD: 红环/最终瞄准点 标记 + 目标源文字
+                # OSD: 红环/合成圆/最终瞄准点 标记 + 目标源文字
                 if SHOW_OSD:
+                    if _circle_view is not None:     # V8.6: 画圈圆(橙=几何合成/青=记忆兜底)
+                        _cvx, _cvy, _cvr, _ctag = _circle_view
+                        if _ctag == 1:
+                            cv2.circle(frame_np, (_cvx, _cvy), _cvr, (0, 165, 255), 1)
+                        else:
+                            cv2.circle(frame_np, (_cvx, _cvy), _cvr, (255, 255, 0), 1)
                     if ring is not None:
                         cv2.circle(frame_np, (ring[0], ring[1]), ring[2], (255, 128, 0), 1)
                     cv2.circle(frame_np, (tx, ty), 4, (0, 255, 255), 1)
                     cv2.putText(frame_np, "[%s] dx:%+d dy:%+d" % (kind, dx, dy),
                                 (4, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                    if _circle_on and kind == "rect":    # V8.6: 画圈退化提示(屏上)
+                        cv2.putText(frame_np, "CIRCLE: no ring/k", (4, 32),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
                 if frame_id % PRINT_EVERY == 0:
                     print("OK [%s] d=(%d,%d) dist=%.0f" % (kind, dx, dy, dist))
+                    if _circle_on and kind == "rect" and frame_id % (PRINT_EVERY * 5) == 0:
+                        print("  CIRCLE tip: 画圈无环/未标定 — 退为矩形追踪")
             else:
                 lost_count += 1
                 if lost_count > 2:
@@ -2137,7 +2192,8 @@ def run_cv():
                 else:
                     param_draw(frame_np, PARAM_BTNS, _paxis, _pitem,
                                param_value(_paxis, _pitem),
-                               M_PID_EN if _paxis == 0 else P_PID_EN)
+                               M_PID_EN if _paxis == 0 else P_PID_EN,
+                               _circle_on)
 
             Display.show_image(frame, x=DISPLAY_X, y=DISPLAY_Y)
             if frame_id % GC_EVERY == 0:
