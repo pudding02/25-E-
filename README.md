@@ -113,9 +113,9 @@ cp model.kmodel /sdcard/model/
 | `yolo` | KPU 模型路径 / labels / input_size（见第四节规则）|
 | `motor` | **yaw 轴**：Emm42 速度模式（RPM 区间 / 死区 / 方向 / 使能）；V7.9 PID 参数 `pid_enabled` / `pid_kp` / `pid_ki` / `pid_kd`（见 4.3）；V8 卡尔曼滤波 `kf_*`（见 4.8）与堵转监控 `monitor_ms`（见 4.9）|
 | `pitch_motor` | **pitch 轴**：Emm42 速度模式（与 yaw 同构：min_rpm/max_rpm/dy_full_px/死区/方向）；同含 `pid_*` 键 |
-| `red_target` | **红环检测**（与矩形检测同帧联合进行，画圈模式用）：红色掩膜/环直径/空心验证阈值、ROI 外扩、半径修正 |
+| `red_target` | **红环检测**（与矩形检测同帧联合进行，画圈模式用）：红色掩膜/环直径/空心验证阈值、ROI 外扩、半径修正；V8.5 总开关 `enabled`（false=完全跳过）|
 | `search` | **上电搜索**：未捕获目标时 yaw 单方向匀速旋转找靶（enabled/rpm/direction/max_ms）|
-| `circle` | **画圈运动**：沿红环匀速转圈的角速度/方向/误差门控（speed_deg_s/direction/pause_px）；V8 环丢失记忆兜底 `fallback_ms`（见 4.6）|
+| `circle` | **画圈运动**：沿红环匀速转圈的角速度/方向/误差门控（speed_deg_s/direction/pause_px）；V8 环丢失记忆兜底 `fallback_ms`、V8.5 几何主轨 `radius_ratio`/`calib_frames`（见 4.6）|
 | `mode_pin` | **画圈模式引脚**（GPIO49/Pin3，可选备用，默认关闭）：被供电=画圈；默认由触屏 `T/C` 切换（引脚开启时以引脚为准）|
 | `debug` | 打印与 GC 节奏 |
 
@@ -210,6 +210,11 @@ cp model.kmodel /sdcard/model/
 
 - 画圈模式下红环可见 → 光斑沿红环**连续匀速画圆**（`circle.speed_deg_s` 角速度、`direction` 方向；光斑离目标点超过 `pause_px` 时暂停 θ 推进等伺服追上）。
 - 红环暂不可见 → 默认退为矩形追踪瞄准（环恢复即续圈）；开启 `circle.fallback_ms`（推荐 800）后，环刚丢的一段时间内用**记忆半径 + 矩形中心**继续画圈（串口打印 `CIRCLE fallback`），窗口过后才退矩形追踪。
+- **几何主轨（V8.5，推荐——尤其激光干扰红环检测的场景）**：`circle.radius_ratio > 0` 时，画圈的环几何**完全不再消费红环检测**——圆心=框中心（同心居中先验）、半径 = `k × √(框面积)`。免疫激光扫环的自干扰、无帧间抖动、无丢失中断。k 的获取（免物理标定，比例制对距离变化自动成立）：
+  1. 设 `circle.calib_frames: 60` → 开机后（环干净时）自动收集 60 个有效环帧的 `r/√面积` 取**中位数**（抗离群），串口打印 `CIRCLE calib: ratio=0.xxxx (n=60) 已实时生效`；
+  2. 把该数值填入 `circle.radius_ratio`（永久生效）；或先直接看"本次运行已生效"的画圈效果再决定填不填。
+  - 配套：`red_target.enabled: false` 可整体关断红环检测（省算力/彻底免疫；画圈需已填 `radius_ratio` 或本次运行已完成标定）。
+  - 串口/OSD 目标源区分：几何路径 `[geo]`，检测路径 `[ring]`。
 - **切换方式（默认）**：触屏顶中 `T/C` 按钮点击切换（追踪⇄画圈），串口打印 `MODE->.. (touch)`。
 - **切换方式（可选备用）**：`config.json` 的 `mode_pin.enabled=true` 时改用 GPIO49 跳线：**三脚跳线**（中间=GPIO49/Pin3，两侧=3.3V/Pin1 与 GND）：拨 3.3V=画圈、拨 GND=仅追踪；**悬空不可信**（I2C0 引脚板载上拉情况以实测为准）。此时触屏 `T/C` **故意失效**（以引脚为准），上电串口打印 `mode pin: GPIO49 level=..` 供核对。
 

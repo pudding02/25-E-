@@ -38,6 +38,12 @@ Drone-competition rectangle-target tracking system (电赛E题). A K230-CanMV bo
 - **V8 — circle memory fallback (default off)** — `circle.fallback_ms>0` keeps drawing for a
   short window after the ring is lost, using the remembered radius + box center
   (`ring_memory_step`, prints `CIRCLE fallback`); then falls back to the original behavior.
+- **V8.5 — circle geometry main-track (default off)** — `circle.radius_ratio>0` makes
+  circle-drawing consume NO ring detection: ring center := box center (confirmed concentric
+  prior), radius := k×√(box area) — immune to the laser-sweeping-the-ring self-interference.
+  Calibrate k via `circle.calib_frames=60` (collects r/√area median of valid ring frames,
+  prints `CIRCLE calib: ratio=...`; paste into config). `red_target.enabled=false` skips ring
+  detection entirely. Prints/OSD tag `[geo]` (geometry) vs `[ring]` (detection).
 - **V8 — Emm42 read commands & stall monitor (default off)** — `read_velocity`(0x35) /
   `read_position`(0x36) / `reset_clog`(0x0E 0x52); boot probe appends `rpm=N` to the `actuator:`
   line; `monitor_ms>0` prints a stall WARN (warn only, control unaffected); `clog_reset_on_boot`
@@ -118,7 +124,9 @@ fdx, fdy = kf_update(dx, dy)  # works identically whether Kalman is on or off
   `S` button (text-level replace, all-or-nothing, `.bak` + read-back verify).
   V8 additions: `kf_*` (Kalman, default off) and `monitor_ms` / `clog_reset_on_boot`
   (Emm42 read-based stall monitor, default off) in `[motor]`/`[pitch_motor]`;
-  `[circle].fallback_ms` (ring-memory fallback, default 0 = off).
+  `[circle].fallback_ms` (ring-memory fallback, default 0 = off);
+  V8.5: `[circle].radius_ratio` / `[circle].calib_frames` (geometry main-track, default 0 = off)
+  and `[red_target].enabled` (default true = ring detection on).
 - The config loader strips keys starting with `_`, so comments can be embedded as `"_说明": "..."`.
 - Values are read at import time into module-level globals; restart `main.py` after edits.
 
@@ -143,10 +151,10 @@ fdx, fdy = kf_update(dx, dy)  # works identically whether Kalman is on or off
   - `python tools/test_emm_protocol.py` — frame bytes vs manual examples + V8 read-command /
     clog-reset frames & reply parsing (24 cases). Always run after touching protocol code.
   - `python tools/test_coast_logic.py` — coast (lost-target pre-judgment) state machine (10 cases).
-  - `python tools/test_circle_logic.py` — V7 pure functions + V8 ring-memory fallback (36 cases):
-    quad containment, ring blob classify, circle geometry, search & pin-debounce machines,
-    ring_memory_step. Threshold constants are extracted from main.py itself — a missing
-    definition is a hard error.
+  - `python tools/test_circle_logic.py` — V7 pure functions + V8 ring-memory fallback + V8.5
+    geometry (49 cases): quad containment, ring blob classify, circle geometry, search &
+    pin-debounce machines, ring_memory_step, quad_area (shoelace), median_of. Threshold
+    constants are extracted from main.py itself — a missing definition is a hard error.
   - `python tools/test_camera_init.py` — capture guard: explicit `id=CSI_ID`, 1280×720
     probe + `crop=True`, `CSI_ID` defined; config chain: `csi_id=2`, 16:9 output, offsets;
     dead-display-path guard (`cv2.resize` / `draw_image` / `image.Image` / `bind_layer` /
