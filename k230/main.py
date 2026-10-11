@@ -211,6 +211,12 @@ KF_P_R = pm.get("kf_r", 2.0)
 KF_P_LEAD = pm.get("kf_lead_s", 0.0)
 KF_P_LIM = pm.get("kf_err_limit", 150)
 
+# ---- V8 执行器监控/恢复(初值=config; 挖掘 Emm42 读取能力, 仅告警不动控制环) ----
+M_MONITOR_MS = mv.get("monitor_ms", 0)              # yaw 堵转监控周期(ms); 0=关(默认)
+P_MONITOR_MS = pm.get("monitor_ms", 0)              # pitch 同
+M_CLOG_RESET = mv.get("clog_reset_on_boot", False)  # 上电发送清堵转(0x0E52); 默认关
+P_CLOG_RESET = pm.get("clog_reset_on_boot", False)
+
 # KF 运行状态(每轴一个 7 元素列表 [x, v, p00, p01, p10, p11, t]; t=0 表首帧;
 # 丢靶/搜索/死区时与 _pid_clear 同点调用 _kf_clear)
 _kf_yaw = [0.0, 0.0, 5.0, 0.0, 0.0, 5.0, 0]
@@ -328,6 +334,7 @@ class EmmStepper:
         self.addr = addr & 0xFF
         self.acc = acc        # 默认加减速档位(set_speed 可覆盖)
         self.tmo = timeout_ms
+        self.last_rpm = 0     # V8: 最近一次速度指令(带符号); 供堵转监控对照(见 run_cv)
 
     # ---- 底层收发 ----
     def _send(self, func, data=b""):
@@ -366,6 +373,7 @@ class EmmStepper:
 
     def stop(self, sync=False):
         """立即停止 (FE 98)"""
+        self.last_rpm = 0    # V8: 停止即清零命令记录(堵转监控参考)
         self._send(0xFE, bytes([0x98, 0x01 if sync else 0x00]))
 
     def set_speed(self, direction, rpm, acc=None, sync=False):
@@ -380,6 +388,7 @@ class EmmStepper:
             a = 0
         elif a > 255:
             a = 255
+        self.last_rpm = s if direction > 0 else -s   # V8: 记录命令值(堵转监控参考)
         self._send(0xF6, bytes([0x01 if direction > 0 else 0x00,
                                 (s >> 8) & 0xFF, s & 0xFF,    # 速度: 高字节在前
                                 a & 0xFF,
@@ -435,6 +444,54 @@ class EmmStepper:
         if r is None or r[0] != self.addr or r[1] != 0x24 or r[4] != EMM_CHECKSUM:
             return None
         return (r[2] << 8) | r[3]                            # 高字节在前
+
+    # ---- V8 读取类命令(转速/位置) + 清堵转 ----------------------------------
+    # 命令码来源: 张大头官方例程 X_V2.c 读取命令表; 帧式与读电压 0x24 同构(已实机验证)。
+    # !! 响应字节段为「预期格式」: 首次上机先 raw_probe(0x35)/raw_probe(0x36) 捕获
+    #    真实响应核对, 再把实际样本补进 tools/test_emm_protocol.py 固化。
+
+    def read_velocity(self, timeout_ms=None):
+        """读电机实时转速 (0x35) → 带符号 RPM; 无应答/校验错返回 None。
+
+        请求: [addr][0x35][0x6B]
+        预期响应 6B: [addr][35][sign][v_hi][v_lo][0x6B]  (sign: 0=正/1=负)。
+        """
+        try:
+            self.uart.read()
+        except Exception:
+            pass
+        self._send(0x35)
+        r = self._recv(6, timeout_ms)
+        if r is None or r[0] != self.addr or r[1] != 0x35 or r[5] != EMM_CHECKSUM:
+            return None
+        v = (r[3] << 8) | r[4]                                # 高字节在前
+        return -v if r[2] else v
+
+    def read_position(self, timeout_ms=None):
+        """读电机实时位置 (0x36) → 带符号脉冲数; 无应答/校验错返回 None。
+
+        请求: [addr][0x36][0x6B]
+        预期响应 8B: [addr][36][sign][pos×4 高字节在前][0x6B]。
+        (位置语义——单圈/多圈/上电零点——以实机核对为准; 供软限位评估用。)
+        """
+        try:
+            self.uart.read()
+        except Exception:
+            pass
+        self._send(0x36)
+        r = self._recv(8, timeout_ms)
+        if r is None or r[0] != self.addr or r[1] != 0x36 or r[7] != EMM_CHECKSUM:
+            return None
+        p = (r[3] << 24) | (r[4] << 16) | (r[5] << 8) | r[6]  # 高字节在前
+        return -p if r[2] else p
+
+    def reset_clog(self):
+        """清除堵转保护 (0x0E 0x52): 撞限位/卡死触发堵转保护后恢复电机。
+
+        帧: [addr][0x0E][0x52][0x6B] (命令来源: 第三方驱动库 ZDT_EmmV5_Driver;
+        首次使用以实机行为核对——发一次后看驱动器是否解除堵转)。
+        """
+        self._send(0x0E, bytes([0x52]))
 
     def raw_probe(self, func=0x24, timeout_ms=300):
         """诊断用: 发一帧后把 RX 上收到的原始字节全部 dump 出来(不做校验/解析)。
@@ -910,20 +967,31 @@ try:
             pass
 
     # ---- 打印执行器状态(上电自检的第一手信息) ----
+    # V8: 可选上电清堵转(驱动器因撞限位/卡死进过堵转保护时恢复; 默认关)
+    if M_CLOG_RESET and _yaw:
+        _yaw.reset_clog()
+        print("clog reset sent (yaw)")
+    if P_CLOG_RESET and _pitch:
+        _pitch.reset_clog()
+        print("clog reset sent (pitch)")
     _yaw_info = "off"
     if _yaw:
         _v = _yaw.read_bus_voltage()    # 兼作在线探测: 有回包说明驱动器和串口都通
-        _yaw_info = "emm(addr=%d UART%d TX=GPIO%d RX=GPIO%d %d~%dRPM rev=%s)%s" % (
+        _rpm0 = _yaw.read_velocity() if _v else None   # V8: 顺带验证读取链路(上电应静止)
+        _yaw_info = "emm(addr=%d UART%d TX=GPIO%d RX=GPIO%d %d~%dRPM rev=%s)%s%s" % (
             M_ADDR, M_PORT, M_TX, M_RX, M_MIN_RPM, M_MAX_RPM,
             "Y" if M_REV < 0 else "N",
-            (" online %dmV" % _v) if _v else " (no resp)")
+            (" online %dmV" % _v) if _v else " (no resp)",
+            (" rpm=%d" % _rpm0) if _rpm0 is not None else "")
     _pitch_info = "off"
     if _pitch:
         _v = _pitch.read_bus_voltage()      # 兼作在线探测: 有回包说明驱动器和串口都通
-        _pitch_info = "emm(addr=%d UART%d TX=GPIO%d RX=GPIO%d %d~%dRPM rev=%s)%s" % (
+        _rpm0 = _pitch.read_velocity() if _v else None  # V8: 同上
+        _pitch_info = "emm(addr=%d UART%d TX=GPIO%d RX=GPIO%d %d~%dRPM rev=%s)%s%s" % (
             P_ADDR, P_PORT, P_TX, P_RX, P_MIN_RPM, P_MAX_RPM,
             "Y" if P_REV < 0 else "N",
-            (" online %dmV" % _v) if _v else " (no resp)")
+            (" online %dmV" % _v) if _v else " (no resp)",
+            (" rpm=%d" % _rpm0) if _rpm0 is not None else "")
     print("actuator: yaw=%s | pitch=%s" % (_yaw_info, _pitch_info))
 
     # ---------------- V7 模式引脚(GPIO49): 被供电=画圈, 其余=仅追踪 ----------------
@@ -1775,6 +1843,8 @@ def run_cv():
     _paxis = 0                       # 调参页当前轴(0=yaw / 1=pitch; 轴键切换)
     _pitem = "pid"                   # 调参页当前项(项键循环; 见 PARAM_ITEMS)
     _calib_skip = False              # 切页后吞掉同一次按压的残留动作(防跨页串按)
+    _mon_tick_y = time.ticks_ms()    # V8: yaw 堵转监控计时(monitor_ms>0 时用)
+    _mon_tick_p = time.ticks_ms()    # V8: pitch 堵转监控计时
     fps = fps_count = 0
     fps_tick = time.ticks_ms()
 
@@ -1993,6 +2063,21 @@ def run_cv():
                 fps_tick = now
             cv2.putText(frame_np, "FPS:%d" % fps, (4, SENSOR_H - 8),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            # ---- V8 堵转监控(monitor_ms>0 时每 N ms 读实测转速对照命令; 默认关, 仅告警) ----
+            if M_MONITOR_MS > 0 and _yaw and time.ticks_diff(now, _mon_tick_y) >= M_MONITOR_MS:
+                _mon_tick_y = now
+                if abs(_yaw.last_rpm) >= 3:
+                    _rpm_m = _yaw.read_velocity(20)
+                    if _rpm_m is not None and -1 <= _rpm_m <= 1:
+                        print("WARN: yaw possible stall (cmd=%d meas=%d rpm) — 查机械或发0x0E52清堵转"
+                              % (_yaw.last_rpm, _rpm_m))
+            if P_MONITOR_MS > 0 and _pitch and time.ticks_diff(now, _mon_tick_p) >= P_MONITOR_MS:
+                _mon_tick_p = now
+                if abs(_pitch.last_rpm) >= 3:
+                    _rpm_m = _pitch.read_velocity(20)
+                    if _rpm_m is not None and -1 <= _rpm_m <= 1:
+                        print("WARN: pitch possible stall (cmd=%d meas=%d rpm) — 查机械或发0x0E52清堵转"
+                              % (_pitch.last_rpm, _rpm_m))
             # 触屏 UI(校准页绿点+按钮 / 调参页, 可隐藏)
             if _calib_vis:
                 if _page == 0:

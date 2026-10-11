@@ -54,15 +54,23 @@ class _FakeTime(types.ModuleType):
 
 
 class FakeUART:
-    """记录 write 字节流; RX 永远为空(离线设备)"""
+    """记录 write 字节流; RX 默认空(离线设备)。
+
+    response: 预设"下一帧发送后注入 RX"的应答字节(模拟驱动器回包时序:
+    实际驱动器是在收到请求帧后才应答, 因此方法开头的清残留 read() 不会吞掉它)。
+    """
     def __init__(self, uart_id, baudrate=115200):
         self.uart_id = uart_id
         self.baudrate = baudrate
         self.rx = bytearray()
+        self.response = None
         self.writes = []
 
     def write(self, b):
         self.writes.append(bytes(b))
+        if self.response is not None:
+            self.rx += self.response
+            self.response = None
         return len(b)
 
     def any(self):
@@ -204,6 +212,87 @@ class TestEmmFrames(unittest.TestCase):
         w = self.last()
         self.assertEqual(w[3:5], bytes.fromhex("0B B8"))  # 3000 = 0x0BB8
         self.assertEqual(w[5], 0xFF)
+
+
+class TestEmmReadMethods(unittest.TestCase):
+    """V8 读取类命令(转速/位置) + 清堵转:
+
+    命令码来源: 张大头官方例程 X_V2.c 读取命令表(0x35 实时转速 / 0x36 实时位置 /
+    0x0E 0x52 清堵转), 与读电压 0x24 同构(帧式 [addr][func][0x6B], 已实机验证)。
+    响应字节段为**预期格式**, 首次上机须先 raw_probe(0x35/0x36) 捕获核对——
+    本组用例保证: 请求帧正确 + 解析按预期格式正确 + 脏数据(校验错/短包/错地址)不误解析。
+    """
+
+    def setUp(self):
+        self.st = make_stepper()
+
+    def last(self):
+        self.assertTrue(self.st.uart.writes, "没有发出任何帧")
+        return self.st.uart.writes[-1]
+
+    # ---- 请求帧(命令码 + 帧结构) ----
+
+    def test_read_velocity_request_frame(self):
+        v = self.st.read_velocity()
+        self.assertEqual(self.last(), bytes.fromhex("01 35 6B"))
+        self.assertIsNone(v)                        # 离线无应答
+
+    def test_read_position_request_frame(self):
+        p = self.st.read_position()
+        self.assertEqual(self.last(), bytes.fromhex("01 36 6B"))
+        self.assertIsNone(p)
+
+    def test_reset_clog_frame(self):
+        self.st.reset_clog()
+        self.assertEqual(self.last(), bytes.fromhex("01 0E 52 6B"))
+
+    # ---- 响应解析(模拟驱动器回包时序; 预期格式) ----
+
+    def test_read_velocity_positive(self):
+        self.st.uart.response = bytes.fromhex("01 35 00 03 E8 6B")
+        self.assertEqual(self.st.read_velocity(), 1000)
+
+    def test_read_velocity_negative(self):
+        self.st.uart.response = bytes.fromhex("01 35 01 00 64 6B")
+        self.assertEqual(self.st.read_velocity(), -100)
+
+    def test_read_position_positive(self):
+        self.st.uart.response = bytes.fromhex("01 36 00 00 00 03 E8 6B")
+        self.assertEqual(self.st.read_position(), 1000)
+
+    def test_read_position_negative(self):
+        self.st.uart.response = bytes.fromhex("01 36 01 00 00 00 64 6B")
+        self.assertEqual(self.st.read_position(), -100)
+
+    def test_read_position_high_bytes_big_endian(self):
+        # 高字节在前: 0x12345678
+        self.st.uart.response = bytes.fromhex("01 36 00 12 34 56 78 6B")
+        self.assertEqual(self.st.read_position(), 0x12345678)
+
+    # ---- 鲁棒性: 脏数据不得误解析 ----
+
+    def test_bad_checksum_returns_none(self):
+        self.st.uart.response = bytes.fromhex("01 35 00 03 E8 00")
+        self.assertIsNone(self.st.read_velocity())
+
+    def test_short_reply_returns_none(self):
+        self.st.uart.response = bytes.fromhex("01 35 00")
+        self.assertIsNone(self.st.read_velocity())
+
+    def test_wrong_addr_returns_none(self):
+        self.st.uart.response = bytes.fromhex("02 35 00 03 E8 6B")
+        self.assertIsNone(self.st.read_velocity())
+
+    # ---- last_rpm 命令记录(堵转监控配套) ----
+
+    def test_last_rpm_tracks_speed_cmd(self):
+        self.assertEqual(self.st.last_rpm, 0)       # 初始 0
+        self.st.set_speed(1, 30)
+        self.assertEqual(self.st.last_rpm, 30)
+        self.st.set_speed(-1, 20)
+        self.assertEqual(self.st.last_rpm, -20)
+        self.st.stop()
+        self.assertEqual(self.st.last_rpm, 0)
 
 
 if __name__ == "__main__":

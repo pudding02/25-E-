@@ -183,6 +183,11 @@
     "kf_err_limit": 150,
     "_kf_err_limit": "V8: 滤波输出限幅(px)。防前馈峰值",
 
+    "monitor_ms": 0,
+    "_monitor_ms": "V8: 堵转监控周期(ms)。0=关(默认); 开建议 2000: 每周期读一次实测转速, 「有命令但实测≈0」时打印 WARN(仅告警, 不影响控制)",
+    "clog_reset_on_boot": false,
+    "_clog_reset_on_boot": "V8: true=上电发送清堵转命令(0x0E52, 驱动器撞限位/卡死后恢复); 默认 false",
+
     "min_rpm": 5,
     "max_rpm": 60,
     "_rpm": "转速区间(RPM)。|dx|≤deadband_px → 停转; 之后从 min_rpm 线性升到 max_rpm; |dx|≥dx_full_px 时达 max_rpm。整体想更快就调大这两个; min_rpm 太小会『哼着不转』(步进低速扭矩小)",
@@ -254,6 +259,11 @@
     "_kf_lead_s": "V8: 速度前馈提前量(s)。0=关; 动态目标滞后明显时试 0.05~0.1",
     "kf_err_limit": 150,
     "_kf_err_limit": "V8: 滤波输出限幅(px)。防前馈峰值",
+
+    "monitor_ms": 0,
+    "_monitor_ms": "V8: 堵转监控周期(ms)。0=关(默认); 开建议 2000: 每周期读一次实测转速, 「有命令但实测≈0」时打印 WARN(仅告警, 不影响控制)",
+    "clog_reset_on_boot": false,
+    "_clog_reset_on_boot": "V8: true=上电发送清堵转命令(0x0E52, 驱动器撞限位/卡死后恢复); 默认 false",
 
     "min_rpm": 3,
     "max_rpm": 30,
