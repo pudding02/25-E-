@@ -115,7 +115,7 @@ cp model.kmodel /sdcard/model/
 | `pitch_motor` | **pitch 轴**：Emm42 速度模式（与 yaw 同构：min_rpm/max_rpm/dy_full_px/死区/方向）；同含 `pid_*` 键 |
 | `red_target` | **红环检测**（与矩形检测同帧联合进行，画圈模式用）：红色掩膜/环直径/空心验证阈值、ROI 外扩、半径修正；V8.5 总开关 `enabled`（false=完全跳过）|
 | `search` | **上电搜索**：未捕获目标时 yaw 单方向匀速旋转找靶（enabled/rpm/direction/max_ms）|
-| `circle` | **画圈运动**：沿红环匀速转圈的角速度/方向/误差门控（speed_deg_s/direction/pause_px）；V8 环丢失记忆兜底 `fallback_ms`、V8.5 几何主轨 `radius_ratio`/`calib_frames`（见 4.6）|
+| `circle` | **画圈运动**：沿红环匀速转圈的角速度/方向/误差门控（speed_deg_s/direction/pause_px）；V8 环丢失记忆兜底 `fallback_ms`、V8.5 几何主轨 `radius_ratio`/`calib_frames`（V8.6 渐进标定默认开，见 4.6）|
 | `mode_pin` | **画圈模式引脚**（GPIO49/Pin3，可选备用，默认关闭）：被供电=画圈；默认由触屏 `T/C` 切换（引脚开启时以引脚为准）|
 | `debug` | 打印与 GC 节奏 |
 
@@ -187,7 +187,8 @@ cp model.kmodel /sdcard/model/
 | 现象 | 调整 |
 |------|------|
 | 云台振荡/过冲 | 降对应轴 `max_rpm` / 调大 `deadband_px` |
-| 对准慢 | 调大 `max_rpm` / 调小 `dx_full_px`(yaw)、`dy_full_px`(pitch)；起步肉可调大 `acc` |
+| 对准慢 | 先调大 `acc`（V8.6 默认 250；公式：每 +1RPM 用时 (256-acc)×50μs，见 10.3）；再调大 `max_rpm` / 调小 `dx_full_px`(yaw)、`dy_full_px`(pitch) |
+| 起步/换向迟钝（追起来才跟上） | 调大 `acc`——起步与换向的转速建立时间是当前最大延迟源；`acc=0`=无斜坡直接跳变（极限选项，现场试）；仍不够再调大 `max_rpm` |
 | 低速"哼着不转" | 对应轴 `min_rpm` 调大（步进低速扭矩小） |
 | 中心附近抖动 | 调大对应轴 `deadband_px` |
 | 方向反了 | `motor.reverse` / `pitch_motor.reverse` 置 true |
@@ -202,7 +203,7 @@ cp model.kmodel /sdcard/model/
 | 模式 | 目标 | 串口目标源 |
 |---|---|---|
 | 追踪（默认） | **矩形中心** | `OK [rect]` |
-| 画圈（触屏 `T/C` 切换，见 4.6） | **红环**（环上 θ 点） | `OK [ring]` |
+| 画圈（触屏 `T/C` 切换，见 4.6） | **红环/几何合成圆**（环上 θ 点） | `OK [geo]`（几何）/ `OK [ring]`（检测） |
 
 无有效目标 → 丢靶逻辑（coast/停）；上电未捕获期 → 自动搜索（见 4.7）。
 
@@ -210,11 +211,13 @@ cp model.kmodel /sdcard/model/
 
 - 画圈模式下红环可见 → 光斑沿红环**连续匀速画圆**（`circle.speed_deg_s` 角速度、`direction` 方向；光斑离目标点超过 `pause_px` 时暂停 θ 推进等伺服追上）。
 - 红环暂不可见 → 默认退为矩形追踪瞄准（环恢复即续圈）；开启 `circle.fallback_ms`（推荐 800）后，环刚丢的一段时间内用**记忆半径 + 矩形中心**继续画圈（串口打印 `CIRCLE fallback`），窗口过后才退矩形追踪。
-- **几何主轨（V8.5，推荐——尤其激光干扰红环检测的场景）**：`circle.radius_ratio > 0` 时，画圈的环几何**完全不再消费红环检测**——圆心=框中心（同心居中先验）、半径 = `k × √(框面积)`。免疫激光扫环的自干扰、无帧间抖动、无丢失中断。k 的获取（免物理标定，比例制对距离变化自动成立）：
-  1. 设 `circle.calib_frames: 60` → 开机后（环干净时）自动收集 60 个有效环帧的 `r/√面积` 取**中位数**（抗离群），串口打印 `CIRCLE calib: ratio=0.xxxx (n=60) 已实时生效`；
-  2. 把该数值填入 `circle.radius_ratio`（永久生效）；或先直接看"本次运行已生效"的画圈效果再决定填不填。
-  - 配套：`red_target.enabled: false` 可整体关断红环检测（省算力/彻底免疫；画圈需已填 `radius_ratio` 或本次运行已完成标定）。
-  - 串口/OSD 目标源区分：几何路径 `[geo]`，检测路径 `[ring]`。
+- **几何主轨（V8.5/V8.6，推荐——尤其激光干扰红环检测的场景）**：`circle.radius_ratio > 0` 时，画圈的环几何**完全不再消费红环检测**——圆心=框中心（同心居中先验）、半径 = `k × √(框面积)`。免疫激光扫环的自干扰、无帧间抖动、无丢失中断。k 的获取（免物理标定，比例制对距离变化自动成立）：
+  1. **渐进标定（V8.6 默认开）**：`circle.calib_frames: 30` —— 开机后环检测**成功的帧**自动入池（追踪模式下激光不扫环，收集最快；画圈模式也在持续收集），满 **6 个样本即实时可用**（串口打印 `CIRCLE autocalib ready: k=0.xxxx (n=6) 已实时生效`），集满 30 个收敛（打印 `CIRCLE autocalib: k=... 收敛 — 建议写入 config`）；
+  2. 把收敛值填入 `circle.radius_ratio`（永久生效，优先级高于运行时值）；不填则每次运行自动重标（数秒内可用）。
+  - 收不到样本时的人工兜底：把靶面摆正到画面中央，量黑框像素宽×高与红环像素直径，算 `k = r ÷ √(w×h)` 手填 `radius_ratio`。
+  - 配套：`red_target.enabled: false` 可整体关断红环检测（省算力/彻底免疫；画圈需已填 `radius_ratio` 或本次运行已就绪）。
+  - 串口/OSD 目标源区分：几何路径 `[geo]`，检测路径 `[ring]`，记忆兜底 `CIRCLE fallback`。
+- **OSD 圆语义（V8.6）**：画圈时屏上画圆——**橙色**=几何合成圆（k 路径）、**蓝色**=本帧检测到的红环、**青色**=记忆兜底圆；黄色小圈=当前目标点。画圈激活但无环源（退化追踪）时屏上显示 `CIRCLE: no ring/k`、串口低频提示。
 - **切换方式（默认）**：触屏顶中 `T/C` 按钮点击切换（追踪⇄画圈），串口打印 `MODE->.. (touch)`。
 - **切换方式（可选备用）**：`config.json` 的 `mode_pin.enabled=true` 时改用 GPIO49 跳线：**三脚跳线**（中间=GPIO49/Pin3，两侧=3.3V/Pin1 与 GND）：拨 3.3V=画圈、拨 GND=仅追踪；**悬空不可信**（I2C0 引脚板载上拉情况以实测为准）。此时触屏 `T/C` **故意失效**（以引脚为准），上电串口打印 `mode pin: GPIO49 level=..` 供核对。
 
@@ -295,14 +298,14 @@ python tools/calibrate_laser.py
 ```bash
 python tools/test_emm_protocol.py    # 协议帧对拍 + V8 读取命令/清堵转帧（24 用例）
 python tools/test_coast_logic.py     # 丢靶预判状态机（10 用例）
-python tools/test_circle_logic.py    # V7 纯函数 + V8 环记忆兜底：红环分流/画圈几何/搜索/引脚去抖/记忆兜底（36 用例）
+python tools/test_circle_logic.py    # V7/V8.6 纯函数：红环分流/画圈几何/搜索/引脚去抖/记忆兜底/渐进标定（55 用例）
 python tools/test_camera_init.py     # 采集初始化守门：CSI id / 720 提示 / crop 兜底 / config 几何链 / 死显示路径（11 用例）
 python tools/test_center_calib.py    # V7.7 触屏校准：按钮命中/触摸状态机/config 文本替换/8 键布局（37 用例）
 python tools/test_pid_tune.py        # V7.9 PID+触屏调参：pid_step/参数步进/段内键保存/调参状态机（52 用例）
 python tools/test_kf_filter.py       # V8 卡尔曼滤波：kf_step 收敛/噪声抑制/lead/限幅/reset + 接线守卫（18 用例）
 ```
 
-七套均为 stdlib 独立脚本，从 `k230/main.py` AST 提取目标函数/常量后断言（不需要硬件、不需要 pytest），合计 188 用例。
+七套均为 stdlib 独立脚本，从 `k230/main.py` AST 提取目标函数/常量后断言（不需要硬件、不需要 pytest），合计 207 用例。
 改动协议层先跑第一套；改动视觉/控制/配置面先跑其余几套；再上机。
 （`test_circle_logic.py` 的阈值常量直接取 main.py 定义，若 main.py 漏定义会直接报错。）
 
@@ -319,7 +322,7 @@ python tools/test_kf_filter.py       # V8 卡尔曼滤波：kf_step 收敛/噪�
 - [ ] 激光偏移已标定：触屏 `▲▼◀▶` 调绿点、满意后按 `S` 保存（或手填 `center.laser_offset_x/y`）
 - [ ] 模式切换核对：触屏 `T/C` 按钮切换追踪/画圈（串口打印 `MODE->circle (touch)`）；若用跳线：`mode_pin.enabled=true` 且上电核对 `mode pin:` 电平打印
 - [ ] 触屏调参核对：`P` 进调参页 → `项`/`+`/`-` 调整（串口打印 `tune: ...`、下一帧生效）；`S` 保存打印 `param: save OK saved 18 keys`，重启后参数保持
-- [ ] 红环阈值现场核对：切到画圈模式后应打印 `OK [ring]` 并绕环转圈；追踪模式应打印 `OK [rect]`
+- [ ] 画圈核对：开机后看串口 `CIRCLE autocalib ready: k=...`（环干净时数秒内出现；未出现则查红环检测与 `calib_frames`）；切到画圈模式后应看到橙色合成圆（`OK [geo]`）或蓝色检测圆（`OK [ring]`）并绕环画圆；退化时屏上显示 `CIRCLE: no ring/k`；追踪模式应打印 `OK [rect]`
 - [ ] 不摆靶开机 → yaw 匀速搜索；放靶 1~2 秒内停转进入追踪
 - [ ] 准备备用 SD 卡（预烧录系统+代码）
 
@@ -343,7 +346,7 @@ python tools/test_kf_filter.py       # V8 卡尔曼滤波：kf_step 收敛/噪�
 | K230 画面卡 | 增大 `debug.gc_every`，降低检测分辨率 |
 | YOLO模式报错 | 确认 kmodel 路径正确、KPU 库已安装 |
 | YOLO不出框 | ① `input_size` ② `labels` 顺序 ③ `task` 配对 ④ 是否拍到训练过的物体 |
-| 画圈不转圈（环不见了） | 属预期退化：默认回矩形追踪瞄准；开 `circle.fallback_ms` 后窗口内用记忆半径续画；查 `ring_min_diam_px/ring_max_diam_px` 与环的实际像素尺寸、红色阈值 |
+| 画圈不转圈（屏上 `CIRCLE: no ring/k`） | 环被激光自干扰（结构性）→ 走几何主轨：等 `CIRCLE autocalib ready` 或手填 `radius_ratio`（见 4.6）；可选开 `fallback_ms` 记忆兜底；查 `ring_min_diam_px/ring_max_diam_px` 与环的实际像素尺寸、红色阈值 |
 | 画圈方向反了 | `circle.direction` 取反（1/-1）|
 | 开机不搜索 | 确认 `search.enabled=true` 且开机后从未捕获过目标；已捕获过则永不搜索（设计如此）|
 | 引脚切换不生效（用跳线时）| 核对 `mode_pin.gpio/active_level`；看启动 `mode pin:` 打印与实际跳线电平；悬空电平不可信，务必接 3.3V 或 GND |
@@ -366,6 +369,7 @@ V8 对「参考代码」做了完整对标分析（`参考代码\`：STM32H723 �
 | 2 状态卡尔曼滤波（位置+速度） | robot_cmd.c VisionKalmanFilterInit | `kf_*` 键 + `kf_step` 纯函数（并用上参考中闲置的速度分量做 `kf_lead_s` 前馈），见 4.8 |
 | 画圆"几何优先、不依赖检测" | robot_cmd.c 画圆模式（60mm 几何生成） | `circle.fallback_ms` 环记忆兜底（框中心+记忆半径续画），见 4.6 |
 | 闭环驱动器读取能力 | X_V2.c 读取命令表 | `read_velocity`/`read_position`/`reset_clog` + 堵转监控，见 4.9 |
+| 执行器加速档实义（提速第一性依据） | Emm42 说明书 Rev1.3 P36 公式 | V8.6：`acc` 默认 250 + config 注释公式化 + 追踪链路对照分析见第十节 |
 
 **经论证不采纳**（防未来重复评估）：
 
@@ -378,3 +382,31 @@ V8 对「参考代码」做了完整对标分析（`参考代码\`：STM32H723 �
 | 921600 双板串口协议（0xA5+float32） | 双板架构专用；本项目 K230 单板直控，无跨板链路 |
 
 **硬件结论**：核心硬件无需新增；候选升级与理由见 `接线图.md` 第八章（读取命令表）与第九章（硬件升级建议）。
+
+## 十、追踪链路对照分析（V8.6 对标参考代码）
+
+对标对象：`参考代码\`（Jetson 视觉 + STM32H723 云台）。以下为 V8.6 的完整分析结论（软件侧优化已按此落地）。
+
+### 10.1 参考的追踪链路（三层闭环）
+
+| 层 | 机制 | 关键参数 | 出处 |
+|---|---|---|---|
+| 视觉 | 100fps 相机；透视校正到 mm 域；每帧发 `dx_mm/dy_mm/distance_mm`；4×4 闭运算修激光干扰 | 1.5px/mm | `视觉代码带注释.py` L1876/L1924/L2018 |
+| 外环 | 200Hz：KF 滤波 → PID → 输出×距离自适应增益 → **累加到角度目标** | Kp 1.5~3 / Ki 3~4 / Kd 0.05~0.07 | `robot_cmd.c` L84/L158/L200 |
+| 内环 | 1kHz：IMU 角度环+速度环（另有速度/电流前馈） | GM6020/DM 无刷直驱 | `gimbal.c` L74/L116 |
+| 画圆 | **几何生成** 60mm 圆周目标点，PID 跟踪「误差↔圆周点」偏移（零检测） | radius=60mm | `robot_cmd.c` L191/L670 |
+
+参考"快"的本质：**高频闭环（外 200Hz + 内 1kHz）+ 前馈**，指令到执行延迟 ~10-20ms；执行器为无刷直驱，不受步进转速斜坡限制。
+
+### 10.2 本项目差距 → V8.6 对策
+
+| 因子 | 参考 | 本项目（V8.6 前 → 后） | 对策 |
+|---|---|---|---|
+| **命令建立时间** | 电流前馈瞬时 | acc=200：每+1RPM 2.8ms（0→60RPM 需 168ms、换向±60 需 336ms）→ acc=250：0.3ms/RPM（0→90RPM 仅 27ms） | 默认 acc=250 |
+| 速度上限 / 满速阈值 | 数千 RPM | 60/30RPM、200px → **90/45RPM、150px** | 参数包 |
+| 控制频率 | 外200Hz+内1kHz | 单环 ~45fps | 结构差异（不换架构），用 acc/上限补偿 |
+| 前馈 / 积分 | 速度+电流前馈；Ki 3~4 | `kf_lead_s` / PID 默认关 | 现场可选开启（见 4.8 / 4.3） |
+
+### 10.3 Emm42 加减速公式（说明书 Rev1.3 P36 原文）
+
+`t2 - t1 = (256 - acc) × 50μs`（每 +1RPM 的用时）；**acc=0 为特殊值：不使用曲线加减速，直接按设定速度运行**。常用对照：200≈2.8ms/RPM；240≈0.8；250≈0.3；255≈0.05。这是本次「追踪提速」的第一性依据（含换向：±60RPM 差速在 acc=250 下约 18ms 完成）。

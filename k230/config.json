@@ -158,8 +158,8 @@
     "enable_on_boot": true,
     "_enable_on_boot": "上电发使能帧(F3)。若驱动器没被使能, 收到速度指令也不会转",
 
-    "acc": 200,
-    "_acc": "加减速档位 0~255, 越大加速越快(0≈最慢, 255≈最急)。追得发飘/滞后就调大; 起步顿挫就调小",
+    "acc": 250,
+    "_acc": "加减速档位 0~255。每 +1RPM 用时 (256-acc)×50μs(越大越快): 0=无曲线直接跳变(极限); 200≈2.8ms/RPM(0→60 需168ms); 250≈0.3ms/RPM(推荐); 255≈0.05ms/RPM。追得发飘就调小, 起步/换向慢就调大",
 
     "pid_enabled": false,
     "_pid_enabled": "V7.9: true=启用 PID 速度控制(触屏调参页可实时开关); false=原「|dx| 线性映射」(默认, 行为不变)",
@@ -189,10 +189,10 @@
     "_clog_reset_on_boot": "V8: true=上电发送清堵转命令(0x0E52, 驱动器撞限位/卡死后恢复); 默认 false",
 
     "min_rpm": 5,
-    "max_rpm": 60,
+    "max_rpm": 90,
     "_rpm": "转速区间(RPM)。|dx|≤deadband_px → 停转; 之后从 min_rpm 线性升到 max_rpm; |dx|≥dx_full_px 时达 max_rpm。整体想更快就调大这两个; min_rpm 太小会『哼着不转』(步进低速扭矩小)",
 
-    "dx_full_px": 200,
+    "dx_full_px": 150,
     "_dx_full_px": "|dx| 达到此像素值时给到 max_rpm。调小=小偏差就满速(更凶), 调大=转速爬升更平缓",
 
     "deadband_px": 5,
@@ -235,8 +235,8 @@
     "enable_on_boot": true,
     "_enable_on_boot": "上电发使能帧(F3)。若驱动器没被使能, 收到速度指令也不会转",
 
-    "acc": 200,
-    "_acc": "加减速档位 0~255, 越大加速越快(0≈最慢, 255≈最急)。追得发飘/滞后就调大; 起步顿挫就调小",
+    "acc": 250,
+    "_acc": "加减速档位 0~255。每 +1RPM 用时 (256-acc)×50μs(越大越快): 0=无曲线直接跳变(极限); 200≈2.8ms/RPM(0→60 需168ms); 250≈0.3ms/RPM(推荐); 255≈0.05ms/RPM。追得发飘就调小, 起步/换向慢就调大",
 
     "pid_enabled": false,
     "_pid_enabled": "V7.9: true=启用 PID 速度控制(触屏调参页可实时开关); false=原「|dy| 线性映射」(默认, 行为不变)",
@@ -266,10 +266,10 @@
     "_clog_reset_on_boot": "V8: true=上电发送清堵转命令(0x0E52, 驱动器撞限位/卡死后恢复); 默认 false",
 
     "min_rpm": 3,
-    "max_rpm": 30,
+    "max_rpm": 45,
     "_rpm": "转速区间(RPM)。|dy|≤deadband_px → 停转; 之后从 min_rpm 线性升到 max_rpm; |dy|≥dy_full_px 时达 max_rpm。整体想更快就调大这两个; min_rpm 太小会『哼着不转』(步进低速扭矩小)",
 
-    "dy_full_px": 200,
+    "dy_full_px": 150,
     "_dy_full_px": "|dy| 达到此像素值时给到 max_rpm。调小=小偏差就满速(更凶), 调大=转速爬升更平缓",
 
     "deadband_px": 5,
