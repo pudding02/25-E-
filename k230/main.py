@@ -239,6 +239,7 @@ _pid_pit_t = 0
 
 # ---- V7 红色目标(红环)检测 ----
 rt = _get(CFG, "red_target", {})
+RED_EN = rt.get("enabled", True)     # V8.5: 红环检测总开关; false=完全跳过(画圈需几何主轨)
 RED_LOW  = tuple(rt.get("red_low", [130, 0, 0]))
 RED_HIGH = tuple(rt.get("red_high", [255, 120, 120]))
 RING_MIN_DIAM = rt.get("ring_min_diam_px", 40)
@@ -278,6 +279,8 @@ CIRC_SPEED = cc.get("speed_deg_s", 60)
 CIRC_DIR = cc.get("direction", 1)
 CIRC_PAUSE = cc.get("pause_px", 120)
 CIRC_FALLBACK_MS = cc.get("fallback_ms", 0)   # V8: 环丢失后继续画圆的记忆窗口(ms); 0=关(原行为)
+CIRC_RATIO = cc.get("radius_ratio", 0)        # V8.5: 环半径/√框面积 比例; >0=几何主轨(免检测干扰)
+CIRC_CALIB_FRAMES = cc.get("calib_frames", 0) # V8.5: 自动标定采集帧数(取中位数); 0=关
 
 # ---- V7 模式引脚(GPIO49: 被供电=画圈) ----
 mp = _get(CFG, "mode_pin", {})
@@ -771,6 +774,28 @@ def ring_memory_step(mem, now_ms, ring, box_center, fallback_ms):
         if time.ticks_diff(now_ms, mem[3]) <= fallback_ms:
             return (box_center[0], box_center[1], mem[2]), mem
     return None, mem
+
+def quad_area(quad):
+    """四边形面积(纯函数, shoelace; quad=order_points 排序的 4 个整数顶点)。
+
+    V8.5 几何主轨用 √面积 作框特征尺寸(距离/透视变化的等比缩放基准)。
+    """
+    s = 0
+    x0, y0 = quad[3]
+    for x, y in quad:
+        s += x0 * y - x * y0
+        x0, y0 = x, y
+    return abs(s) // 2
+
+def median_of(samples):
+    """中位数(纯函数): 空表返 0.0; 偶数取中间两值均值 —— V8.5 标定抗离群用"""
+    n = len(samples)
+    if n == 0:
+        return 0.0
+    s = sorted(samples)
+    if n & 1:
+        return float(s[n // 2])
+    return (s[n // 2 - 1] + s[n // 2]) / 2.0
 
 def search_step(now_ms, searching, start_ms, enabled, acquired, max_ms):
     """上电搜索状态机(纯函数)。返回 (mode, searching, start_ms):
@@ -1852,6 +1877,9 @@ def run_cv():
     _calib_skip = False              # 切页后吞掉同一次按压的残留动作(防跨页串按)
     _mon_tick_y = time.ticks_ms()    # V8: yaw 堵转监控计时(monitor_ms>0 时用)
     _mon_tick_p = time.ticks_ms()    # V8: pitch 堵转监控计时
+    _calib_buf = []                  # V8.5: 标定样本(环半径/√框面积)
+    _calib_k = 0.0                   # V8.5: 标定出的几何比例(本次运行生效)
+    _calib_done = False              # V8.5: 标定是否已完成
     fps = fps_count = 0
     fps_tick = time.ticks_ms()
 
@@ -2002,7 +2030,17 @@ def run_cv():
             # ---- 检测(每检测帧): 矩形 + 红色 联合 ----------------
             if frame_id % DETECT_EVERY == 0 or not last_box:
                 box, contour_count, area_count = find_paper_box(frame_np, last_box)
-                ring = find_red_ring(frame_np, box)
+                ring = find_red_ring(frame_np, box) if RED_EN else None   # V8.5: 可整体关断
+                # ---- V8.5 标定采集: 有效环帧的 k=r/√框面积, 满 N 取中位数(抗激光干扰离群) ----
+                if CIRC_CALIB_FRAMES > 0 and not _calib_done and ring is not None and box is not None:
+                    _fa = quad_area(box)
+                    if _fa > 0:
+                        _calib_buf.append(ring[2] / math.sqrt(_fa))
+                        if len(_calib_buf) >= CIRC_CALIB_FRAMES:
+                            _calib_done = True
+                            _calib_k = median_of(_calib_buf)
+                            print("CIRCLE calib: ratio=%.4f (n=%d) 已实时生效 — 建议写入 config [circle].radius_ratio"
+                                  % (_calib_k, CIRC_CALIB_FRAMES))
             else:
                 box, ring = last_box, last_ring
 
@@ -2013,8 +2051,15 @@ def run_cv():
             kind, tx, ty = "none", 0, 0
             if _circle_on:
                 _bctr = quad_center(box) if box is not None else None
-                _ring_use, _ring_mem = ring_memory_step(_ring_mem, now2, ring, _bctr,
-                                                        CIRC_FALLBACK_MS)
+                _kuse = CIRC_RATIO if CIRC_RATIO > 0 else _calib_k   # 配置优先, 标定值次之
+                if _kuse > 0 and _bctr is not None:
+                    # V8.5 几何主轨: 同心先验(心=框中心) + 比例半径 —— 不消费红环检测(免激光干扰)
+                    _ring_use = (_bctr[0], _bctr[1], int(_kuse * math.sqrt(quad_area(box))))
+                    _geo_on = True
+                else:
+                    _ring_use, _ring_mem = ring_memory_step(_ring_mem, now2, ring, _bctr,
+                                                            CIRC_FALLBACK_MS)
+                    _geo_on = False
                 if _ring_use is not None:
                     rcx, rcy, rr = _ring_use
                     if box is not None:
@@ -2023,8 +2068,8 @@ def run_cv():
                         _theta = math.degrees(math.atan2(CENTER_Y - rcy, CENTER_X - rcx)) % 360.0
                     _theta = circle_theta_step(_theta, CIRC_SPEED, dtm, CIRC_DIR, last_dist, CIRC_PAUSE)
                     tx, ty = circle_target_point(rcx, rcy, rr + RADIUS_BIAS, _theta)
-                    kind = "ring"
-                    if ring is None and frame_id % PRINT_EVERY == 0:
+                    kind = "geo" if _geo_on else "ring"    # V8.5: 串口/OSD 区分两条路径(仅显示)
+                    if (not _geo_on) and ring is None and frame_id % PRINT_EVERY == 0:
                         print("CIRCLE fallback (mem r=%d)" % rr)   # 环丢失, 记忆兜底中
             if kind == "none" and box is not None:
                 rcx, rcy, _dcx, _dcy = draw_box(frame_np, box)   # 画框 + 矩形中心

@@ -32,7 +32,7 @@ _MAIN_PY = os.path.normpath(os.path.join(_THIS_DIR, "..", "k230", "main.py"))
 _FUNC_NAMES = (
     "point_in_quad", "classify_blob",
     "circle_target_point", "circle_theta_step", "search_step", "mode_pin_step",
-    "ring_memory_step",
+    "ring_memory_step", "quad_area", "median_of",
 )
 
 # classify_blob 引用的模块级阈值常量 —— 必须由 main.py 定义; 本测试**不注入**其取值,
@@ -308,6 +308,76 @@ class TestRingMemory(unittest.TestCase):
         mem = [100, 80, 30, 5000]
         use, _ = F("ring_memory_step")(mem, 5100, None, None, 800)
         self.assertIsNone(use)                    # 框也丢了 → 退原行为
+
+
+class TestQuadArea(unittest.TestCase):
+    """quad_area: 四边形面积(shoelace; V8.5 几何主轨的框特征尺寸 = √面积 的来源)"""
+
+    def test_square(self):
+        self.assertEqual(F("quad_area")([(0, 0), (4, 0), (4, 4), (0, 4)]), 16)
+
+    def test_rectangle(self):
+        self.assertEqual(F("quad_area")([(0, 0), (8, 0), (8, 4), (0, 4)]), 32)
+
+    def test_tilted_diamond(self):
+        # 对角线 10×10 → 面积 50
+        self.assertEqual(F("quad_area")([(5, 0), (10, 5), (5, 10), (0, 5)]), 50)
+
+    def test_vertex_rotation_invariant(self):
+        # 顶点顺序轮转不改变面积
+        self.assertEqual(F("quad_area")([(4, 0), (4, 4), (0, 4), (0, 0)]), 16)
+
+    def test_degenerate_collinear(self):
+        self.assertEqual(F("quad_area")([(0, 0), (1, 1), (2, 2), (3, 3)]), 0)
+
+
+class TestMedianOf(unittest.TestCase):
+    """median_of: 标定样本中位数(抗离群)"""
+
+    def test_empty(self):
+        self.assertEqual(F("median_of")([]), 0.0)
+
+    def test_single(self):
+        self.assertEqual(F("median_of")([3.5]), 3.5)
+
+    def test_odd(self):
+        self.assertEqual(F("median_of")([3, 1, 2]), 2)
+
+    def test_even_averages_middle(self):
+        self.assertEqual(F("median_of")([1, 2, 3, 4]), 2.5)
+
+    def test_unsorted_float(self):
+        self.assertEqual(F("median_of")([5.0, 0.5, 2.0]), 2.0)
+
+    def test_outlier_robust(self):
+        # 单离群值不拉偏中位数(标定抗激光干扰的核心理由)
+        self.assertEqual(F("median_of")([0.4, 0.41, 0.39, 0.40, 9.9]), 0.40)
+
+
+class TestGeoMainGuards(unittest.TestCase):
+    """V8.5 静态守门: main.py 定义几何主轨参数/接线; config 默认关断(行为不变锚点)"""
+
+    def _src(self):
+        with open(_MAIN_PY, encoding="utf-8") as f:
+            return f.read()
+
+    def test_geo_wired_in_main(self):
+        src = self._src()
+        for name in ("CIRC_RATIO", "CIRC_CALIB_FRAMES", "RED_EN",
+                     "quad_area(", "median_of("):
+            self.assertIn(name, src, "main.py 缺少 V8.5 接线: %s" % name)
+
+    def test_default_off_in_config(self):
+        import json
+        cfg_path = os.path.normpath(os.path.join(_THIS_DIR, "..", "k230", "config.json"))
+        with open(cfg_path, encoding="utf-8") as f:
+            cfg = json.load(f)
+        self.assertEqual(cfg["circle"].get("radius_ratio", -1), 0,
+                         "circle.radius_ratio 默认必须为 0(现状行为)")
+        self.assertEqual(cfg["circle"].get("calib_frames", -1), 0,
+                         "circle.calib_frames 默认必须为 0(不打扰运行)")
+        self.assertTrue(cfg["red_target"].get("enabled", False),
+                        "red_target.enabled 默认必须为 true(红环检测保持原行为)")
 
 
 class TestModuleThresholdConstants(unittest.TestCase):
