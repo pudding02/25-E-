@@ -111,11 +111,11 @@ cp model.kmodel /sdcard/model/
 | `center_calib` | **触屏校准 + 调参页**：校准页按钮移动绿色校准点（=追踪收敛点，即 `center.laser_offset`）、`T/C` 追踪/画圈切换、`●` 隐藏、`S` 保存写回；`P` 进调参页（`Y/P` 切轴、`项` 选参数、`+`/`-` 实时调、`S` 写回，见 4.3）|
 | `rectangle` | CV 矩形检测阈值（现场光照变化主要调这里）|
 | `yolo` | KPU 模型路径 / labels / input_size（见第四节规则）|
-| `motor` | **yaw 轴**：Emm42 速度模式（RPM 区间 / 死区 / 方向 / 使能）；V7.9 PID 参数 `pid_enabled` / `pid_kp` / `pid_ki` / `pid_kd`（见 4.3）|
+| `motor` | **yaw 轴**：Emm42 速度模式（RPM 区间 / 死区 / 方向 / 使能）；V7.9 PID 参数 `pid_enabled` / `pid_kp` / `pid_ki` / `pid_kd`（见 4.3）；V8 卡尔曼滤波 `kf_*`（见 4.8）与堵转监控 `monitor_ms`（见 4.9）|
 | `pitch_motor` | **pitch 轴**：Emm42 速度模式（与 yaw 同构：min_rpm/max_rpm/dy_full_px/死区/方向）；同含 `pid_*` 键 |
 | `red_target` | **红环检测**（与矩形检测同帧联合进行，画圈模式用）：红色掩膜/环直径/空心验证阈值、ROI 外扩、半径修正 |
 | `search` | **上电搜索**：未捕获目标时 yaw 单方向匀速旋转找靶（enabled/rpm/direction/max_ms）|
-| `circle` | **画圈运动**：沿红环匀速转圈的角速度/方向/误差门控（speed_deg_s/direction/pause_px）|
+| `circle` | **画圈运动**：沿红环匀速转圈的角速度/方向/误差门控（speed_deg_s/direction/pause_px）；V8 环丢失记忆兜底 `fallback_ms`（见 4.6）|
 | `mode_pin` | **画圈模式引脚**（GPIO49/Pin3，可选备用，默认关闭）：被供电=画圈；默认由触屏 `T/C` 切换（引脚开启时以引脚为准）|
 | `debug` | 打印与 GC 节奏 |
 
@@ -209,7 +209,7 @@ cp model.kmodel /sdcard/model/
 ### 4.6 画圈模式（触屏 T/C 切换；引脚可选）
 
 - 画圈模式下红环可见 → 光斑沿红环**连续匀速画圆**（`circle.speed_deg_s` 角速度、`direction` 方向；光斑离目标点超过 `pause_px` 时暂停 θ 推进等伺服追上）。
-- 红环暂不可见 → 保持矩形追踪瞄准、**θ 冻结**（不乱转不丢靶），环恢复即续圈。
+- 红环暂不可见 → 默认退为矩形追踪瞄准（环恢复即续圈）；开启 `circle.fallback_ms`（推荐 800）后，环刚丢的一段时间内用**记忆半径 + 矩形中心**继续画圈（串口打印 `CIRCLE fallback`），窗口过后才退矩形追踪。
 - **切换方式（默认）**：触屏顶中 `T/C` 按钮点击切换（追踪⇄画圈），串口打印 `MODE->.. (touch)`。
 - **切换方式（可选备用）**：`config.json` 的 `mode_pin.enabled=true` 时改用 GPIO49 跳线：**三脚跳线**（中间=GPIO49/Pin3，两侧=3.3V/Pin1 与 GND）：拨 3.3V=画圈、拨 GND=仅追踪；**悬空不可信**（I2C0 引脚板载上拉情况以实测为准）。此时触屏 `T/C` **故意失效**（以引脚为准），上电串口打印 `mode pin: GPIO49 level=..` 供核对。
 
@@ -218,6 +218,24 @@ cp model.kmodel /sdcard/model/
 - 开机后**未捕获过任何目标**时，yaw 按 `search.rpm` 单方向匀速旋转找靶；捕获目标（矩形或红环）即停并转入追踪。
 - 一旦捕获过目标（发出过 track），搜索**永久退出**——后续丢靶行为与原来一致（coast/停），不会被搜索干扰。
 - `search.max_ms=0` 表示一直找到为止；>0 为搜索上限（超时停转，不再重启）。
+
+### 4.8 卡尔曼滤波（V8，可选；默认关）
+
+对视觉误差做 2 状态（位置+速度）卡尔曼滤波——移植参考云台（robot_cmd.c VisionKalmanFilterInit）的设计：
+
+- **开启**：对应轴 `kf_enabled=true`（默认 false=原样直通，行为不变）。开启后误差更平滑（检测抖动小）；`kf_lead_s>0` 时用速度估计做**提前量前馈**（补偿检测+显示帧延迟；动态目标拖尾明显时试 0.05~0.1，0=关）。
+- **参数**（每轴一组）：`kf_q_pos`/`kf_q_vel` 过程噪声（调大=跟得快、平滑弱）、`kf_r` 观测噪声（调大=更平滑、更滞后）、`kf_err_limit` 输出限幅(px)。
+- **状态清理与 PID 同步**：丢靶/搜索/死区停转时一并清空（防恢复追踪时速度状态突跳）。
+- **与 PID 正交**：KF 只作用在"误差输入"，PID/线性映射的选择照旧；建议先单独开 KF 观察平滑收益，再决定要不要叠 PID。
+
+### 4.9 堵转监控与读取命令（V8，可选；默认关）
+
+挖掘 Emm42 的读取类命令（命令码来自张大头官方例程读取命令表；帧式与读电压 0x24 同构）：
+
+- **boot 探测增强**：`actuator:` 行在电压后追加 `rpm=N`（读一次实时转速 0x35，上电应接近 0）——同时验证读取链路是否通。
+- **堵转监控**：`monitor_ms>0`（建议 2000）后，主循环每 N ms 读一次实测转速；「有速度命令但实测≈0」打印 `WARN: possible stall`（**仅告警，不影响控制**）。
+- **清堵转**：驱动器因撞限位/卡死触发堵转保护后，`clog_reset_on_boot=true` 可上电自动发清堵转命令（0x0E52）恢复。
+- **首次上机核对**：读取类响应字节段为**预期格式**（0x35 预期 6B / 0x36 预期 8B，位置语义待核）；先 `raw_probe(0x35)` / `raw_probe(0x36)` 捕获实测核对，再把样本补进测试固化。无应答/校验错返回 None，不阻塞主循环。
 
 ## 五、激光标定
 
@@ -270,15 +288,16 @@ python tools/calibrate_laser.py
 ## 六、主机侧自检（不接硬件）
 
 ```bash
-python tools/test_emm_protocol.py    # 协议帧对拍（12 用例）
+python tools/test_emm_protocol.py    # 协议帧对拍 + V8 读取命令/清堵转帧（24 用例）
 python tools/test_coast_logic.py     # 丢靶预判状态机（10 用例）
-python tools/test_circle_logic.py    # V7 纯函数：红环分流/画圈几何/搜索/引脚去抖（29 用例）
+python tools/test_circle_logic.py    # V7 纯函数 + V8 环记忆兜底：红环分流/画圈几何/搜索/引脚去抖/记忆兜底（36 用例）
 python tools/test_camera_init.py     # 采集初始化守门：CSI id / 720 提示 / crop 兜底 / config 几何链 / 死显示路径（11 用例）
-python tools/test_center_calib.py    # V7.7 触屏校准：按钮命中/触摸状态机/config 文本替换/8 键布局（33 用例）
-python tools/test_pid_tune.py        # V7.9 PID+触屏调参：pid_step/参数步进/段内键保存/调参状态机（48 用例）
+python tools/test_center_calib.py    # V7.7 触屏校准：按钮命中/触摸状态机/config 文本替换/8 键布局（37 用例）
+python tools/test_pid_tune.py        # V7.9 PID+触屏调参：pid_step/参数步进/段内键保存/调参状态机（52 用例）
+python tools/test_kf_filter.py       # V8 卡尔曼滤波：kf_step 收敛/噪声抑制/lead/限幅/reset + 接线守卫（18 用例）
 ```
 
-六套均为 stdlib 独立脚本，从 `k230/main.py` AST 提取目标函数/常量后断言（不需要硬件、不需要 pytest）。
+七套均为 stdlib 独立脚本，从 `k230/main.py` AST 提取目标函数/常量后断言（不需要硬件、不需要 pytest），合计 188 用例。
 改动协议层先跑第一套；改动视觉/控制/配置面先跑其余几套；再上机。
 （`test_circle_logic.py` 的阈值常量直接取 main.py 定义，若 main.py 漏定义会直接报错。）
 
@@ -315,11 +334,11 @@ python tools/test_pid_tune.py        # V7.9 PID+触屏调参：pid_step/参数�
 | 某轴电机不动 | 先看 `actuator:` 行是否 `online`；`(no resp)` → 按 `接线图.md` 第六节排障（共地/交叉/预置/回环）|
 | 云台乱转/抖动 | 调死区 / 降低 K 参数 / 检查方向位（`reverse`）|
 | pitch 电机不动/动作不对 | 与 yaw 同排查路径（接线图第六节）；确认 `[pitch_motor]` 参数与 `[motor]` 同构 |
-| 电机被"卡住"后拒绝指令 | 堵转保护触发 → 检查机械卡阻，用上位机/命令解除堵转保护（0x0E 52）|
+| 电机被"卡住"后拒绝指令 | 堵转保护触发 → 检查机械卡阻，用上位机/命令解除堵转保护（0x0E 52）；或开 `clog_reset_on_boot=true` 上电自动恢复 |
 | K230 画面卡 | 增大 `debug.gc_every`，降低检测分辨率 |
 | YOLO模式报错 | 确认 kmodel 路径正确、KPU 库已安装 |
 | YOLO不出框 | ① `input_size` ② `labels` 顺序 ③ `task` 配对 ④ 是否拍到训练过的物体 |
-| 画圈不转圈（环不见了） | 属预期退化：θ 冻结保持矩形追踪瞄准；查 `ring_min_diam_px/ring_max_diam_px` 与环的实际像素尺寸、红色阈值 |
+| 画圈不转圈（环不见了） | 属预期退化：默认回矩形追踪瞄准；开 `circle.fallback_ms` 后窗口内用记忆半径续画；查 `ring_min_diam_px/ring_max_diam_px` 与环的实际像素尺寸、红色阈值 |
 | 画圈方向反了 | `circle.direction` 取反（1/-1）|
 | 开机不搜索 | 确认 `search.enabled=true` 且开机后从未捕获过目标；已捕获过则永不搜索（设计如此）|
 | 引脚切换不生效（用跳线时）| 核对 `mode_pin.gpio/active_level`；看启动 `mode pin:` 打印与实际跳线电平；悬空电平不可信，务必接 3.3V 或 GND |
@@ -330,3 +349,27 @@ python tools/test_pid_tune.py        # V7.9 PID+触屏调参：pid_step/参数�
 | UART报 tx not configured | 检查 config 中 `tx_pin`/`rx_pin` 与 FPIOA 映射 |
 
 > 串口类问题的完整排障顺序（OLED 状态 → 共地 → 回环测试 → 引脚实测）见 `接线图.md` 第六节。
+
+## 九、参考代码吸收纪要（V8）
+
+V8 对「参考代码」做了完整对标分析（`参考代码\`：STM32H723 电赛云台 + Jetson 视觉；`官方代码\`：K230 霍夫圆例程），吸收情况如下：
+
+**已吸收**：
+
+| 借鉴项 | 参考出处 | 本项目落地 |
+|---|---|---|
+| 2 状态卡尔曼滤波（位置+速度） | robot_cmd.c VisionKalmanFilterInit | `kf_*` 键 + `kf_step` 纯函数（并用上参考中闲置的速度分量做 `kf_lead_s` 前馈），见 4.8 |
+| 画圆"几何优先、不依赖检测" | robot_cmd.c 画圆模式（60mm 几何生成） | `circle.fallback_ms` 环记忆兜底（框中心+记忆半径续画），见 4.6 |
+| 闭环驱动器读取能力 | X_V2.c 读取命令表 | `read_velocity`/`read_position`/`reset_clog` + 堵转监控，见 4.9 |
+
+**经论证不采纳**（防未来重复评估）：
+
+| 候选 | 不采纳理由 |
+|---|---|
+| 透视校正（warpPerspective 全套） | 本项目的四边形对角线交点求中心已透视正确；K230 上额外算力换不来精度提升 |
+| 距离自适应增益（1/D 映射） | 推导：`θ ≈ (dx_px / px_per_mm) / D` 且 `px_per_mm ∝ 1/D` → 像素误差→角度的增益天然与距离无关；仅在 mm 域工作才需要该补偿 |
+| 双框嵌套检测（面积比 ≥0.7） | 当前靶面为「白心+黑边单框+红环」结构，双框策略无对应形态（若换靶纸再评估） |
+| 30×30 闭运算修"激光打断黑边" | 大核形态学在 K230 上成本高；现有黑边验证已容忍单边断裂；现场出现实际丢检再以小核定实现 |
+| 921600 双板串口协议（0xA5+float32） | 双板架构专用；本项目 K230 单板直控，无跨板链路 |
+
+**硬件结论**：核心硬件无需新增；候选升级与理由见 `接线图.md` 第八章（读取命令表）与第九章（硬件升级建议）。

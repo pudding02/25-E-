@@ -19,6 +19,11 @@ K230 物体追踪 — 双轴云台 (双步进)
                    丢靶预判: 目标从左右两侧丢失后, 朝最后方向续追一小段时间(可关, 见 coast_step)
     上下轴(pitch): 按 dy 做「速度」控制 —— |dy| 越大转速越快; 死区内停转(V7.9 同上可切 PID); 丢靶停转
 
+  V8 可选增强(均默认关, 见 config.json 对应键):
+    卡尔曼滤波(kf_*)            误差平滑 + 速度前馈(移植参考云台 2 状态 KF);
+    画圈环记忆兜底(fallback_ms)  环丢失后短窗内用「记忆半径+框中心」继续画圆;
+    堵转监控(monitor_ms)/清堵转(clog_reset_on_boot)  依赖 Emm42 读取命令(0x35/0x0E52)
+
   dx = 目标中心x - 屏幕中心x   (右偏为正)
   dy = 目标中心y - 屏幕中心y   (下偏为正)
 
@@ -48,6 +53,7 @@ K230 物体追踪 — 双轴云台 (双步进)
    二  运行参数          把配置铺平成模块级常量
    三  Emm 步进驱动      EmmStepper (速度模式 + 位置模式)          → yaw / pitch
    三点五 PID 速度控制   pid_step/pid_speed —— 误差→转速(可选切 PID, Kp/Ki/Kd 触屏可调)
+   三点五·五 KF 误差滤波  kf_step/_kf_clear —— 2 状态卡尔曼(可选, 速度前馈)
    四  执行器初始化      gimbal_send(dx,dy,dist,status) —— 视觉与执行器之间的唯一接口
    五  CV 矩形检测       find_paper_box() 等
    六  YOLO 支持         _yolo_ok()
@@ -58,6 +64,7 @@ K230 物体追踪 — 双轴云台 (双步进)
 
   所有可调参数都在 config.json 内并附注释; 本文件不含硬编码阈值, 改完重启生效。
   V7.9: PID 开关/Kp/Ki/Kd 与两轴速度/死区/加速等参数可在触屏调参页实时调整, S 键写回 config。
+  V8: 卡尔曼滤波 / 画圈环记忆兜底 / 堵转监控均为可选增强(默认关), 键位与说明见 config.json。
 """
 
 import time, os, gc, math

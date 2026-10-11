@@ -30,6 +30,19 @@ Drone-competition rectangle-target tracking system (电赛E题). A K230-CanMV bo
   are live-tunable on the touch **param page** (`P`: `Y/P` axis, item cycling, `+/-` hold-repeat,
   `S` writes the 18 keys back to config.json text-level with `.bak` + read-back verify). Changes
   apply on the next frame; coast/search keep the original map.
+- **V8 — Kalman filter (default off)** — per-axis 2-state (position+velocity) KF smooths the
+  vision error, ported from the reference gimbal's `VisionKalmanFilterInit`; `kf_lead_s>0` uses
+  the (previously unused) velocity state as a look-ahead feed-forward against frame latency.
+  Keys `kf_*` in `[motor]`/`[pitch_motor]`; KF state cleared together with PID state on
+  deadband/lost/search frames.
+- **V8 — circle memory fallback (default off)** — `circle.fallback_ms>0` keeps drawing for a
+  short window after the ring is lost, using the remembered radius + box center
+  (`ring_memory_step`, prints `CIRCLE fallback`); then falls back to the original behavior.
+- **V8 — Emm42 read commands & stall monitor (default off)** — `read_velocity`(0x35) /
+  `read_position`(0x36) / `reset_clog`(0x0E 0x52); boot probe appends `rpm=N` to the `actuator:`
+  line; `monitor_ms>0` prints a stall WARN (warn only, control unaffected); `clog_reset_on_boot`
+  optional auto-recovery. **Response byte layouts are expected-only — verify on hardware via
+  `raw_probe(0x35)/raw_probe(0x36)` before trusting the parsed values.**
 
 (The original MaixCam + STM32F407 relay architecture is retired — there is no `stm32/` directory and no `fs_servo.py`; all code is single-file in `k230/main.py`.)
 
@@ -103,6 +116,9 @@ fdx, fdy = kf_update(dx, dy)  # works identically whether Kalman is on or off
   `pid_kd`); these plus the motion params (`min_rpm` / `max_rpm` / `dx_full_px`|`dy_full_px` /
   `deadband_px` / `acc`) are live-tunable from the touch param page (`P`) and written back by its
   `S` button (text-level replace, all-or-nothing, `.bak` + read-back verify).
+  V8 additions: `kf_*` (Kalman, default off) and `monitor_ms` / `clog_reset_on_boot`
+  (Emm42 read-based stall monitor, default off) in `[motor]`/`[pitch_motor]`;
+  `[circle].fallback_ms` (ring-memory fallback, default 0 = off).
 - The config loader strips keys starting with `_`, so comments can be embedded as `"_说明": "..."`.
 - Values are read at import time into module-level globals; restart `main.py` after edits.
 
@@ -122,14 +138,15 @@ fdx, fdy = kf_update(dx, dy)  # works identically whether Kalman is on or off
 
 ## Testing
 
-- **Host-side (no hardware)**: six stdlib-only scripts, all static-check `k230/main.py`
+- **Host-side (no hardware)**: seven stdlib-only scripts, all static-check `k230/main.py`
   (some also read `k230/config.json`):
-  - `python tools/test_emm_protocol.py` — frame bytes vs manual examples (12 cases). Always run
-    after touching protocol code.
+  - `python tools/test_emm_protocol.py` — frame bytes vs manual examples + V8 read-command /
+    clog-reset frames & reply parsing (24 cases). Always run after touching protocol code.
   - `python tools/test_coast_logic.py` — coast (lost-target pre-judgment) state machine (10 cases).
-  - `python tools/test_circle_logic.py` — V7 pure functions (29 cases): quad containment, ring
-    blob classify, circle geometry, search & pin-debounce machines. Threshold constants are
-    extracted from main.py itself — a missing definition is a hard error.
+  - `python tools/test_circle_logic.py` — V7 pure functions + V8 ring-memory fallback (36 cases):
+    quad containment, ring blob classify, circle geometry, search & pin-debounce machines,
+    ring_memory_step. Threshold constants are extracted from main.py itself — a missing
+    definition is a hard error.
   - `python tools/test_camera_init.py` — capture guard: explicit `id=CSI_ID`, 1280×720
     probe + `crop=True`, `CSI_ID` defined; config chain: `csi_id=2`, 16:9 output, offsets;
     dead-display-path guard (`cv2.resize` / `draw_image` / `image.Image` / `bind_layer` /
@@ -142,6 +159,9 @@ fdx, fdy = kf_update(dx, dy)  # works identically whether Kalman is on or off
     section-scoped config text save (motor vs pitch_motor isolation, real-config roundtrip),
     tuning state machine (plus/minus repeat + same-button debounce), static guards (tune vars
     defined; gimbal_send wired to pid_step).
+  - `python tools/test_kf_filter.py` — V8 Kalman filter (18 cases): kf_step convergence / noise
+    suppression / step response / dt guards / lead feed-forward / clamping / reset, plus static
+    guards (KF vars defined; gimbal_send wired to kf_step; kf_enabled defaults false).
 - **Hardware**: `motor.test_mode` / `pitch_motor.test_mode` in config.json perform power-on
   self-checks (online probe + continuous rotation) without running vision. `main.py` also
   self-reports at boot: the `actuator:` line (both axes + online voltage).
