@@ -32,6 +32,7 @@ _MAIN_PY = os.path.normpath(os.path.join(_THIS_DIR, "..", "k230", "main.py"))
 _FUNC_NAMES = (
     "point_in_quad", "classify_blob",
     "circle_target_point", "circle_theta_step", "search_step", "mode_pin_step",
+    "ring_memory_step",
 )
 
 # classify_blob 引用的模块级阈值常量 —— 必须由 main.py 定义; 本测试**不注入**其取值,
@@ -261,6 +262,52 @@ class TestModePinStep(unittest.TestCase):
 
     def test_stable_keeps_value(self):
         self.assertEqual(F("mode_pin_step")(True, 0, True, 3), (True, 0))
+
+
+class TestRingMemory(unittest.TestCase):
+    """ring_memory_step: 画圈环记忆兜底(参考代码"几何优先"思想的混合落地)。
+
+    规则: 环可见 → 直通并刷新记忆; 环丢失但 fallback_ms 窗口内且框中心可用
+    → 用 (框中心, 记忆半径) 继续画圈; 过期/无历史/关断 → None(调用方退原行为)。
+    """
+
+    def test_ring_visible_refreshes_memory(self):
+        ring = (100, 80, 30)
+        use, mem = F("ring_memory_step")([0, 0, 0, 0], 5000, ring, (90, 70), 800)
+        self.assertEqual(use, ring)
+        self.assertEqual(mem, [100, 80, 30, 5000])
+
+    def test_fallback_within_window(self):
+        mem = [100, 80, 30, 5000]
+        use, new_mem = F("ring_memory_step")(mem, 5300, None, (90, 70), 800)
+        self.assertEqual(use, (90, 70, 30))       # 框中心 + 记忆半径
+        self.assertEqual(new_mem, mem)            # 兜底不改写记忆(时间戳保持)
+        self.assertEqual(new_mem[3], 5000)
+
+    def test_fallback_at_window_boundary(self):
+        mem = [100, 80, 30, 5000]
+        use, _ = F("ring_memory_step")(mem, 5800, None, (90, 70), 800)
+        self.assertEqual(use, (90, 70, 30))       # 恰在窗口边界(<=)仍有效
+
+    def test_fallback_expired(self):
+        mem = [100, 80, 30, 5000]
+        use, new_mem = F("ring_memory_step")(mem, 5801, None, (90, 70), 800)
+        self.assertIsNone(use)
+        self.assertEqual(new_mem, mem)
+
+    def test_fallback_disabled_returns_none(self):
+        mem = [100, 80, 30, 5000]
+        use, _ = F("ring_memory_step")(mem, 5100, None, (90, 70), 0)
+        self.assertIsNone(use)                    # fallback_ms=0 → 原行为(不兜底)
+
+    def test_no_history_not_fallback(self):
+        use, _ = F("ring_memory_step")([0, 0, 0, 0], 5000, None, (90, 70), 800)
+        self.assertIsNone(use)                    # 从未见过环 → 无从兜底
+
+    def test_no_box_not_fallback(self):
+        mem = [100, 80, 30, 5000]
+        use, _ = F("ring_memory_step")(mem, 5100, None, None, 800)
+        self.assertIsNone(use)                    # 框也丢了 → 退原行为
 
 
 class TestModuleThresholdConstants(unittest.TestCase):

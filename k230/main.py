@@ -264,6 +264,7 @@ cc = _get(CFG, "circle", {})
 CIRC_SPEED = cc.get("speed_deg_s", 60)
 CIRC_DIR = cc.get("direction", 1)
 CIRC_PAUSE = cc.get("pause_px", 120)
+CIRC_FALLBACK_MS = cc.get("fallback_ms", 0)   # V8: 环丢失后继续画圆的记忆窗口(ms); 0=关(原行为)
 
 # ---- V7 模式引脚(GPIO49: 被供电=画圈) ----
 mp = _get(CFG, "mode_pin", {})
@@ -686,6 +687,26 @@ def circle_theta_step(theta_deg, deg_s, dt_ms, direction, err_px, pause_px):
     if err_px > pause_px or dt_ms <= 0:
         return theta_deg
     return (theta_deg + direction * deg_s * dt_ms / 1000.0) % 360.0
+
+def ring_memory_step(mem, now_ms, ring, box_center, fallback_ms):
+    """画圈环记忆兜底(纯函数): 环丢失时用「框中心 + 记忆半径」继续画圈。
+
+    (借鉴参考云台画圆"几何优先、不依赖检测"的思路, 与红环检测混合: 环在=用实
+     测, 环刚丢=用最近一次记忆的半径 + 矩形中心续画, 窗口过后回退原行为。)
+
+    mem        : [cx, cy, r, t] 最近一次成功检测的红环(含时刻); t=0 表无历史
+    ring       : 本帧检测到的环 (cx,cy,r) 或 None
+    box_center : 本帧矩形中心 (cx,cy) 或 None
+    fallback_ms: 记忆窗口(ms); 0=关(恒 None → 调用方走原「环丢失退追踪中心」路径)
+    返回 (可用环或 None, 新 mem):
+      环可见 → 直通并刷新记忆; 环丢失但窗口内且框可见 → (框中心, 记忆半径)。
+    """
+    if ring is not None:
+        return ring, [ring[0], ring[1], ring[2], now_ms]
+    if fallback_ms > 0 and mem[3] != 0 and box_center is not None:
+        if time.ticks_diff(now_ms, mem[3]) <= fallback_ms:
+            return (box_center[0], box_center[1], mem[2]), mem
+    return None, mem
 
 def search_step(now_ms, searching, start_ms, enabled, acquired, max_ms):
     """上电搜索状态机(纯函数)。返回 (mode, searching, start_ms):
@@ -1742,6 +1763,7 @@ def run_cv():
     _pin_streak = 0
     _theta = None                    # 画圈 θ(None=未起始; 见环时按当前方位角起转)
     _theta_tick = time.ticks_ms()    # θ 推进的帧间计时基准
+    _ring_mem = [0, 0, 0, 0]         # 画圈环记忆 [cx,cy,r,t](t=0 无历史; 见 ring_memory_step)
     last_dist = 0.0                  # 上帧瞄准偏差(画圈误差门控用)
     _calib_tp = None                 # 触摸句柄(None=不可用/未启用)
     _calib_vis = CALIB_SHOW_DOT      # 绿点+按钮 显隐(dot按钮切换; 隐藏后触摸任意处唤出)
@@ -1907,21 +1929,27 @@ def run_cv():
             else:
                 box, ring = last_box, last_ring
 
-            # ---- 目标选择: 画圈(环优先) > 追踪(矩形中心) ----------------
+            # ---- 目标选择: 画圈(环优先, 记忆兜底) > 追踪(矩形中心) ----------------
             now2 = time.ticks_ms()
             dtm = time.ticks_diff(now2, _theta_tick)
             _theta_tick = now2
             kind, tx, ty = "none", 0, 0
-            if _circle_on and ring is not None:
-                rcx, rcy, rr = ring
-                if box is not None:
-                    draw_box(frame_np, box)          # 仅绘制(目标=环上点)
-                if _theta is None:
-                    _theta = math.degrees(math.atan2(CENTER_Y - rcy, CENTER_X - rcx)) % 360.0
-                _theta = circle_theta_step(_theta, CIRC_SPEED, dtm, CIRC_DIR, last_dist, CIRC_PAUSE)
-                tx, ty = circle_target_point(rcx, rcy, rr + RADIUS_BIAS, _theta)
-                kind = "ring"
-            elif box is not None:
+            if _circle_on:
+                _bctr = quad_center(box) if box is not None else None
+                _ring_use, _ring_mem = ring_memory_step(_ring_mem, now2, ring, _bctr,
+                                                        CIRC_FALLBACK_MS)
+                if _ring_use is not None:
+                    rcx, rcy, rr = _ring_use
+                    if box is not None:
+                        draw_box(frame_np, box)          # 仅绘制(目标=环上点)
+                    if _theta is None:
+                        _theta = math.degrees(math.atan2(CENTER_Y - rcy, CENTER_X - rcx)) % 360.0
+                    _theta = circle_theta_step(_theta, CIRC_SPEED, dtm, CIRC_DIR, last_dist, CIRC_PAUSE)
+                    tx, ty = circle_target_point(rcx, rcy, rr + RADIUS_BIAS, _theta)
+                    kind = "ring"
+                    if ring is None and frame_id % PRINT_EVERY == 0:
+                        print("CIRCLE fallback (mem r=%d)" % rr)   # 环丢失, 记忆兜底中
+            if kind == "none" and box is not None:
                 rcx, rcy, _dcx, _dcy = draw_box(frame_np, box)   # 画框 + 矩形中心
                 tx, ty = rcx, rcy
                 kind = "rect"
