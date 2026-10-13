@@ -21,7 +21,6 @@ K230 物体追踪 — 双轴云台 (双步进)
 
   V8 可选增强(均默认关, 见 config.json 对应键):
     卡尔曼滤波(kf_*)            误差平滑 + 速度前馈(移植参考云台 2 状态 KF);
-    画圈环记忆兜底(fallback_ms)  环丢失后短窗内用「记忆半径+框中心」继续画圆;
     堵转监控(monitor_ms)/清堵转(clog_reset_on_boot)  依赖 Emm42 读取命令(0x35/0x0E52)
 
   dx = 目标中心x - 屏幕中心x   (右偏为正)
@@ -64,7 +63,11 @@ K230 物体追踪 — 双轴云台 (双步进)
 
   所有可调参数都在 config.json 内并附注释; 本文件不含硬编码阈值, 改完重启生效。
   V7.9: PID 开关/Kp/Ki/Kd 与两轴速度/死区/加速等参数可在触屏调参页实时调整, S 键写回 config。
-  V8: 卡尔曼滤波 / 画圈环记忆兜底 / 堵转监控均为可选增强(默认关), 键位与说明见 config.json。
+  V8: 卡尔曼滤波 / 堵转监控均为可选增强(默认关), 键位与说明见 config.json。
+  V9: 距离估算(面积法)+激光点映射(移植参考视觉v2.3, 见 config.json [distance]);
+      aim_laser=true 时矩形追踪收敛点=激光落点(默认关, 仅显示距离/激光点)。
+  V10: 画圈改纯几何 —— 圆心=矩形中心, 半径按靶纸固定尺寸(白框25.6×17 / 圆⌀11.3, 可配)
+       推算; 删除红环检测(find_red_ring/[red_target]/渐进标定), 画圈不再受激光干扰。
 """
 
 import time, os, gc, math
@@ -237,18 +240,17 @@ _pid_pit_i = 0.0
 _pid_pit_e = 0.0
 _pid_pit_t = 0
 
-# ---- V7 红色目标(红环)检测 ----
-rt = _get(CFG, "red_target", {})
-RED_EN = rt.get("enabled", True)     # V8.5: 红环检测总开关; false=完全跳过(画圈需几何主轨)
-RED_LOW  = tuple(rt.get("red_low", [130, 0, 0]))
-RED_HIGH = tuple(rt.get("red_high", [255, 120, 120]))
-RING_MIN_DIAM = rt.get("ring_min_diam_px", 40)
-RING_MAX_DIAM = rt.get("ring_max_diam_px", 900)
-RING_MAX_ASPECT = rt.get("ring_max_aspect", 1.6)
-HOLLOW_SAMPLE_PCT = rt.get("hollow_sample_pct", 50)
-HOLLOW_MAX_HITS = rt.get("hollow_max_hits", 2)
-ROI_MARGIN_PX = rt.get("roi_margin_px", 12)
-RADIUS_BIAS = rt.get("radius_bias_px", 0)
+# ---- V9 距离估算 + 激光点映射(移植参考视觉v2.3: 面积法测距/距离线性映射激光点) ----
+dc = _get(CFG, "distance", {})
+DIST_EN = dc.get("enabled", True)                 # 总开关; false=完全不计算(行为与 V8 一致)
+DIST_REF_MM = dc.get("ref_distance_mm", 1500)     # 标定距离: 靶标(A4纸)放置处(mm)
+DIST_REF_AREA = dc.get("ref_area_px", 8412)       # 标定距离下检测到的靶标像素面积
+DIST_MIN = dc.get("dist_min_mm", 500)             # 映射下限(近于此按最近处理)
+DIST_MAX = dc.get("dist_max_mm", 1500)            # 映射上限(远于此按最远处理)
+LASER_X = dc.get("laser_x", 322)                  # 激光点X固定坐标(激光器安装横向偏移)
+LASER_Y_NEAR = dc.get("laser_y_near", 180)        # 最近距离的激光点Y(参考机640x480上为240=画面中心)
+LASER_Y_FAR = dc.get("laser_y_far", 190)          # 最远距离的激光点Y(参考机640x480上为250=中心+10)
+LASER_AIM = dc.get("aim_laser", False)            # true=矩形追踪收敛点=激光落点; false=仅显示(默认)
 
 # ---- V7 激光偏移(激光点相对画面中心; 与光轴同轴则 0; 触屏校准运行时调整它) ----
 LOX = CENTER_CFG.get("laser_offset_x", 0)
@@ -273,15 +275,18 @@ SEARCH_RPM = srch.get("rpm", 12)
 SEARCH_DIR = srch.get("direction", 1)
 SEARCH_MAX_MS = srch.get("max_ms", 0)
 
-# ---- V7 画圈 ----
+# ---- V7 画圈(V10: 纯几何 — 圆心=矩形中心, 半径按固定尺寸比例推算, 不检测红环) ----
 cc = _get(CFG, "circle", {})
 CIRC_SPEED = cc.get("speed_deg_s", 60)
 CIRC_DIR = cc.get("direction", 1)
 CIRC_PAUSE = cc.get("pause_px", 120)
-CIRC_FALLBACK_MS = cc.get("fallback_ms", 0)   # V8: 环丢失后继续画圆的记忆窗口(ms); 0=关(原行为)
-CIRC_RATIO = cc.get("radius_ratio", 0)        # V8.5: 环半径/√框面积 比例; >0=几何主轨(免检测干扰)
-CIRC_CALIB_FRAMES = cc.get("calib_frames", 0) # V8.5/V8.6: 渐进标定采集上限(池满即收敛); 0=关(原行为)
-CIRC_CALIB_READY_N = 6                        # V8.6: 渐进标定达标线(≥6 样本实时可用, 防单样本污染)
+RADIUS_BIAS = cc.get("radius_bias_px", 0)     # 目标半径修正(px): 几何推算有系统偏差时微调
+PAPER_W_CM = cc.get("paper_w_cm", 29.7)       # A4 白纸宽(cm)
+PAPER_H_CM = cc.get("paper_h_cm", 21.0)       # A4 白纸高(cm)
+TAPE_W_CM = cc.get("tape_w_cm", 2.0)          # 白纸外沿黑胶带宽度(cm)
+RECT_W_CM = cc.get("rect_w_cm", 0) or (PAPER_W_CM - 2.0 * TAPE_W_CM)  # 白色可见矩形宽(胶带内沿); 0=按 paper-2×tape 推导
+RECT_H_CM = cc.get("rect_h_cm", 0) or (PAPER_H_CM - 2.0 * TAPE_W_CM)  # 白色可见矩形高(胶带内沿); 0=按 paper-2×tape 推导
+CIRCLE_DIA_CM = cc.get("circle_dia_cm", 11.3) # 中心圆直径(cm), 与白矩形同心
 
 # ---- V7 模式引脚(GPIO49: 被供电=画圈) ----
 mp = _get(CFG, "mode_pin", {})
@@ -708,37 +713,6 @@ def coast_step(now_ms, active, start_ms, last_dx, edge_px, coast_ms):
 #   tools/test_circle_logic.py 抓取本节函数做主机侧测试(与 coast_step 同模式)
 # ============================================================================
 
-def point_in_quad(px, py, quad):
-    """凸四边形包含判定(纯函数; 叉积同号法)。
-
-    quad = order_points 输出序的 4 点 [TL, TR, BR, BL]; 点恰在边上视为在内。
-    """
-    sign = 0
-    for i in range(4):
-        x1, y1 = quad[i]
-        x2, y2 = quad[(i + 1) % 4]
-        cross = (x2 - x1) * (py - y1) - (y2 - y1) * (px - x1)
-        if cross != 0:
-            s = 1 if cross > 0 else -1
-            if sign == 0:
-                sign = s
-            elif sign != s:
-                return False
-    return True
-
-def classify_blob(w, h, hollow_hits):
-    """红色块分流(纯函数): 大尺寸近方且空心 -> "ring"; 其余(小尺寸/实心/畸形) -> None。
-
-    hollow_hits: 50% 外径半径处 8 点采样的红色命中数(由 find_red_ring 计算);
-    阈值取自 config [red_target] 段。
-    """
-    mx = w if w > h else h
-    mn = h if w > h else w
-    if (mn > 0 and RING_MIN_DIAM <= mx <= RING_MAX_DIAM
-            and mx <= mn * RING_MAX_ASPECT and hollow_hits <= HOLLOW_MAX_HITS):
-        return "ring"
-    return None
-
 def circle_target_point(cx, cy, r, theta_deg):
     """画圈目标点(纯函数): 环心 + 半径在 θ 处的像素坐标。
 
@@ -756,25 +730,22 @@ def circle_theta_step(theta_deg, deg_s, dt_ms, direction, err_px, pause_px):
         return theta_deg
     return (theta_deg + direction * deg_s * dt_ms / 1000.0) % 360.0
 
-def ring_memory_step(mem, now_ms, ring, box_center, fallback_ms):
-    """画圈环记忆兜底(纯函数): 环丢失时用「框中心 + 记忆半径」继续画圈。
+def geo_radius_px(box):
+    """V10 画圈半径(纯几何, 纯函数): 检测框 ↔ 白框物理尺寸 求像素比例, 推算同心圆半径。
 
-    (借鉴参考云台画圆"几何优先、不依赖检测"的思路, 与红环检测混合: 环在=用实
-     测, 环刚丢=用最近一次记忆的半径 + 矩形中心续画, 窗口过后回退原行为。)
-
-    mem        : [cx, cy, r, t] 最近一次成功检测的红环(含时刻); t=0 表无历史
-    ring       : 本帧检测到的环 (cx,cy,r) 或 None
-    box_center : 本帧矩形中心 (cx,cy) 或 None
-    fallback_ms: 记忆窗口(ms); 0=关(恒 None → 调用方走原「环丢失退追踪中心」路径)
-    返回 (可用环或 None, 新 mem):
-      环可见 → 直通并刷新记忆; 环丢失但窗口内且框可见 → (框中心, 记忆半径)。
+    几何: 白色可见矩形(胶带内沿) RECT_W×RECT_H cm, 中心圆直径 CIRCLE_DIA cm 同心。
+    用框的上边/左边像素长分别对应宽/高求 px/cm 比例取平均(自动适配框旋转90°);
+    返回半径(px) 或 0(框/配置无效)。
     """
-    if ring is not None:
-        return ring, [ring[0], ring[1], ring[2], now_ms]
-    if fallback_ms > 0 and mem[3] != 0 and box_center is not None:
-        if time.ticks_diff(now_ms, mem[3]) <= fallback_ms:
-            return (box_center[0], box_center[1], mem[2]), mem
-    return None, mem
+    w = math.sqrt((box[1][0] - box[0][0]) ** 2 + (box[1][1] - box[0][1]) ** 2)  # 上边 TL→TR
+    h = math.sqrt((box[3][0] - box[0][0]) ** 2 + (box[3][1] - box[0][1]) ** 2)  # 左边 TL→BL
+    if w <= 0 or h <= 0 or RECT_W_CM <= 0 or RECT_H_CM <= 0:
+        return 0
+    if (w >= h) == (RECT_W_CM >= RECT_H_CM):    # 方向一致: 宽对宽 / 高对高
+        s = 0.5 * (w / RECT_W_CM + h / RECT_H_CM)
+    else:                                       # 框转了90°: 宽对高 / 高对宽
+        s = 0.5 * (w / RECT_H_CM + h / RECT_W_CM)
+    return int(s * CIRCLE_DIA_CM * 0.5)
 
 def quad_area(quad):
     """四边形面积(纯函数, shoelace; quad=order_points 排序的 4 个整数顶点)。
@@ -787,41 +758,6 @@ def quad_area(quad):
         s += x0 * y - x * y0
         x0, y0 = x, y
     return abs(s) // 2
-
-def median_of(samples):
-    """中位数(纯函数): 空表返 0.0; 偶数取中间两值均值 —— V8.5 标定抗离群用"""
-    n = len(samples)
-    if n == 0:
-        return 0.0
-    s = sorted(samples)
-    if n & 1:
-        return float(s[n // 2])
-    return (s[n // 2 - 1] + s[n // 2]) / 2.0
-
-def calib_feed(samples, k_now, st, sample, pool_max, ready_n):
-    """渐进标定单步(纯函数, V8.6): 环帧样本 r/√框面积 渐进累积。返回 (samples, k_now, st, ev)。
-
-    st: 0=未就绪 / 1=ready(可用) / 2=final(收敛停止)。
-    集满 ready_n → st=1, ev=1, 采纳中位数(画圈几何主轨即刻可用);
-    已 ready 再集满 pool_max → st=2, ev=2, 重算并采纳最终中位数; 此后不再收集。
-    ready 前不采纳 k(防单样本/离群污染); k 只在事件(ev 非 0)时重算。
-    ready_n>pool_max 按 pool_max 截断(至少 1); pool_max<1 原样返回(调用方已门控, 此处防误用)。
-    """
-    if st >= 2 or pool_max < 1:
-        return samples, k_now, st, 0
-    if ready_n > pool_max:
-        ready_n = pool_max
-    samples = samples + [sample]
-    ev = 0
-    if st == 0 and len(samples) >= ready_n:
-        st = 1
-        ev = 1
-    elif st == 1 and len(samples) >= pool_max:
-        st = 2
-        ev = 2
-    if ev:
-        k_now = median_of(samples)
-    return samples, k_now, st, ev
 
 def search_step(now_ms, searching, start_ms, enabled, acquired, max_ms):
     """上电搜索状态机(纯函数)。返回 (mode, searching, start_ms):
@@ -1233,106 +1169,30 @@ def draw_box(frame_np, box):
     return cx, cy, dx, dy
 
 
-# ---- V7 红色目标检测(与矩形检测同帧联合进行) ----
+# ---- V9 距离估算与激光点映射(移植自参考视觉 v2.3) ----
+#   面积法测距: D = D_ref × √(A_ref / A)   (同一靶标, 越近像素面积越大)
+#   激光点映射: X 固定(激光器安装偏移); Y = Y_near + (D-D_min)×(Y_far-Y_near)/(D_max-D_min), D 先限幅
 
-def _ring_geom_mec(cnt, x, y, bw, bh):
-    """红环几何: 优先最小包围圆(cv2.minEnclosingCircle 可用时); 异常时兜底"""
-    try:
-        c, r = cv2.minEnclosingCircle(cnt)
-        return int(c[0]), int(c[1]), int(r)
-    except Exception:
-        return x + bw // 2, y + bh // 2, (bw + bh) // 4
+def estimate_distance_by_area(area_px):
+    """面积法估算靶标距离(mm); area_px<=0 返回 0.0(无效)
 
-def _ring_geom_bbox(cnt, x, y, bw, bh):
-    """红环几何兜底: 外接框中心 + (w+h)//4 作半径"""
-    return x + bw // 2, y + bh // 2, (bw + bh) // 4
-
-_RING_GEOM = _ring_geom_mec if hasattr(cv2, "minEnclosingCircle") else _ring_geom_bbox
-
-def _count_red_at(mask, sx, sy, mw, mh):
-    """3x3 窗口内是否有红色像素(sx/sy 已 clamp 在 mask 范围内)"""
-    x0 = sx - 1 if sx > 0 else 0
-    y0 = sy - 1 if sy > 0 else 0
-    x1 = sx + 2 if sx + 2 <= mw else mw
-    y1 = sy + 2 if sy + 2 <= mh else mh
-    return cv2.countNonZero(mask[y0:y1, x0:x1]) > 0
-
-def _hollow_hits(mask, cx, cy, sr, mw, mh):
-    """空心验证采样: 以 (cx,cy) 为心、半径 sr 的 8 个 45° 方向点, 返回红色命中数"""
-    hits = 0
-    for k in range(8):
-        rad = k * 0.7853981634      # k * 45° 的弧度
-        sx = cx + int(sr * math.cos(rad))
-        sy = cy + int(sr * math.sin(rad))
-        if sx < 0:
-            sx = 0
-        elif sx >= mw:
-            sx = mw - 1
-        if sy < 0:
-            sy = 0
-        elif sy >= mh:
-            sy = mh - 1
-        if _count_red_at(mask, sx, sy, mw, mh):
-            hits += 1
-    return hits
-
-def find_red_ring(frame_np, box):
-    """红色侧检测: 找红环(画圈用), 返回 ring=(cx,cy,r) 或 None。
-
-    box 有效 -> 红色在矩形外扩 ROI_MARGIN_PX 的区域内找(省算力);
-    box 无效 -> 全帧找(保证"单独红环"可见)。
-    ring 选取: 有矩形优先"环心在矩形内"(point_in_quad), 否则取半径最大者。
+    标定: 把靶标放在 ref_distance_mm 处, 检测面积填入 ref_area_px。
     """
-    mw = SENSOR_W
-    mh = SENSOR_H
-    if box:
-        xs = [p[0] for p in box]
-        ys = [p[1] for p in box]
-        ox = min(xs) - ROI_MARGIN_PX
-        oy = min(ys) - ROI_MARGIN_PX
-        ex = max(xs) + ROI_MARGIN_PX
-        ey = max(ys) + ROI_MARGIN_PX
-        if ox < 0: ox = 0
-        if oy < 0: oy = 0
-        if ex > mw: ex = mw
-        if ey > mh: ey = mh
-    else:
-        ox = 0
-        oy = 0
-        ex = mw
-        ey = mh
-    rw = ex - ox
-    rh = ey - oy
-    if rw < 8 or rh < 8:
-        return None
-    mask = cv2.inRange(frame_np[oy:ey, ox:ex], RED_LOW, RED_HIGH)
-    contours = get_contours(cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE))
-    rings = []
-    for cnt in contours:
-        x, y, bw, bh = cv2.boundingRect(cnt)
-        if bw <= 0 or bh <= 0:
-            continue
-        mx = bw if bw > bh else bh
-        sr = (mx // 2) * HOLLOW_SAMPLE_PCT // 100
-        cx = x + bw // 2
-        cy = y + bh // 2
-        hits = _hollow_hits(mask, cx, cy, sr, rw, rh) if sr > 0 else 0
-        if classify_blob(bw, bh, hits) == "ring":
-            rx, ry, rr = _RING_GEOM(cnt, x, y, bw, bh)
-            rings.append((rx + ox, ry + oy, rr))
-    # ---- 红环选取: 有矩形优先环心在矩形内; 否则取半径最大者 ----
-    ring = None
-    if rings:
-        if box:
-            for cand in rings:
-                if point_in_quad(cand[0], cand[1], box):
-                    if ring is None or cand[2] > ring[2]:
-                        ring = cand
-        if ring is None:
-            for cand in rings:
-                if ring is None or cand[2] > ring[2]:
-                    ring = cand
-    return ring
+    if area_px <= 0:
+        return 0.0
+    return DIST_REF_MM * math.sqrt(DIST_REF_AREA / area_px)
+
+def laser_position_by_distance(distance_mm):
+    """距离线性映射激光点坐标 → (x, y); 距离先限幅到 [DIST_MIN, DIST_MAX]"""
+    if DIST_MAX <= DIST_MIN:
+        return (LASER_X, LASER_Y_NEAR)       # 配置防呆: 区间非法时固定近点
+    d = distance_mm
+    if d < DIST_MIN:
+        d = DIST_MIN
+    elif d > DIST_MAX:
+        d = DIST_MAX
+    y = LASER_Y_NEAR + (d - DIST_MIN) * (LASER_Y_FAR - LASER_Y_NEAR) / (DIST_MAX - DIST_MIN)
+    return (LASER_X, int(y))
 
 
 # ============================================================================
@@ -1886,12 +1746,10 @@ def run_cv():
     sensor = None
     frame_id = lost_count = 0
     last_box = None
-    last_ring = None                 # 红环检测帧间复用
     _circle_on = False               # 画圈模式(模式引脚去抖后)
     _pin_streak = 0
-    _theta = None                    # 画圈 θ(None=未起始; 见环时按当前方位角起转)
+    _theta = None                    # 画圈 θ(None=未起始; 见框时按当前方位角起转)
     _theta_tick = time.ticks_ms()    # θ 推进的帧间计时基准
-    _ring_mem = [0, 0, 0, 0]         # 画圈环记忆 [cx,cy,r,t](t=0 无历史; 见 ring_memory_step)
     last_dist = 0.0                  # 上帧瞄准偏差(画圈误差门控用)
     _calib_tp = None                 # 触摸句柄(None=不可用/未启用)
     _calib_vis = CALIB_SHOW_DOT      # 绿点+按钮 显隐(dot按钮切换; 隐藏后触摸任意处唤出)
@@ -1905,9 +1763,6 @@ def run_cv():
     _calib_skip = False              # 切页后吞掉同一次按压的残留动作(防跨页串按)
     _mon_tick_y = time.ticks_ms()    # V8: yaw 堵转监控计时(monitor_ms>0 时用)
     _mon_tick_p = time.ticks_ms()    # V8: pitch 堵转监控计时
-    _calib_buf = []                  # V8.5: 标定样本(环半径/√框面积)
-    _calib_k = 0.0                   # V8.5: 标定出的几何比例(本次运行生效)
-    _calib_st = 0                    # V8.6: 渐进标定状态(0=未就绪/1=ready/2=final)
     fps = fps_count = 0
     fps_tick = time.ticks_ms()
 
@@ -2000,12 +1855,6 @@ def run_cv():
                             _circle_on = not _circle_on
                             _theta = None            # 进出画圈沿重置起始角
                             print("MODE->%s (touch)" % ("circle" if _circle_on else "track"))
-                            if _circle_on and CIRC_RATIO <= 0 and _calib_st < 1:
-                                if CIRC_CALIB_FRAMES > 0:   # V8.6: 渐进标定过渡期提示
-                                    print("  CIRCLE: 渐进标定中(n=%d), 过渡走红环检测; k 就绪后自动切几何主轨"
-                                          % len(_calib_buf))
-                                else:
-                                    print("  CIRCLE: 无 k 且未开启标定, 仅红环检测(受激光干扰); 建议设 [circle].calib_frames=30")
                     elif _act == "save":
                         _ok, _msg = calib_save_file(CFG_PATH, LOX, LOY)
                         print("calib: save %s %s" % ("OK" if _ok else "FAIL", _msg))
@@ -2061,95 +1910,67 @@ def run_cv():
                     _theta = None                    # 进出画圈沿重置起始角
                     print("MODE->%s" % ("circle" if _circle_on else "track"))
 
-            # ---- 检测(每检测帧): 矩形 + 红色 联合 ----------------
+            # ---- 检测(每检测帧): 矩形 ----------------
             if frame_id % DETECT_EVERY == 0 or not last_box:
                 box, contour_count, area_count = find_paper_box(frame_np, last_box)
-                ring = find_red_ring(frame_np, box) if RED_EN else None   # V8.5: 可整体关断
-                # ---- V8.5/V8.6 渐进标定: 有效环帧的 k=r/√框面积, ≥6 样本实时可用, 集满 N 收敛 ----
-                if CIRC_CALIB_FRAMES > 0 and _calib_st < 2 and ring is not None and box is not None:
-                    _fa = quad_area(box)
-                    if _fa > 0:
-                        _ks = ring[2] / math.sqrt(_fa)
-                        if 0.02 < _ks < 1.5:       # 物理合理性过滤(防误检离群污染池)
-                            _calib_buf, _calib_k, _calib_st, _cev = calib_feed(
-                                _calib_buf, _calib_k, _calib_st, _ks,
-                                CIRC_CALIB_FRAMES, CIRC_CALIB_READY_N)
-                            if _cev == 1:
-                                print("CIRCLE autocalib ready: k=%.4f (n=%d) 已实时生效"
-                                      % (_calib_k, len(_calib_buf)))
-                            elif _cev == 2:
-                                print("CIRCLE autocalib: k=%.4f (n=%d) 收敛 — 建议写入 config [circle].radius_ratio"
-                                      % (_calib_k, CIRC_CALIB_FRAMES))
             else:
-                box, ring = last_box, last_ring
+                box = last_box
 
-            # ---- 目标选择: 画圈(环优先, 记忆兜底) > 追踪(矩形中心) ----------------
+            # ---- 目标选择: 画圈(纯几何) > 追踪(矩形中心) ------------------------
             now2 = time.ticks_ms()
             dtm = time.ticks_diff(now2, _theta_tick)
             _theta_tick = now2
             kind, tx, ty = "none", 0, 0
-            _circle_view = None              # V8.6: 画圈圆可视化[(cx,cy,r,tag) tag:1=geo合成/2=记忆兜底]
-            if _circle_on:
-                _bctr = quad_center(box) if box is not None else None
-                _kuse = CIRC_RATIO if CIRC_RATIO > 0 else _calib_k   # 配置优先, 标定值次之
-                if _kuse > 0 and _bctr is not None:
-                    # V8.5 几何主轨: 同心先验(心=框中心) + 比例半径 —— 不消费红环检测(免激光干扰)
-                    _ring_use = (_bctr[0], _bctr[1], int(_kuse * math.sqrt(quad_area(box))))
-                    _geo_on = True
-                else:
-                    _ring_use, _ring_mem = ring_memory_step(_ring_mem, now2, ring, _bctr,
-                                                            CIRC_FALLBACK_MS)
-                    _geo_on = False
-                if _ring_use is not None:
-                    rcx, rcy, rr = _ring_use
-                    if _geo_on:
-                        _circle_view = (rcx, rcy, rr, 1)   # 合成圆(橙) — 屏上可见"要画的圆"
-                    elif ring is None:
-                        _circle_view = (rcx, rcy, rr, 2)   # 记忆兜底圆(青); 本帧检测环仍由原蓝圆绘制
-                    if box is not None:
-                        draw_box(frame_np, box)          # 仅绘制(目标=环上点)
+            dist_mm = 0.0                    # V9: 面积法估算距离(仅矩形追踪路径计算)
+            laser_pt = None                  # V9: 激光映射点[(x,y); 未算出=None]
+            _circle_view = None              # V10: 画圈几何圆可视化(cx,cy,r)
+            if _circle_on and box is not None:
+                _rr = geo_radius_px(box)     # V10: 半径按白框尺寸比例推算(几何参数见 [circle])
+                if _rr > 0:
+                    # 纯几何: 同心先验(圆心=框中心) + 固定尺寸比例 —— 不依赖任何圆形识别(免激光干扰)
+                    rcx, rcy, _dcx, _dcy = draw_box(frame_np, box)   # 画框 + 圆心
+                    _circle_view = (rcx, rcy, _rr)       # 几何圆(橙) — 屏上可见"要画的圆"
                     if _theta is None:
                         _theta = math.degrees(math.atan2(CENTER_Y - rcy, CENTER_X - rcx)) % 360.0
                     _theta = circle_theta_step(_theta, CIRC_SPEED, dtm, CIRC_DIR, last_dist, CIRC_PAUSE)
-                    tx, ty = circle_target_point(rcx, rcy, rr + RADIUS_BIAS, _theta)
-                    kind = "geo" if _geo_on else "ring"    # V8.5: 串口/OSD 区分两条路径(仅显示)
-                    if (not _geo_on) and ring is None and frame_id % PRINT_EVERY == 0:
-                        print("CIRCLE fallback (mem r=%d)" % rr)   # 环丢失, 记忆兜底中
+                    tx, ty = circle_target_point(rcx, rcy, _rr + RADIUS_BIAS, _theta)
+                    kind = "geo"
             if kind == "none" and box is not None:
                 rcx, rcy, _dcx, _dcy = draw_box(frame_np, box)   # 画框 + 矩形中心
                 tx, ty = rcx, rcy
                 kind = "rect"
+                if DIST_EN:                  # V9: 面积法测距 + 激光点映射(仅矩形路径, 面积标定只对靶标成立)
+                    dist_mm = estimate_distance_by_area(quad_area(box))
+                    laser_pt = laser_position_by_distance(dist_mm)
 
             # ---- 执行(保持既有 gimbal_send track 语义) ----------------
             if kind != "none":
                 lost_count = 0
                 if box is not None:
                     last_box = box
-                last_ring = ring
-                dx, dy = tx - CENTER_X - LOX, ty - CENTER_Y - LOY
+                if LASER_AIM and laser_pt is not None and kind == "rect":
+                    dx, dy = tx - laser_pt[0], ty - laser_pt[1]   # V9: 收敛点=激光落点(靶心追到激光点上, 激光打中)
+                else:
+                    dx, dy = tx - CENTER_X - LOX, ty - CENTER_Y - LOY
                 dist = math.sqrt(dx * dx + dy * dy)
                 last_dist = dist
                 gimbal_send(int(dx), int(dy), dist, "track")
-                # OSD: 红环/合成圆/最终瞄准点 标记 + 目标源文字
+                # OSD: 画圈几何圆/最终瞄准点 标记 + 目标源文字
                 if SHOW_OSD:
-                    if _circle_view is not None:     # V8.6: 画圈圆(橙=几何合成/青=记忆兜底)
-                        _cvx, _cvy, _cvr, _ctag = _circle_view
-                        if _ctag == 1:
-                            cv2.circle(frame_np, (_cvx, _cvy), _cvr, (0, 165, 255), 1)
-                        else:
-                            cv2.circle(frame_np, (_cvx, _cvy), _cvr, (255, 255, 0), 1)
-                    if ring is not None:
-                        cv2.circle(frame_np, (ring[0], ring[1]), ring[2], (255, 128, 0), 1)
+                    if _circle_view is not None:     # V10: 画圈几何圆(橙)
+                        cv2.circle(frame_np, (_circle_view[0], _circle_view[1]), _circle_view[2],
+                                   (0, 165, 255), 1)
                     cv2.circle(frame_np, (tx, ty), 4, (0, 255, 255), 1)
                     cv2.putText(frame_np, "[%s] dx:%+d dy:%+d" % (kind, dx, dy),
                                 (4, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-                    if _circle_on and kind == "rect":    # V8.6: 画圈退化提示(屏上)
-                        cv2.putText(frame_np, "CIRCLE: no ring/k", (4, 32),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
+                    if laser_pt is not None:         # V9: 激光映射点(黄圈+红心)与估算距离
+                        cv2.circle(frame_np, (laser_pt[0], laser_pt[1]), 10, (0, 255, 255), 2)
+                        cv2.circle(frame_np, (laser_pt[0], laser_pt[1]), 3, (255, 0, 0), -1)
+                        cv2.putText(frame_np, "D:%dmm" % int(dist_mm), (4, 48),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
                 if frame_id % PRINT_EVERY == 0:
-                    print("OK [%s] d=(%d,%d) dist=%.0f" % (kind, dx, dy, dist))
-                    if _circle_on and kind == "rect" and frame_id % (PRINT_EVERY * 5) == 0:
-                        print("  CIRCLE tip: 画圈无环/未标定 — 退为矩形追踪")
+                    _dsfx = (" D=%.0fmm" % dist_mm) if dist_mm > 0 else ""   # V9: 距离估算
+                    print("OK [%s] d=(%d,%d) dist=%.0f%s" % (kind, dx, dy, dist, _dsfx))
             else:
                 lost_count += 1
                 if lost_count > 2:
