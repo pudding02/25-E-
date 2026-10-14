@@ -1,0 +1,13 @@
+# 云台（FashionStar C++ SDK 等第三方/本地资料，不入库）
+云台/
+
+# Rivet 会话产物（编辑备份/计划稿/工具原始输出，不入库）
+.rivet/
+.rivet.md
+
+# 参考代码（第三方参考项目，仅本地分析用，不入库）
+参考代码/
+
+# Python 编译缓存（py_compile / import 副产物）
+__pycache__/
+*.pyc
